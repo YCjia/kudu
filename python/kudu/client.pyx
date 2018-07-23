@@ -18,6 +18,8 @@
 # distutils: language = c++
 # cython: embedsignature = True
 
+include "config.pxi"
+
 from libcpp.string cimport string
 from libcpp cimport bool as c_bool
 from libcpp.map cimport map
@@ -29,10 +31,20 @@ from libkudu_client cimport *
 from kudu.compat import tobytes, frombytes, dict_iter
 from kudu.schema cimport Schema, ColumnSchema, ColumnSpec, KuduValue, KuduType
 from kudu.errors cimport check_status
-from kudu.util import to_unixtime_micros, from_unixtime_micros, from_hybridtime
+from kudu.util import to_unixtime_micros, from_unixtime_micros, \
+    from_hybridtime, to_unscaled_decimal, from_unscaled_decimal
 from errors import KuduException
 
 import six
+
+# True if this python client was compiled with a
+# compiler that supports __int128 which is required
+# for decimal type support. This is generally true
+# except for EL6 environments.
+IF PYKUDU_INT128_SUPPORTED == 1:
+    CLIENT_SUPPORTS_DECIMAL = True
+ELSE:
+    CLIENT_SUPPORTS_DECIMAL = False
 
 # Replica selection enums
 LEADER_ONLY = ReplicaSelection_Leader
@@ -48,10 +60,12 @@ cdef dict _replica_selection_policies = {
 # Read mode enums
 READ_LATEST = ReadMode_Latest
 READ_AT_SNAPSHOT = ReadMode_Snapshot
+READ_YOUR_WRITES = ReadMode_ReadYourWrites
 
 cdef dict _read_modes = {
     'latest': ReadMode_Latest,
-    'snapshot': ReadMode_Snapshot
+    'snapshot': ReadMode_Snapshot,
+    'read_your_writes': ReadMode_ReadYourWrites
 }
 
 cdef dict _type_names = {
@@ -64,7 +78,8 @@ cdef dict _type_names = {
     KUDU_FLOAT : "KUDU_FLOAT",
     KUDU_DOUBLE : "KUDU_DOUBLE",
     KUDU_BINARY : "KUDU_BINARY",
-    KUDU_UNIXTIME_MICROS : "KUDU_UNIXTIME_MICROS"
+    KUDU_UNIXTIME_MICROS : "KUDU_UNIXTIME_MICROS",
+    KUDU_DECIMAL : "KUDU_DECIMAL"
 }
 
 # Range Partition Bound Type enums
@@ -510,7 +525,7 @@ cdef class Client:
             result.append(ts._init(tservers[i]))
         return result
 
-    def new_session(self, flush_mode='manual', timeout_ms=5000):
+    def new_session(self, flush_mode='manual', timeout_ms=5000, **kwargs):
         """
         Create a new KuduSession for applying write operations.
 
@@ -520,16 +535,42 @@ cdef class Client:
           See Session.set_flush_mode
         timeout_ms : int, default 5000
           Timeout in milliseconds
+        mutation_buffer_sz : Size in bytes of the buffer space.
+        mutation_buffer_watermark : Watermark level as percentage of the mutation buffer size,
+            this is used to trigger a flush in AUTO_FLUSH_BACKGROUND mode.
+        mutation_buffer_flush_interval : The duration of the interval for the time-based
+            flushing, in milliseconds. In some cases, while running in AUTO_FLUSH_BACKGROUND
+            mode, the size of the mutation buffer for pending operations and the flush
+            watermark for fresh operations may be too high for the rate of incoming data:
+            it would take too long to accumulate enough data in the buffer to trigger
+            flushing. I.e., it makes sense to flush the accumulated operations if the
+            prior flush happened long time ago. This parameter sets the wait interval for
+            the time-based flushing which takes place along with the flushing triggered
+            by the over-the-watermark criterion. By default, the interval is set to
+            1000 ms (i.e. 1 second).
+        mutation_buffer_max_num : The maximum number of mutation buffers per KuduSession
+            object to hold the applied operations. Use 0 to set the maximum number of
+            concurrent mutation buffers to unlimited
 
         Returns
         -------
         session : kudu.Session
         """
+
         cdef Session result = Session()
         result.s = self.cp.NewSession()
 
         result.set_flush_mode(flush_mode)
         result.set_timeout_ms(timeout_ms)
+
+        if "mutation_buffer_sz" in kwargs:
+            result.set_mutation_buffer_space(kwargs["mutation_buffer_sz"])
+        if "mutation_buffer_watermark" in kwargs:
+            result.set_mutation_buffer_flush_watermark(kwargs["mutation_buffer_watermark"])
+        if "mutation_buffer_flush_interval" in kwargs:
+            result.set_mutation_buffer_flush_interval(kwargs["mutation_buffer_flush_interval"])
+        if "mutation_buffer_max_num" in kwargs:
+            result.set_mutation_buffer_max_num(kwargs["mutation_buffer_max_num"])
 
         return result
 
@@ -980,6 +1021,64 @@ cdef class Column:
 
         return result
 
+    def is_not_null(Column self):
+        """
+        Creates a new IsNotNullPredicate for the Column which can be used for scanners
+        on this table.
+
+        Examples
+        --------
+        scanner.add_predicate(table[col_name].is_not_null())
+
+        Returns
+        -------
+        pred : Predicate
+        """
+
+        cdef:
+            KuduPredicate* pred
+            Slice col_name_slice
+            Predicate result
+            object _name = tobytes(self.name)
+
+        col_name_slice = Slice(<char*> _name, len(_name))
+
+        pred = (self.parent.ptr()
+                .NewIsNotNullPredicate(col_name_slice))
+
+        result = Predicate()
+        result.init(pred)
+
+        return result
+
+    def is_null(Column self):
+        """
+        Creates a new IsNullPredicate for the Column which can be used for scanners on this table.
+
+        Examples
+        --------
+        scanner.add_predicate(table[col_name].is_null())
+
+        Returns
+        -------
+        pred : Predicate
+        """
+
+        cdef:
+            KuduPredicate* pred
+            Slice col_name_slice
+            Predicate result
+            object _name = tobytes(self.name)
+
+        col_name_slice = Slice(<char*> _name, len(_name))
+
+        pred = (self.parent.ptr()
+                .NewIsNullPredicate(col_name_slice))
+
+        result = Predicate()
+        result.init(pred)
+
+        return result
 
 class Partitioning(object):
     """ Argument to Client.create_table(...) to describe table partitioning. """
@@ -1172,6 +1271,99 @@ cdef class Session:
         """
         self.s.get().SetTimeoutMillis(ms)
 
+    def set_mutation_buffer_space(self, size_t size_bytes):
+        """
+        Set the amount of buffer space used by this session for outbound writes.
+
+        The effect of the buffer size varies based on the flush mode of the session:
+
+            AUTO_FLUSH_SYNC: since no buffering is done, this has no effect.
+            AUTO_FLUSH_BACKGROUND: if the buffer space is exhausted, then write calls
+                will block until there is space available in the buffer.
+            MANUAL_FLUSH: if the buffer space is exhausted, then write calls will return
+                an error
+
+        By default, the buffer space is set to 7 MiB (i.e. 7 * 1024 * 1024 bytes).
+
+        Parameters
+        ----------
+        size_bytes : Size of the buffer space to set (number of bytes)
+        """
+        status = self.s.get().SetMutationBufferSpace(size_bytes)
+
+        check_status(status)
+
+    def set_mutation_buffer_flush_watermark(self, double watermark_pct):
+        """
+        Set the buffer watermark to trigger flush in AUTO_FLUSH_BACKGROUND mode.
+
+        This method sets the watermark for fresh operations in the buffer when running
+        in AUTO_FLUSH_BACKGROUND mode: once the specified threshold is reached, the
+        session starts sending the accumulated write operations to the appropriate
+        tablet servers. The flush watermark determines how much of the buffer space is
+        taken by newly submitted operations. Setting this level to 100% results in
+        flushing the buffer only when the newly applied operation would overflow the
+        buffer. By default, the buffer flush watermark is set to 50%.
+
+        Parameters
+        ----------
+        watermark_pct : Watermark level as percentage of the mutation buffer size
+        """
+        status = self.s.get().SetMutationBufferFlushWatermark(watermark_pct)
+
+        check_status(status)
+
+    def set_mutation_buffer_flush_interval(self, unsigned int millis):
+        """
+        Set the interval for time-based flushing of the mutation buffer.
+
+        In some cases, while running in AUTO_FLUSH_BACKGROUND mode, the size of the
+        mutation buffer for pending operations and the flush watermark for fresh
+        operations may be too high for the rate of incoming data: it would take too
+        long to accumulate enough data in the buffer to trigger flushing. I.e., it
+        makes sense to flush the accumulated operations if the prior flush happened
+        long time ago. This method sets the wait interval for the time-based flushing
+        which takes place along with the flushing triggered by the over-the-watermark
+        criterion. By default, the interval is set to 1000 ms (i.e. 1 second).
+
+        Parameters
+        ----------
+        millis : The duration of the interval for the time-based flushing, in milliseconds.
+        """
+
+        status = self.s.get().SetMutationBufferFlushInterval(millis)
+
+        check_status(status)
+
+    def set_mutation_buffer_max_num(self, unsigned int max_num):
+        """
+        Set the maximum number of mutation buffers per Session object.
+
+        A Session accumulates write operations submitted via the Apply() method in
+        mutation buffers. A Session always has at least one mutation buffer. The
+        mutation buffer which accumulates new incoming operations is called the current
+        mutation buffer. The current mutation buffer is flushed using the
+        Session.flush() method or it's done by the Session automatically if
+        running in AUTO_FLUSH_BACKGROUND mode. After flushing the current mutation buffer,
+        a new buffer is created upon calling Session.apply(), provided the limit is
+        not exceeded. A call to Session.apply() blocks if it's at the maximum number
+        of buffers allowed; the call unblocks as soon as one of the pending batchers
+        finished flushing and a new batcher can be created.
+
+        The minimum setting for this parameter is 1 (one). The default setting for this
+        parameter is 2 (two).
+
+        Parameters
+        ----------
+        max_num : The maximum number of mutation buffers per Session object to hold
+            the applied operations. Use 0 to set the maximum number of concurrent mutation
+            buffers to unlimited.
+        """
+
+        status = self.s.get().SetMutationBufferMaxNum(max_num)
+
+        check_status(status)
+
     def apply(self, WriteOperation op):
         """
         Apply the indicated write operation
@@ -1314,6 +1506,18 @@ cdef class Row:
         check_status(self.row.GetUnixTimeMicros(i, &val))
         return val
 
+    cdef inline __get_unscaled_decimal(self, int i):
+        IF PYKUDU_INT128_SUPPORTED == 1:
+            cdef int128_t val
+            check_status(self.row.GetUnscaledDecimal(i, &val))
+            return val
+        ELSE:
+            raise KuduException("The decimal type is not supported when GCC version is < 4.6.0" % self)
+
+    cdef inline get_decimal(self, int i):
+        scale = self.parent.batch.projection_schema().Column(i).type_attributes().scale()
+        return from_unscaled_decimal(self.__get_unscaled_decimal(i), scale)
+
     cdef inline get_slot(self, int i):
         cdef:
             Status s
@@ -1339,6 +1543,8 @@ cdef class Row:
             return self.get_binary(i)
         elif t == KUDU_UNIXTIME_MICROS:
             return from_unixtime_micros(self.get_unixtime_micros(i))
+        elif t == KUDU_DECIMAL:
+            return self.get_decimal(i)
         else:
             raise TypeError("Cannot get kudu type <{0}>"
                                 .format(_type_names[t]))
@@ -1544,8 +1750,9 @@ cdef class Scanner:
 
         Parameters
         ----------
-        read_mode : {'latest', 'snapshot'}
-          You can also use the constants READ_LATEST, READ_AT_SNAPSHOT
+        read_mode : {'latest', 'snapshot', 'read_your_writes'}
+          You can also use the constants READ_LATEST, READ_AT_SNAPSHOT,
+          READ_YOUR_WRITES
 
         Returns
         -------
@@ -1606,6 +1813,23 @@ cdef class Scanner:
                 "Snapshot Timestamps be greater than the unix epoch.")
 
         return self
+
+    def set_limit(self, limit):
+        """
+        Set a limit on the number of rows returned by this scanner.
+        Must be a positive value.
+
+        Parameters
+        ----------
+        limit : the maximum number of rows to return
+
+        Returns
+        -------
+        self : Scanner
+        """
+        if limit <= 0:
+            raise ValueError("Limit must be positive.")
+        check_status(self.scanner.SetLimit(<int64_t> limit))
 
     def set_fault_tolerant(self):
         """
@@ -2057,9 +2281,9 @@ cdef class ScanTokenBuilder:
 
         return self
 
-    def set_timout_millis(self, millis):
+    def set_timeout_millis(self, millis):
         """
-        Sets the timeout in milliseconds.
+        Sets the scan request timeout in milliseconds.
         Returns a reference to itself to facilitate chaining.
 
         Parameters
@@ -2073,6 +2297,15 @@ cdef class ScanTokenBuilder:
         """
         check_status(self._builder.SetTimeoutMillis(millis))
         return self
+
+    def set_timout_millis(self, millis):
+        """
+        See set_timeout_millis().
+
+        This method is deprecated due to having a typo in the method name and
+        will be removed in a future release.
+        """
+        return self.set_timeout_millis(millis)
 
     def set_fault_tolerant(self):
         """
@@ -2438,7 +2671,6 @@ cdef class PartialRow:
         elif t == KUDU_STRING:
             if isinstance(value, unicode):
                 value = value.encode('utf8')
-
             slc = Slice(<char*> value, len(value))
             check_status(self.row.SetStringCopy(i, slc))
         elif t == KUDU_BINARY:
@@ -2451,6 +2683,11 @@ cdef class PartialRow:
         elif t == KUDU_UNIXTIME_MICROS:
             check_status(self.row.SetUnixTimeMicros(i, <int64_t>
                 to_unixtime_micros(value)))
+        elif t == KUDU_DECIMAL:
+            IF PYKUDU_INT128_SUPPORTED == 1:
+                check_status(self.row.SetUnscaledDecimal(i, <int128_t>to_unscaled_decimal(value)))
+            ELSE:
+                raise KuduException("The decimal type is not supported when GCC version is < 4.6.0" % self)
         else:
             raise TypeError("Cannot set kudu type <{0}>.".format(_type_names[t]))
 

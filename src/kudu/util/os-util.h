@@ -23,20 +23,11 @@
 #ifndef KUDU_UTIL_OS_UTIL_H
 #define KUDU_UTIL_OS_UTIL_H
 
-#include <errno.h>
-
 #include <cstdint>
 #include <string>
-#include <type_traits>
+#include <type_traits> // IWYU pragma: keep
 
 #include "kudu/util/status.h"
-
-// Retry on EINTR for functions like read() that return -1 on error.
-#define RETRY_ON_EINTR(err, expr) do { \
-  static_assert(std::is_signed<decltype(err)>::value, \
-                #err " must be a signed integer"); \
-  (err) = (expr); \
-} while ((err) == -1 && errno == EINTR)
 
 namespace kudu {
 
@@ -70,6 +61,11 @@ Status GetThreadStats(int64_t tid, ThreadStats* stats);
 // This is useful particularly in tests where we have injected failures and don't
 // want to generate a core dump from an "expected" crash.
 void DisableCoreDumps();
+
+// Return true if this process appears to be running under a debugger or strace.
+//
+// This may return false on unsupported (non-Linux) platforms.
+bool IsBeingDebugged();
 
 } // namespace kudu
 

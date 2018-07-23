@@ -55,7 +55,7 @@
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
@@ -95,10 +95,12 @@ DEFINE_int32(test_delete_leader_num_writer_threads, 1,
 using kudu::client::KuduSchema;
 using kudu::client::KuduSchemaFromSchema;
 using kudu::client::KuduTableCreator;
+using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::cluster::ExternalTabletServer;
 using kudu::consensus::COMMITTED_OPID;
 using kudu::consensus::ConsensusMetadataManager;
 using kudu::consensus::ConsensusMetadataPB;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::consensus::MakeOpId;
 using kudu::consensus::RaftPeerPB;
 using kudu::itest::AddServer;
@@ -378,6 +380,97 @@ TEST_F(TabletCopyITest, TestListTabletsDuringTabletCopy) {
   NO_FATALS(cluster_->AssertNoCrashes());
 }
 
+// Regression test for KUDU-2293.
+TEST_F(TabletCopyITest, TestCopyAfterFailedCopy) {
+  MonoDelta kTimeout = MonoDelta::FromSeconds(30);
+  const int kTsIndex = 1; // Pick an arbitrary tserver to observe.
+  // Use 2 data dirs so we can fail a directory without crashing the server.
+  ExternalMiniClusterOptions cluster_opts;
+  cluster_opts.num_data_dirs = 2;
+  cluster_opts.num_tablet_servers = 3;
+  // We're going to tombstone replicas manually, so prevent the master from
+  // tombstoning evicted followers.
+  cluster_opts.extra_master_flags.emplace_back("--master_tombstone_evicted_tablet_replicas=false");
+  NO_FATALS(StartClusterWithOpts(std::move(cluster_opts)));
+
+  // Populate a tablet with some data.
+  TestWorkload workload(cluster_.get());
+  workload.Setup();
+  workload.Start();
+  while (workload.rows_inserted() < 1000) {
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  }
+
+  TServerDetails* ts = ts_map_[cluster_->tablet_server(kTsIndex)->uuid()];
+  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  ASSERT_OK(WaitForNumTabletsOnTS(ts, 1, kTimeout, &tablets));
+  string tablet_id = tablets[0].tablet_status().tablet_id();
+
+  // Ensure all the servers agree before we proceed.
+  workload.StopAndJoin();
+  ASSERT_OK(WaitForServersToAgree(kTimeout, ts_map_, tablet_id,
+                                  workload.batches_completed()));
+
+  int leader_index;
+  int follower_index;
+  TServerDetails* leader_ts;
+  TServerDetails* follower_ts;
+
+  // Get the leader and follower tablet servers.
+  ASSERT_OK(FindTabletLeader(ts_map_, tablet_id, kTimeout, &leader_ts));
+  leader_index = cluster_->tablet_server_index_by_uuid(leader_ts->uuid());
+  follower_index = (leader_index + 1) % cluster_->num_tablet_servers();
+  ExternalTabletServer* follower = cluster_->tablet_server(follower_index);
+  leader_ts = ts_map_[cluster_->tablet_server(leader_index)->uuid()];
+  follower_ts = ts_map_[follower->uuid()];
+
+  // Tombstone the follower.
+  ASSERT_OK(DeleteTabletWithRetries(follower_ts, tablet_id,
+                                    TabletDataState::TABLET_DATA_TOMBSTONED,
+                                    kTimeout));
+  HostPort leader_addr;
+  ASSERT_OK(HostPortFromPB(leader_ts->registration.rpc_addresses(0), &leader_addr));
+
+  // Inject failures to the metadata and trigger the tablet copy. This will
+  // cause the copy to fail.
+  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(follower_index),
+      "env_inject_eio_globs", JoinPathSegments(cluster_->WalRootForTS(follower_index),
+                                               "tablet-meta/**")));
+  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(follower_index),
+      "env_inject_eio", "0.10"));
+  Status s;
+  ASSERT_EVENTUALLY([&] {
+    s = itest::StartTabletCopy(follower_ts, tablet_id, leader_ts->uuid(),
+                               leader_addr, std::numeric_limits<int64_t>::max(), kTimeout);
+    ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+  });
+
+  // Trigger a copy again. This should fail. The previous copy might still be
+  // cleaning up so we might get some "already in progress" errors; eventually
+  // a copy will successfully start and fail with the expected error.
+  ASSERT_EVENTUALLY([&] {
+    s = itest::StartTabletCopy(follower_ts, tablet_id, leader_ts->uuid(),
+                               leader_addr, std::numeric_limits<int64_t>::max(), kTimeout);
+    ASSERT_STR_CONTAINS(s.ToString(), "INJECTED FAILURE");
+  });
+
+  // Regression condition for KUDU-2293: the above second attempt at a copy
+  // should not crash the destination server.
+  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    const auto tserver = cluster_->tablet_server(i);
+    ASSERT_TRUE(tserver->IsProcessAlive())
+        << Substitute("Tablet server $0 ($1) has crashed...", i, tserver->uuid());
+  }
+
+  // Finally, trigger a successful copy.
+  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(follower_index),
+      "env_inject_eio", "0.0"));
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(itest::StartTabletCopy(follower_ts, tablet_id, leader_ts->uuid(),
+                                    leader_addr, std::numeric_limits<int64_t>::max(), kTimeout));
+  });
+}
+
 // Start tablet copy session and delete the tablet in the middle.
 // It should actually be possible to complete copying in such a case, because
 // when a Tablet Copy session is started on the "source" server, all of
@@ -495,7 +588,8 @@ TEST_F(TabletCopyITest, TestTabletCopyFollowerWithHigherTerm) {
   int64_t term = 0;
   for (int i = 0; i < 1000; i++) {
     consensus::ConsensusStatePB cstate;
-    ASSERT_OK(itest::GetConsensusState(follower_ts, tablet_id, timeout, &cstate));
+    ASSERT_OK(itest::GetConsensusState(follower_ts, tablet_id, timeout, EXCLUDE_HEALTH_REPORT,
+                                       &cstate));
     term = cstate.current_term();
     if (term == 2) break;
     SleepFor(MonoDelta::FromMilliseconds(10));

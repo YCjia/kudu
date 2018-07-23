@@ -28,7 +28,7 @@ import org.apache.kudu.{Type, client}
 /**
   * A Resilient Distributed Dataset backed by a Kudu table.
   *
-  * To construct a KuduRDD, use {@link KuduContext#kuduRdd} or a Kudu DataSource.
+  * To construct a KuduRDD, use [[KuduContext#kuduRDD]] or a Kudu DataSource.
   */
 class KuduRDD private[kudu] (val kuduContext: KuduContext,
                              @transient val batchSize: Integer,
@@ -37,6 +37,8 @@ class KuduRDD private[kudu] (val kuduContext: KuduContext,
                              @transient val table: KuduTable,
                              @transient val isFaultTolerant: Boolean,
                              @transient val scanLocality: ReplicaSelection,
+                             @transient val scanRequestTimeoutMs: Option[Long],
+                             @transient val socketReadTimeoutMs: Option[Long],
                              @transient val sc: SparkContext) extends RDD[Row](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = {
@@ -56,14 +58,27 @@ class KuduRDD private[kudu] (val kuduContext: KuduContext,
              .readMode(AsyncKuduScanner.ReadMode.READ_AT_SNAPSHOT)
     }
 
+    scanRequestTimeoutMs match {
+      case Some(timeout) => builder.scanRequestTimeout(timeout)
+      case _ =>
+    }
+
     for (predicate <- predicates) {
       builder.addPredicate(predicate)
     }
     val tokens = builder.build().asScala
     tokens.zipWithIndex.map {
       case (token, index) =>
-        new KuduPartition(index, token.serialize(),
-                          token.getTablet.getReplicas.asScala.map(_.getRpcHost).toArray)
+        // Only list the leader replica as the preferred location if
+        // replica selection policy is leader only, to take advantage
+        // of scan locality.
+        var locations: Array[String] = null
+        if (scanLocality == ReplicaSelection.LEADER_ONLY) {
+          locations = Array(token.getTablet.getLeaderReplica.getRpcHost)
+        } else {
+          locations = token.getTablet.getReplicas.asScala.map(_.getRpcHost).toArray
+        }
+        new KuduPartition(index, token.serialize(), locations)
     }.toArray
   }
 
@@ -118,11 +133,12 @@ private class RowIterator(private val scanner: KuduScanner,
       case Type.INT16 => rowResult.getShort(i)
       case Type.INT32 => rowResult.getInt(i)
       case Type.INT64 => rowResult.getLong(i)
-      case Type.UNIXTIME_MICROS => KuduRelation.microsToTimestamp(rowResult.getLong(i))
+      case Type.UNIXTIME_MICROS => rowResult.getTimestamp(i)
       case Type.FLOAT => rowResult.getFloat(i)
       case Type.DOUBLE => rowResult.getDouble(i)
       case Type.STRING => rowResult.getString(i)
       case Type.BINARY => rowResult.getBinaryCopy(i)
+      case Type.DECIMAL => rowResult.getDecimal(i)
     }
   }
 

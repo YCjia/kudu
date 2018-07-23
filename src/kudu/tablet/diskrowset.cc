@@ -30,6 +30,7 @@
 #include "kudu/cfile/bloomfile.h"
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/cfile/cfile_writer.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/generic_iterators.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/rowblock.h"
@@ -73,6 +74,11 @@ TAG_FLAG(tablet_delta_store_major_compact_min_ratio, experimental);
 DEFINE_int32(default_composite_key_index_block_size_bytes, 4096,
              "Block size used for composite key indexes.");
 TAG_FLAG(default_composite_key_index_block_size_bytes, experimental);
+
+DEFINE_bool(rowset_metadata_store_keys, false,
+            "Whether to store the min/max encoded keys in the rowset "
+            "metadata. If false, keys will be read from the data blocks.");
+TAG_FLAG(rowset_metadata_store_keys, experimental);
 
 namespace kudu {
 
@@ -154,11 +160,6 @@ Status DiskRowSetWriter::InitAdHocIndexWriter() {
 
   rowset_metadata_->set_adhoc_index_block(block->id());
 
-  // TODO: allow options to be configured, perhaps on a per-column
-  // basis as part of the schema. For now use defaults.
-  //
-  // Also would be able to set encoding here, or do something smart
-  // to figure out the encoding on the fly.
   cfile::WriterOptions opts;
 
   // Index the composite key by value
@@ -190,6 +191,9 @@ Status DiskRowSetWriter::AppendBlock(const RowBlock &block) {
   if (written_count_ == 0) {
     Slice enc_key = schema_->EncodeComparableKey(block.row(0), &last_encoded_key_);
     key_index_writer()->AddMetadataPair(DiskRowSet::kMinKeyMetaEntryName, enc_key);
+    if (FLAGS_rowset_metadata_store_keys) {
+      rowset_metadata_->set_min_encoded_key(enc_key.ToString());
+    }
     last_encoded_key_.clear();
   }
 
@@ -257,6 +261,9 @@ Status DiskRowSetWriter::FinishAndReleaseBlocks(BlockCreationTransaction* transa
       << "First Key not <= Last key: first_key=" << KUDU_REDACT(first_enc_slice.ToDebugString())
       << "   last_key=" << KUDU_REDACT(last_enc_slice.ToDebugString());
   key_index_writer()->AddMetadataPair(DiskRowSet::kMaxKeyMetaEntryName, last_enc_slice);
+  if (FLAGS_rowset_metadata_store_keys) {
+    rowset_metadata_->set_max_encoded_key(last_enc_slice.ToString());
+  }
 
   // Finish writing the columns themselves.
   RETURN_NOT_OK(col_writer_->FinishAndReleaseBlocks(transaction));
@@ -519,6 +526,7 @@ DiskRowSet::DiskRowSet(shared_ptr<RowSetMetadata> rowset_metadata,
       open_(false),
       log_anchor_registry_(log_anchor_registry),
       mem_trackers_(std::move(mem_trackers)),
+      num_rows_(-1),
       has_been_compacted_(false) {}
 
 Status DiskRowSet::Open() {
@@ -527,9 +535,7 @@ Status DiskRowSet::Open() {
                                mem_trackers_.tablet_tracker,
                                &base_data_));
 
-  rowid_t num_rows;
-  RETURN_NOT_OK(base_data_->CountRows(&num_rows));
-  RETURN_NOT_OK(DeltaTracker::Open(rowset_metadata_, num_rows,
+  RETURN_NOT_OK(DeltaTracker::Open(rowset_metadata_,
                                    log_anchor_registry_,
                                    mem_trackers_,
                                    &delta_tracker_));
@@ -621,14 +627,12 @@ Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
 
   const Schema* schema = &rowset_metadata_->tablet_schema();
 
-  vector<shared_ptr<DeltaStore> > included_stores;
+  RowIteratorOptions opts;
+  opts.projection = schema;
+  vector<shared_ptr<DeltaStore>> included_stores;
   unique_ptr<DeltaIterator> delta_iter;
   RETURN_NOT_OK(delta_tracker_->NewDeltaFileIterator(
-    schema,
-    MvccSnapshot::CreateSnapshotIncludingAllTransactions(),
-    REDO,
-    &included_stores,
-    &delta_iter));
+      opts, REDO, &included_stores, &delta_iter));
 
   out->reset(new MajorDeltaCompaction(rowset_metadata_->fs_manager(),
                                       *schema,
@@ -641,16 +645,14 @@ Status DiskRowSet::NewMajorDeltaCompaction(const vector<ColumnId>& col_ids,
   return Status::OK();
 }
 
-Status DiskRowSet::NewRowIterator(const Schema *projection,
-                                  const MvccSnapshot &mvcc_snap,
-                                  OrderMode /*order*/,
+Status DiskRowSet::NewRowIterator(const RowIteratorOptions& opts,
                                   gscoped_ptr<RowwiseIterator>* out) const {
   DCHECK(open_);
   shared_lock<rw_spinlock> l(component_lock_);
 
-  shared_ptr<CFileSet::Iterator> base_iter(base_data_->NewIterator(projection));
+  shared_ptr<CFileSet::Iterator> base_iter(base_data_->NewIterator(opts.projection));
   gscoped_ptr<ColumnwiseIterator> col_iter;
-  RETURN_NOT_OK(delta_tracker_->WrapIterator(base_iter, mvcc_snap, &col_iter));
+  RETURN_NOT_OK(delta_tracker_->WrapIterator(base_iter, opts, &col_iter));
 
   out->reset(new MaterializingIterator(
       shared_ptr<ColumnwiseIterator>(col_iter.release())));
@@ -670,6 +672,10 @@ Status DiskRowSet::MutateRow(Timestamp timestamp,
                              ProbeStats* stats,
                              OperationResultPB* result) {
   DCHECK(open_);
+#ifndef NDEBUG
+  rowid_t num_rows;
+  RETURN_NOT_OK(CountRows(&num_rows));
+#endif
   shared_lock<rw_spinlock> l(component_lock_);
 
   boost::optional<rowid_t> row_idx;
@@ -677,6 +683,9 @@ Status DiskRowSet::MutateRow(Timestamp timestamp,
   if (PREDICT_FALSE(row_idx == boost::none)) {
     return Status::NotFound("row not found");
   }
+#ifndef NDEBUG
+  CHECK_LT(*row_idx, num_rows);
+#endif
 
   // It's possible that the row key exists in this DiskRowSet, but it has
   // in fact been Deleted already. Check with the delta tracker to be sure.
@@ -695,6 +704,10 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
                                    bool* present,
                                    ProbeStats* stats) const {
   DCHECK(open_);
+#ifndef NDEBUG
+  rowid_t num_rows;
+  RETURN_NOT_OK(CountRows(&num_rows));
+#endif
   shared_lock<rw_spinlock> l(component_lock_);
 
   rowid_t row_idx;
@@ -703,6 +716,9 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
     // If it wasn't in the base data, then it's definitely not in the rowset.
     return Status::OK();
   }
+#ifndef NDEBUG
+  CHECK_LT(row_idx, num_rows);
+#endif
 
   // Otherwise it might be in the base data but deleted.
   bool deleted = false;
@@ -713,9 +729,15 @@ Status DiskRowSet::CheckRowPresent(const RowSetKeyProbe &probe,
 
 Status DiskRowSet::CountRows(rowid_t *count) const {
   DCHECK(open_);
-  shared_lock<rw_spinlock> l(component_lock_);
-
-  return base_data_->CountRows(count);
+  rowid_t num_rows = num_rows_.load();
+  if (PREDICT_TRUE(num_rows != -1)) {
+    *count = num_rows;
+  } else {
+    shared_lock<rw_spinlock> l(component_lock_);
+    RETURN_NOT_OK(base_data_->CountRows(count));
+    num_rows_.store(*count);
+  }
+  return Status::OK();
 }
 
 Status DiskRowSet::GetBounds(std::string* min_encoded_key,

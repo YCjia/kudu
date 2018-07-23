@@ -22,6 +22,7 @@ import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Field;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.util.Random;
 import java.util.Set;
 
 import com.google.common.base.Joiner;
@@ -40,11 +41,11 @@ import org.apache.kudu.master.Master;
 public class TestUtils {
   private static final Logger LOG = LoggerFactory.getLogger(TestUtils.class);
 
-  // Used by pidOfProcess()
-  private static String UNIX_PROCESS_CLS_NAME =  "java.lang.UNIXProcess";
   private static Set<String> VALID_SIGNALS =  ImmutableSet.of("STOP", "CONT", "TERM", "KILL");
 
   private static final String BIN_DIR_PROP = "binDir";
+
+  private static final String TEST_RANDOM_SEED_PROP = "testRandomSeed";
 
   /**
    * Return the path portion of a file URL, after decoding the escaped
@@ -95,6 +96,7 @@ public class TestUtils {
     // instead relying on setting -DbinDir for cases where the test libs may be in the Maven repo.
     // See the following code reviews for the discussion: https://gerrit.cloudera.org/5328 and
     // https://gerrit.cloudera.org/4630
+    // Note: Builds using Gradle do not have this issue.
 
     LOG.warn("Unable to find bin dir! codeSrcUrl={}", codeSrcUrl);
     return null;
@@ -126,13 +128,16 @@ public class TestUtils {
    */
   static int pidOfProcess(Process proc) throws Exception {
     Class<?> procCls = proc.getClass();
-    if (!procCls.getName().equals(UNIX_PROCESS_CLS_NAME)) {
-      throw new IllegalArgumentException("stopProcess() expects objects of class " +
-          UNIX_PROCESS_CLS_NAME + ", but " + procCls.getName() + " was passed in instead!");
+    try {
+      // Note: In Java 9+ you can call proc.getPid(). We use reflection
+      // because we support earlier version of java.
+      Field pidField = procCls.getDeclaredField("pid");
+      pidField.setAccessible(true);
+      return (Integer) pidField.get(proc);
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalArgumentException("pidOfProcess could not find or access the pid field" +
+          "via reflection on the class " + procCls.getName(), e);
     }
-    Field pidField = procCls.getDeclaredField("pid");
-    pidField.setAccessible(true);
-    return (Integer) pidField.get(proc);
   }
 
   /**
@@ -208,5 +213,22 @@ public class TestUtils {
     replicaBuilder.setTsInfo(tsInfoBuilder);
     replicaBuilder.setRole(role);
     return replicaBuilder;
+  }
+
+  /**
+   * Get an instance of Random for use in tests and logs the seed used.
+   *
+   * Uses a default seed of System.currentTimeMillis() with the option to
+   * override via the testRandomSeed system property.
+   */
+  public static Random getRandom() {
+    // First check the system property.
+    long seed = System.currentTimeMillis();
+    if (System.getProperty(TEST_RANDOM_SEED_PROP) != null) {
+      seed = Long.parseLong(System.getProperty(TEST_RANDOM_SEED_PROP));
+      LOG.info("System property {} is defined. Overriding random seed.", TEST_RANDOM_SEED_PROP, seed);
+    }
+    LOG.info("Using random seed: {}", seed);
+    return new Random(seed);
   }
 }

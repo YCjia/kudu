@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/tools/ksck_remote.h"
+
 #include <cstdint>
 #include <memory>
 #include <sstream>
@@ -22,26 +24,32 @@
 #include <vector>
 
 #include <boost/core/ref.hpp>
+#include <gflags/gflags.h>
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
-#include "kudu/client/shared_ptr.h"
 #include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/tools/data_gen_util.h"
 #include "kudu/tools/ksck.h"
-#include "kudu/tools/ksck_remote.h"
+#include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/promise.h"
 #include "kudu/util/random.h"
 #include "kudu/util/status.h"
@@ -50,6 +58,12 @@
 #include "kudu/util/thread.h"
 
 DECLARE_int32(heartbeat_interval_ms);
+DECLARE_int32(safe_time_max_lag_ms);
+
+DEFINE_int32(experimental_flag_for_ksck_test, 0,
+             "A flag marked experimental so it can be used to test ksck's "
+             "unusual flag detection features");
+TAG_FLAG(experimental_flag_for_ksck_test, experimental);
 
 namespace kudu {
 namespace tools {
@@ -87,12 +101,7 @@ class RemoteKsckTest : public KuduTest {
 
     InternalMiniClusterOptions opts;
 
-    // Hard-coded ports for the masters. This is safe, as these tests run under
-    // a resource lock (see CMakeLists.txt in this directory).
-    // TODO we should have a generic method to obtain n free ports.
-    opts.master_rpc_ports = { 11010, 11011, 11012 };
-
-    opts.num_masters = opts.master_rpc_ports.size();
+    opts.num_masters = 3;
     opts.num_tablet_servers = 3;
     mini_cluster_.reset(new InternalMiniCluster(env_, opts));
     ASSERT_OK(mini_cluster_->Start());
@@ -117,9 +126,8 @@ class RemoteKsckTest : public KuduTest {
         master_addresses.push_back(
             mini_cluster_->mini_master(i)->bound_rpc_addr_str());
     }
-    std::shared_ptr<KsckMaster> master;
-    ASSERT_OK(RemoteKsckMaster::Build(master_addresses, &master));
-    std::shared_ptr<KsckCluster> cluster(new KsckCluster(master));
+    std::shared_ptr<KsckCluster> cluster;
+    ASSERT_OK(RemoteKsckCluster::Build(master_addresses, &cluster));
     ksck_.reset(new Ksck(cluster, &err_stream_));
   }
 
@@ -212,21 +220,77 @@ class RemoteKsckTest : public KuduTest {
   Random random_;
 };
 
-TEST_F(RemoteKsckTest, TestMasterOk) {
-  ASSERT_OK(ksck_->CheckMasterRunning());
-}
-
-TEST_F(RemoteKsckTest, TestTabletServersOk) {
-  ASSERT_OK(ksck_->CheckMasterRunning());
+TEST_F(RemoteKsckTest, TestClusterOk) {
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckMasterConsensus());
+  ASSERT_OK(ksck_->CheckClusterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
   ASSERT_OK(ksck_->FetchInfoFromTabletServers());
+  ASSERT_OK(ksck_->CheckTabletServerUnusualFlags());
+}
+
+TEST_F(RemoteKsckTest, TestCheckUnusualFlags) {
+  FLAGS_experimental_flag_for_ksck_test = 1;
+
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckClusterRunning());
+  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
+  ASSERT_OK(ksck_->FetchInfoFromTabletServers());
+  ASSERT_OK(ksck_->CheckTabletServerUnusualFlags());
+  ASSERT_OK(ksck_->PrintResults());
+
+  const string& err_string = err_stream_.str();
+  ASSERT_STR_CONTAINS(err_string,
+      "Some masters have unsafe, experimental, or hidden flags set");
+  ASSERT_STR_CONTAINS(err_string,
+      "Some tablet servers have unsafe, experimental, or hidden flags set");
+  ASSERT_STR_CONTAINS(err_string, "experimental_flag_for_ksck_test");
+}
+
+TEST_F(RemoteKsckTest, TestTabletServerMismatchedUUID) {
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckMasterConsensus());
+  ASSERT_OK(ksck_->CheckClusterRunning());
+  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
+
+  tserver::MiniTabletServer* tablet_server = mini_cluster_->mini_tablet_server(0);
+  string old_uuid = tablet_server->uuid();
+  string root_dir = mini_cluster_->GetTabletServerFsRoot(0) + "2";
+  HostPort address = HostPort(tablet_server->bound_rpc_addr());
+
+  tablet_server->Shutdown();
+  tserver::MiniTabletServer new_tablet_server(root_dir, address);
+  ASSERT_OK(new_tablet_server.Start());
+  ASSERT_OK(new_tablet_server.WaitStarted());
+
+  string new_uuid = new_tablet_server.uuid();
+
+  ASSERT_TRUE(ksck_->FetchInfoFromTabletServers().IsNetworkError());
+  ASSERT_OK(ksck_->PrintResults());
+
+  string match_string = "Error from $0: Remote error: ID reported by tablet server "
+                        "($1) doesn't match the expected ID: $2 (WRONG_SERVER_UUID)";
+  ASSERT_STR_CONTAINS(err_stream_.str(), strings::Substitute(match_string, address.ToString(),
+                                                             new_uuid, old_uuid));
+  tserver::MiniTabletServer* ts = mini_cluster_->mini_tablet_server(1);
+  ASSERT_STR_CONTAINS(err_stream_.str(), strings::Substitute("$0 | $1 | HEALTHY", ts->uuid(),
+                                                             ts->bound_rpc_addr().ToString()));
+  ts = mini_cluster_->mini_tablet_server(2);
+  ASSERT_STR_CONTAINS(err_stream_.str(), strings::Substitute("$0 | $1 | HEALTHY", ts->uuid(),
+                                                             ts->bound_rpc_addr().ToString()));
 }
 
 TEST_F(RemoteKsckTest, TestTableConsistency) {
   MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(30);
   Status s;
   while (MonoTime::Now() < deadline) {
-    ASSERT_OK(ksck_->CheckMasterRunning());
+    ASSERT_OK(ksck_->CheckMasterHealth());
+    ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+    ASSERT_OK(ksck_->CheckMasterConsensus());
+    ASSERT_OK(ksck_->CheckClusterRunning());
     ASSERT_OK(ksck_->FetchTableAndTabletInfo());
     ASSERT_OK(ksck_->FetchInfoFromTabletServers());
     s = ksck_->CheckTablesConsistency();
@@ -246,7 +310,10 @@ TEST_F(RemoteKsckTest, TestChecksum) {
   MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(30);
   Status s;
   while (MonoTime::Now() < deadline) {
-    ASSERT_OK(ksck_->CheckMasterRunning());
+    ASSERT_OK(ksck_->CheckMasterHealth());
+    ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+    ASSERT_OK(ksck_->CheckMasterConsensus());
+    ASSERT_OK(ksck_->CheckClusterRunning());
     ASSERT_OK(ksck_->FetchTableAndTabletInfo());
     ASSERT_OK(ksck_->FetchInfoFromTabletServers());
 
@@ -271,7 +338,7 @@ TEST_F(RemoteKsckTest, TestChecksumTimeout) {
   uint64_t num_writes = 10000;
   LOG(INFO) << "Generating row writes...";
   ASSERT_OK(GenerateRowWrites(num_writes));
-  ASSERT_OK(ksck_->CheckMasterRunning());
+  ASSERT_OK(ksck_->CheckClusterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
   ASSERT_OK(ksck_->FetchInfoFromTabletServers());
   // Use an impossibly low timeout value of zero!
@@ -292,7 +359,10 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshot) {
   CHECK(started_writing.WaitFor(MonoDelta::FromSeconds(30)));
 
   uint64_t ts = client_->GetLatestObservedTimestamp();
-  ASSERT_OK(ksck_->CheckMasterRunning());
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckMasterConsensus());
+  ASSERT_OK(ksck_->CheckClusterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
   ASSERT_OK(ksck_->FetchInfoFromTabletServers());
   ASSERT_OK(ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromSeconds(10), 16, true, ts)));
@@ -315,7 +385,10 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshotCurrentTimestamp) {
                  &writer_thread);
   CHECK(started_writing.WaitFor(MonoDelta::FromSeconds(30)));
 
-  ASSERT_OK(ksck_->CheckMasterRunning());
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckMasterConsensus());
+  ASSERT_OK(ksck_->CheckClusterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
   ASSERT_OK(ksck_->FetchInfoFromTabletServers());
   ASSERT_OK(ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromSeconds(10), 16, true,
@@ -326,13 +399,20 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshotCurrentTimestamp) {
 }
 
 TEST_F(RemoteKsckTest, TestLeaderMasterDown) {
-  // Make sure ksck's client is created with the current leader master.
-  ASSERT_OK(ksck_->CheckMasterRunning());
+  // Make sure ksck's client is created with the current leader master and that
+  // all masters are healthy.
+  ASSERT_OK(ksck_->CheckMasterHealth());
+  ASSERT_OK(ksck_->CheckMasterUnusualFlags());
+  ASSERT_OK(ksck_->CheckMasterConsensus());
+  ASSERT_OK(ksck_->CheckClusterRunning());
 
   // Shut down the leader master.
   int leader_idx;
   ASSERT_OK(mini_cluster_->GetLeaderMasterIndex(&leader_idx));
   mini_cluster_->mini_master(leader_idx)->Shutdown();
+
+  // Check that the bad master health is detected.
+  ASSERT_TRUE(ksck_->CheckMasterHealth().IsNetworkError());
 
   // Try to ksck. The underlying client will need to find the new leader master
   // in order for the test to pass.

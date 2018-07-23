@@ -17,6 +17,7 @@
 
 package org.apache.kudu.client;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.EQUAL;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.GREATER;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.GREATER_EQUAL;
@@ -24,6 +25,7 @@ import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS_EQUAL;
 import static org.apache.kudu.client.KuduPredicate.PredicateType.RANGE;
 
+import java.math.BigDecimal;
 import java.util.Arrays;
 
 import com.google.common.base.Preconditions;
@@ -33,6 +35,7 @@ import org.junit.Test;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Type;
+import org.apache.kudu.util.DecimalUtil;
 
 public class TestKuduPredicate {
 
@@ -62,6 +65,21 @@ public class TestKuduPredicate {
 
   private static final ColumnSchema binaryCol =
       new ColumnSchema.ColumnSchemaBuilder("binary", Type.BINARY).build();
+
+  private static final ColumnSchema decimal32Col =
+      new ColumnSchema.ColumnSchemaBuilder("decimal32", Type.DECIMAL)
+          .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL32_PRECISION, 2))
+          .build();
+
+  private static final ColumnSchema decimal64Col =
+      new ColumnSchema.ColumnSchemaBuilder("decimal64", Type.DECIMAL)
+          .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL64_PRECISION, 2))
+          .build();
+
+  private static final ColumnSchema decimal128Col =
+      new ColumnSchema.ColumnSchemaBuilder("decimal128", Type.DECIMAL)
+          .typeAttributes(DecimalUtil.typeAttributes(DecimalUtil.MAX_DECIMAL128_PRECISION, 2))
+          .build();
 
   private static KuduPredicate intRange(int lower, int upper) {
     Preconditions.checkArgument(lower < upper);
@@ -844,6 +862,66 @@ public class TestKuduPredicate {
               KuduPredicate.newInListPredicate(doubleCol, ImmutableList.of(14d, 18d, 20d)),
               KuduPredicate.newInListPredicate(doubleCol, ImmutableList.of(14d, 18d)));
 
+    testMerge(KuduPredicate.newComparisonPredicate(decimal32Col, GREATER_EQUAL,
+        BigDecimal.valueOf(12345, 2)),
+        KuduPredicate.newComparisonPredicate(decimal32Col, LESS,
+            BigDecimal.valueOf(67890,2)),
+        new KuduPredicate(RANGE,
+            decimal32Col,
+            Bytes.fromBigDecimal(BigDecimal.valueOf(12345, 2),
+                DecimalUtil.MAX_DECIMAL32_PRECISION),
+            Bytes.fromBigDecimal(BigDecimal.valueOf(67890, 2),
+                DecimalUtil.MAX_DECIMAL32_PRECISION)));
+
+    testMerge(KuduPredicate.newInListPredicate(decimal32Col, ImmutableList.of(
+            BigDecimal.valueOf(12345, 2),
+            BigDecimal.valueOf(45678, 2))),
+        KuduPredicate.newInListPredicate(decimal32Col, ImmutableList.of(
+            BigDecimal.valueOf(45678, 2),
+            BigDecimal.valueOf(98765, 2))),
+        KuduPredicate.newInListPredicate(decimal32Col, ImmutableList.of(
+            BigDecimal.valueOf(45678, 2))));
+
+    testMerge(KuduPredicate.newInListPredicate(decimal64Col, ImmutableList.of(
+        BigDecimal.valueOf(12345678910L, 2),
+        BigDecimal.valueOf(34567891011L, 2))),
+        KuduPredicate.newInListPredicate(decimal64Col, ImmutableList.of(
+            BigDecimal.valueOf(34567891011L, 2),
+            BigDecimal.valueOf(98765432111L, 2))),
+        KuduPredicate.newInListPredicate(decimal64Col, ImmutableList.of(
+            BigDecimal.valueOf(34567891011L, 2))));
+
+    testMerge(KuduPredicate.newComparisonPredicate(decimal64Col, GREATER_EQUAL,
+        BigDecimal.valueOf(12345678910L, 2)),
+        KuduPredicate.newComparisonPredicate(decimal64Col, LESS,
+            BigDecimal.valueOf(67890101112L,2)),
+        new KuduPredicate(RANGE,
+            decimal64Col,
+            Bytes.fromBigDecimal(BigDecimal.valueOf(12345678910L, 2),
+                DecimalUtil.MAX_DECIMAL64_PRECISION),
+            Bytes.fromBigDecimal(BigDecimal.valueOf(67890101112L, 2),
+                DecimalUtil.MAX_DECIMAL64_PRECISION)));
+
+    testMerge(KuduPredicate.newInListPredicate(decimal128Col, ImmutableList.of(
+        new BigDecimal("1234567891011121314.15"),
+        new BigDecimal("3456789101112131415.16"))),
+        KuduPredicate.newInListPredicate(decimal128Col, ImmutableList.of(
+            new BigDecimal("3456789101112131415.16"),
+            new BigDecimal("9876543212345678910.11"))),
+        KuduPredicate.newInListPredicate(decimal128Col, ImmutableList.of(
+            new BigDecimal("3456789101112131415.16"))));
+
+    testMerge(KuduPredicate.newComparisonPredicate(decimal128Col, GREATER_EQUAL,
+        new BigDecimal("1234567891011121314.15")),
+        KuduPredicate.newComparisonPredicate(decimal128Col, LESS,
+            new BigDecimal("67891011121314151617.18")),
+        new KuduPredicate(RANGE,
+            decimal128Col,
+            Bytes.fromBigDecimal(new BigDecimal("1234567891011121314.15"),
+                DecimalUtil.MAX_DECIMAL128_PRECISION),
+            Bytes.fromBigDecimal(new BigDecimal("67891011121314151617.18"),
+                DecimalUtil.MAX_DECIMAL128_PRECISION)));
+
     testMerge(KuduPredicate.newComparisonPredicate(binaryCol, GREATER_EQUAL,
                                                    new byte[] { 0, 1, 2, 3, 4, 5, 6 }),
               KuduPredicate.newComparisonPredicate(binaryCol, LESS, new byte[] { 10 }),
@@ -852,9 +930,14 @@ public class TestKuduPredicate {
                                 new byte[] { 0, 1, 2, 3, 4, 5, 6 },
                                 new byte[] { 10 }));
 
-    testMerge(KuduPredicate.newInListPredicate(binaryCol, ImmutableList.of("a".getBytes(), "b".getBytes(), "c".getBytes(), "d".getBytes())),
-              KuduPredicate.newInListPredicate(binaryCol, ImmutableList.of("b".getBytes(), "d".getBytes(), "e".getBytes())),
-              KuduPredicate.newInListPredicate(binaryCol, ImmutableList.of("b".getBytes(), "d".getBytes())));
+    byte[] bA = "a".getBytes(UTF_8);
+    byte[] bB = "b".getBytes(UTF_8);
+    byte[] bC = "c".getBytes(UTF_8);
+    byte[] bD = "d".getBytes(UTF_8);
+    byte[] bE = "e".getBytes(UTF_8);
+    testMerge(KuduPredicate.newInListPredicate(binaryCol, ImmutableList.of(bA, bB, bC, bD)),
+              KuduPredicate.newInListPredicate(binaryCol, ImmutableList.of(bB, bD, bE)),
+              KuduPredicate.newInListPredicate(binaryCol, ImmutableList.of(bB, bD)));
   }
 
   @Test
@@ -871,11 +954,13 @@ public class TestKuduPredicate {
                         KuduPredicate.newComparisonPredicate(floatCol, LESS, Math.nextAfter(12.345f, Float.POSITIVE_INFINITY)));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(doubleCol, LESS_EQUAL, 12.345),
                         KuduPredicate.newComparisonPredicate(doubleCol, LESS, Math.nextAfter(12.345, Float.POSITIVE_INFINITY)));
+    Assert.assertEquals(
+        KuduPredicate.newComparisonPredicate(decimal32Col, LESS_EQUAL, BigDecimal.valueOf(12345,2)),
+        KuduPredicate.newComparisonPredicate(decimal32Col, LESS, BigDecimal.valueOf(12346,2)));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(stringCol, LESS_EQUAL, "a"),
                         KuduPredicate.newComparisonPredicate(stringCol, LESS, "a\0"));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(binaryCol, LESS_EQUAL, new byte[] { (byte) 10 }),
                         KuduPredicate.newComparisonPredicate(binaryCol, LESS, new byte[] { (byte) 10, (byte) 0 }));
-
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(byteCol, LESS_EQUAL, Byte.MAX_VALUE),
                         KuduPredicate.newIsNotNullPredicate(byteCol));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(shortCol, LESS_EQUAL, Short.MAX_VALUE),
@@ -908,6 +993,9 @@ public class TestKuduPredicate {
                         KuduPredicate.newComparisonPredicate(floatCol, GREATER, 12.345f));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(doubleCol, GREATER_EQUAL, Math.nextAfter(12.345, Float.MAX_VALUE)),
                         KuduPredicate.newComparisonPredicate(doubleCol, GREATER, 12.345));
+    Assert.assertEquals(
+        KuduPredicate.newComparisonPredicate(decimal32Col, GREATER_EQUAL, BigDecimal.valueOf(12346, 2)),
+        KuduPredicate.newComparisonPredicate(decimal32Col, GREATER, BigDecimal.valueOf(12345, 2)));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(stringCol, GREATER_EQUAL, "a\0"),
                         KuduPredicate.newComparisonPredicate(stringCol, GREATER, "a"));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(binaryCol, GREATER_EQUAL, new byte[] { (byte) 10, (byte) 0 }),
@@ -945,6 +1033,15 @@ public class TestKuduPredicate {
                         KuduPredicate.none(floatCol));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(doubleCol, LESS, Double.NEGATIVE_INFINITY),
                         KuduPredicate.none(doubleCol));
+    Assert.assertEquals(KuduPredicate.newComparisonPredicate(decimal32Col, LESS,
+        DecimalUtil.minValue(DecimalUtil.MAX_DECIMAL32_PRECISION, 2)),
+        KuduPredicate.none(decimal32Col));
+    Assert.assertEquals(KuduPredicate.newComparisonPredicate(decimal64Col, LESS,
+        DecimalUtil.minValue(DecimalUtil.MAX_DECIMAL64_PRECISION, 2)),
+        KuduPredicate.none(decimal64Col));
+    Assert.assertEquals(KuduPredicate.newComparisonPredicate(decimal128Col, LESS,
+        DecimalUtil.minValue(DecimalUtil.MAX_DECIMAL128_PRECISION, 2)),
+        KuduPredicate.none(decimal128Col));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(stringCol, LESS, ""),
                         KuduPredicate.none(stringCol));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(binaryCol, LESS, new byte[] {}),
@@ -965,6 +1062,15 @@ public class TestKuduPredicate {
                         KuduPredicate.newIsNotNullPredicate(floatCol));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(doubleCol, GREATER_EQUAL, Double.NEGATIVE_INFINITY),
                         KuduPredicate.newIsNotNullPredicate(doubleCol));
+    Assert.assertEquals(KuduPredicate.newComparisonPredicate(decimal32Col, GREATER_EQUAL,
+        DecimalUtil.minValue(DecimalUtil.MAX_DECIMAL32_PRECISION, 2)),
+        KuduPredicate.newIsNotNullPredicate(decimal32Col));
+    Assert.assertEquals(KuduPredicate.newComparisonPredicate(decimal64Col, GREATER_EQUAL,
+        DecimalUtil.minValue(DecimalUtil.MAX_DECIMAL64_PRECISION, 2)),
+        KuduPredicate.newIsNotNullPredicate(decimal64Col));
+    Assert.assertEquals(KuduPredicate.newComparisonPredicate(decimal128Col, GREATER_EQUAL,
+        DecimalUtil.minValue(DecimalUtil.MAX_DECIMAL128_PRECISION, 2)),
+        KuduPredicate.newIsNotNullPredicate(decimal128Col));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(stringCol, GREATER_EQUAL, ""),
                         KuduPredicate.newIsNotNullPredicate(stringCol));
     Assert.assertEquals(KuduPredicate.newComparisonPredicate(binaryCol, GREATER_EQUAL, new byte[] {}),
@@ -1000,6 +1106,15 @@ public class TestKuduPredicate {
                         KuduPredicate.newComparisonPredicate(floatCol, EQUAL, 123.456f).toString());
     Assert.assertEquals("`double` = 123.456",
                         KuduPredicate.newComparisonPredicate(doubleCol, EQUAL, 123.456).toString());
+    Assert.assertEquals("`decimal32` = 123.45",
+        KuduPredicate.newComparisonPredicate(decimal32Col, EQUAL,
+            BigDecimal.valueOf(12345, 2)).toString());
+    Assert.assertEquals("`decimal64` = 123456789.10",
+        KuduPredicate.newComparisonPredicate(decimal64Col, EQUAL,
+            BigDecimal.valueOf(12345678910L, 2)).toString());
+    Assert.assertEquals("`decimal128` = 1234567891011121314.15",
+        KuduPredicate.newComparisonPredicate(decimal128Col, EQUAL,
+            new BigDecimal("1234567891011121314.15")).toString());
     Assert.assertEquals("`string` = \"my string\"",
                         KuduPredicate.newComparisonPredicate(stringCol, EQUAL, "my string").toString());
     Assert.assertEquals("`binary` = 0xAB01CD", KuduPredicate.newComparisonPredicate(
@@ -1038,4 +1153,21 @@ public class TestKuduPredicate {
         binaryCol, ImmutableList.of(new byte[] { (byte) 0xAB, (byte) 0x01, (byte) 0xCD },
                                     new byte[] { (byte) 0x00 })).toString());
   }
+
+  @Test
+  public void TestDecimalCoercion() {
+    Assert.assertEquals(
+        KuduPredicate.newComparisonPredicate(decimal32Col, LESS, BigDecimal.valueOf(123)),
+        KuduPredicate.newComparisonPredicate(decimal32Col, LESS, BigDecimal.valueOf(12300, 2))
+    );
+    Assert.assertEquals(
+        KuduPredicate.newComparisonPredicate(decimal32Col, GREATER, BigDecimal.valueOf(123, 1)),
+        KuduPredicate.newComparisonPredicate(decimal32Col, GREATER, BigDecimal.valueOf(1230, 2))
+    );
+    Assert.assertEquals(
+        KuduPredicate.newComparisonPredicate(decimal32Col, EQUAL, BigDecimal.valueOf(1, 0)),
+        KuduPredicate.newComparisonPredicate(decimal32Col, EQUAL, BigDecimal.valueOf(100, 2))
+    );
+  }
+
 }

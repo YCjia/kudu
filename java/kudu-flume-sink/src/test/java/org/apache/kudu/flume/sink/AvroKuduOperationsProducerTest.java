@@ -19,6 +19,7 @@
 
 package org.apache.kudu.flume.sink;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.kudu.flume.sink.AvroKuduOperationsProducer.SCHEMA_LITERAL_HEADER;
 import static org.apache.kudu.flume.sink.AvroKuduOperationsProducer.SCHEMA_PROP;
 import static org.apache.kudu.flume.sink.AvroKuduOperationsProducer.SCHEMA_URL_HEADER;
@@ -26,18 +27,20 @@ import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.MASTER_A
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.PRODUCER;
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.PRODUCER_PREFIX;
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.TABLE_NAME;
+import static org.apache.kudu.util.ClientTestUtil.scanTableToStrings;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.IOException;
+import java.math.BigDecimal;
+import java.net.URL;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 
-import com.google.common.base.Charsets;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
@@ -49,13 +52,12 @@ import org.apache.avro.specific.SpecificDatumWriter;
 import org.apache.flume.Channel;
 import org.apache.flume.Context;
 import org.apache.flume.Event;
-import org.apache.flume.FlumeException;
 import org.apache.flume.Sink;
 import org.apache.flume.Transaction;
 import org.apache.flume.channel.MemoryChannel;
 import org.apache.flume.conf.Configurables;
 import org.apache.flume.event.EventBuilder;
-import org.junit.BeforeClass;
+import org.apache.kudu.util.DecimalUtil;
 import org.junit.Test;
 
 import org.apache.kudu.ColumnSchema;
@@ -66,20 +68,23 @@ import org.apache.kudu.client.CreateTableOptions;
 import org.apache.kudu.client.KuduTable;
 
 public class AvroKuduOperationsProducerTest extends BaseKuduTest {
-  private static final String schemaPath = "src/test/avro/testAvroKuduOperationsProducer.avsc";
+  private static String schemaUriString;
   private static String schemaLiteral;
+
+  static {
+    try {
+      String schemaPath = "/testAvroKuduOperationsProducer.avsc";
+      URL schemaUrl = AvroKuduOperationsProducerTest.class.getResource(schemaPath);
+      File schemaFile = Paths.get(schemaUrl.toURI()).toFile();
+      schemaUriString = schemaFile.getAbsoluteFile().toURI().toString();
+      schemaLiteral = Files.asCharSource(schemaFile, UTF_8).read();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
 
   enum SchemaLocation {
     GLOBAL, URL, LITERAL
-  }
-
-  @BeforeClass
-  public static void setupAvroSchemaBeforeClass() {
-    try {
-      schemaLiteral = Files.toString(new File(schemaPath), Charsets.UTF_8);
-    } catch (IOException e) {
-      throw new FlumeException("Unable to read schema file!", e);
-    }
   }
 
   @Test
@@ -112,9 +117,8 @@ public class AvroKuduOperationsProducerTest extends BaseKuduTest {
     KuduTable table = createNewTable(
         String.format("test%sevents%s", eventCount, schemaLocation));
     String tableName = table.getName();
-    String schemaURI = new File(schemaPath).getAbsoluteFile().toURI().toString();
     Context ctx = schemaLocation != SchemaLocation.GLOBAL ? new Context()
-        : new Context(ImmutableMap.of(PRODUCER_PREFIX + SCHEMA_PROP, schemaURI));
+        : new Context(ImmutableMap.of(PRODUCER_PREFIX + SCHEMA_PROP, schemaUriString));
     KuduSink sink = createSink(tableName, ctx);
 
     Channel channel = new MemoryChannel();
@@ -148,6 +152,8 @@ public class AvroKuduOperationsProducerTest extends BaseKuduTest {
     columns.add(new ColumnSchema.ColumnSchemaBuilder("doubleField", Type.DOUBLE).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("nullableField", Type.STRING).nullable(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("stringField", Type.STRING).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("decimalField", Type.DECIMAL)
+        .typeAttributes(DecimalUtil.typeAttributes(9, 1)).build());
     CreateTableOptions createOptions =
         new CreateTableOptions().setRangePartitionColumns(ImmutableList.of("key"))
             .setNumReplicas(1);
@@ -176,6 +182,7 @@ public class AvroKuduOperationsProducerTest extends BaseKuduTest {
       record.setDoubleField(2.71828 * i);
       record.setNullableField(i % 2 == 0 ? null : "taco");
       record.setStringField(String.format("hello %d", i));
+      record.setDecimalField(BigDecimal.valueOf(i, 1));
       ByteArrayOutputStream out = new ByteArrayOutputStream();
       Encoder encoder = EncoderFactory.get().binaryEncoder(out, null);
       DatumWriter<AvroKuduOperationsProducerTestRecord> writer =
@@ -184,8 +191,7 @@ public class AvroKuduOperationsProducerTest extends BaseKuduTest {
       encoder.flush();
       Event e = EventBuilder.withBody(out.toByteArray());
       if (schemaLocation == SchemaLocation.URL) {
-        String schemaURI = new File(schemaPath).getAbsoluteFile().toURI().toString();
-        e.setHeaders(ImmutableMap.of(SCHEMA_URL_HEADER, schemaURI));
+        e.setHeaders(ImmutableMap.of(SCHEMA_URL_HEADER, schemaUriString));
       } else if (schemaLocation == SchemaLocation.LITERAL) {
         e.setHeaders(ImmutableMap.of(SCHEMA_LITERAL_HEADER, schemaLiteral));
       }
@@ -198,12 +204,14 @@ public class AvroKuduOperationsProducerTest extends BaseKuduTest {
     for (int i = 0; i < eventCount; i++) {
       answers.add(String.format(
           "INT32 key=%s, INT64 longField=%s, DOUBLE doubleField=%s, " +
-              "STRING nullableField=%s, STRING stringField=hello %s",
+              "STRING nullableField=%s, STRING stringField=hello %s, " +
+              "DECIMAL decimalField(9, 1)=%s",
           10 * i,
           2 * i,
           2.71828 * i,
           i % 2 == 0 ? "NULL" : "taco",
-          i));
+          i,
+          BigDecimal.valueOf(i, 1)));
     }
     Collections.sort(answers);
     return answers;

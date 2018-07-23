@@ -54,7 +54,7 @@
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
@@ -89,6 +89,7 @@ using kudu::cluster::ExternalTabletServer;
 using kudu::consensus::COMMITTED_OPID;
 using kudu::consensus::ConsensusMetadataPB;
 using kudu::consensus::ConsensusStatePB;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::consensus::RaftPeerPB;
 using kudu::itest::AddServer;
 using kudu::itest::DeleteTablet;
@@ -174,8 +175,8 @@ class DeleteTableITest : public ExternalMiniClusterITestBase {
 
 string DeleteTableITest::GetLeaderUUID(const string& ts_uuid, const string& tablet_id) {
   ConsensusStatePB cstate;
-  CHECK_OK(itest::GetConsensusState(ts_map_[ts_uuid], tablet_id,
-                                    MonoDelta::FromSeconds(10), &cstate));
+  CHECK_OK(itest::GetConsensusState(ts_map_[ts_uuid], tablet_id, MonoDelta::FromSeconds(10),
+                                    EXCLUDE_HEALTH_REPORT, &cstate));
   return cstate.leader_uuid();
 }
 
@@ -1093,10 +1094,32 @@ TEST_F(DeleteTableITest, TestWebPageForTombstonedTablet) {
 }
 
 TEST_F(DeleteTableITest, TestUnknownTabletsAreNotDeleted) {
-  // Speed up heartbeating so that the unknown tablet is detected faster.
-  vector<string> extra_ts_flags = { "--heartbeat_interval_ms=10" };
+  //
+  // NOTE on disabled RPC authentication and encryption:
+  //   This test scenario would be flaky if the master/tserver authentication
+  //   were done via TLS certificates. That's because the scenario involves
+  //   removing master's data directory along with the IPKI information. Once
+  //   the master re-generates its IPKI system records and starts using the new
+  //   TLS server certificate signed by the newly generated CA private key,
+  //   the tserver fails to verify the new master's certificate using the old CA
+  //   certificate.
+  //
+  constexpr int kNumTabletServers = 1;
+  const vector<string> extra_ts_flags = {
+    // Speed up heartbeating so that the unknown tablet is detected faster.
+    "--heartbeat_interval_ms=10",
 
-  NO_FATALS(StartCluster(extra_ts_flags, {}, 1));
+    // See the note above on disabled RPC authentication and encryption.
+    "--rpc_authentication=disabled",
+    "--rpc_encryption=disabled",
+  };
+  const vector<string> extra_master_flags = {
+    // See the note above on disabled RPC authentication and encryption.
+    "--rpc_authentication=disabled",
+    "--rpc_encryption=disabled",
+  };
+
+  NO_FATALS(StartCluster(extra_ts_flags, extra_master_flags, kNumTabletServers));
 
   Schema schema(GetSimpleTestSchema());
   client::KuduSchema client_schema(client::KuduSchemaFromSchema(schema));
@@ -1113,22 +1136,12 @@ TEST_F(DeleteTableITest, TestUnknownTabletsAreNotDeleted) {
   ASSERT_OK(cluster_->master()->DeleteFromDisk());
   ASSERT_OK(cluster_->master()->Restart());
 
-  // Give the master a chance to finish writing the new master tablet to disk
-  // so that it can be found after the subsequent restart below.
-  ASSERT_OK(cluster_->master()->WaitForCatalogManager());
-
-  // The master should not delete the tablet. Let's wait for at least one
-  // heartbeat to pass.
+  // Let's wait for tablet server registration with the master: it guarantees
+  // at least one heartbeat is processed by the master.
+  ASSERT_OK(cluster_->WaitForTabletServerCount(kNumTabletServers,
+                                               MonoDelta::FromSeconds(30)));
+  // The master should not delete the tablet.
   int64_t num_delete_attempts;
-  ASSERT_EVENTUALLY([&]() {
-    int64_t num_heartbeats;
-    ASSERT_OK(GetInt64Metric(
-        cluster_->master()->bound_http_hostport(),
-        &METRIC_ENTITY_server, "kudu.master",
-        &METRIC_handler_latency_kudu_master_MasterService_TSHeartbeat, "total_count",
-        &num_heartbeats));
-    ASSERT_GE(num_heartbeats, 1);
-  });
   ASSERT_OK(GetInt64Metric(
       cluster_->tablet_server(0)->bound_http_hostport(),
       &METRIC_ENTITY_server, "kudu.tabletserver",
@@ -1146,7 +1159,14 @@ TEST_F(DeleteTableITest, TestNoDeleteTombstonedTablets) {
   }
 
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
-  NO_FATALS(StartCluster({}, {}, /*num_tablet_servers=*/ 4));
+  const vector<string> master_flags = {
+    // If running with the 3-4-3 replication scheme, the catalog manager
+    // controls replacement of replicas: it's necessary to disable that default
+    // behavior since this test manages replicas on its own.
+    "--catalog_manager_evict_excess_replicas=false",
+    "--master_add_server_when_underreplicated=false",
+  };
+  NO_FATALS(StartCluster({}, master_flags, /*num_tablet_servers=*/ 4));
   const int kNumReplicas = 3;
 
   // Create a table on the cluster. We're just using TestWorkload
@@ -1497,6 +1517,8 @@ TEST_P(DeleteTableWhileScanInProgressParamTest, Test) {
         return "READ_LATEST";
       case KuduScanner::READ_AT_SNAPSHOT:
         return "READ_AT_SNAPSHOT";
+      case KuduScanner::READ_YOUR_WRITES:
+        return "READ_YOUR_WRITES";
       default:
         return "UNKNOWN";
     }
@@ -1563,7 +1585,7 @@ TEST_P(DeleteTableWhileScanInProgressParamTest, Test) {
 
   using kudu::client::sp::shared_ptr;
   shared_ptr<KuduTable> table;
-  ASSERT_OK(client_->OpenTable(w.table_name(), &table));
+  ASSERT_OK(w.client()->OpenTable(w.table_name(), &table));
   KuduScanner scanner(table.get());
   ASSERT_OK(scanner.SetReadMode(mode));
   ASSERT_OK(scanner.SetSelection(sel));
@@ -1621,6 +1643,7 @@ TEST_P(DeleteTableWhileScanInProgressParamTest, Test) {
 const KuduScanner::ReadMode read_modes[] = {
   KuduScanner::READ_LATEST,
   KuduScanner::READ_AT_SNAPSHOT,
+  KuduScanner::READ_YOUR_WRITES,
 };
 const KuduClient::ReplicaSelection replica_selectors[] = {
   KuduClient::LEADER_ONLY,

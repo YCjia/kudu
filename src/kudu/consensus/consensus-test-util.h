@@ -27,16 +27,17 @@
 #include <boost/bind.hpp>
 #include <gmock/gmock.h>
 
+#include "kudu/clock/clock.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus_peers.h"
 #include "kudu/consensus/consensus_queue.h"
 #include "kudu/consensus/log.h"
+#include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
-#include "kudu/clock/clock.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/pb_util.h"
@@ -141,6 +142,10 @@ class TestPeerProxy : public PeerProxy {
   };
 
   explicit TestPeerProxy(ThreadPool* pool) : pool_(pool) {}
+
+  std::string PeerName() const override {
+    return "TestPeerProxy";
+  }
 
  protected:
   // Register the RPC callback in order to call later.
@@ -543,7 +548,9 @@ class LocalTestPeerProxy : public TestPeerProxy {
     Status s = peers_->GetPeerByUuid(peer_uuid_, &peer);
 
     if (s.ok()) {
-      s = peer->RequestVote(&other_peer_req, boost::none, &other_peer_resp);
+      s = peer->RequestVote(&other_peer_req,
+                            TabletVotingState(boost::none, tablet::TABLET_DATA_READY),
+                            &other_peer_resp);
     }
     if (!s.ok()) {
       LOG(WARNING) << "Could not RequestVote from replica with request: "

@@ -45,7 +45,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
@@ -144,7 +144,7 @@ void TabletServerIntegrationTestBase::CreateCluster(
 
   cluster_.reset(new cluster::ExternalMiniCluster(std::move(opts)));
   ASSERT_OK(cluster_->Start());
-  inspect_.reset(new itest::ExternalMiniClusterFsInspector(cluster_.get()));
+  inspect_.reset(new itest::MiniClusterFsInspector(cluster_.get()));
   CreateTSProxies();
 }
 
@@ -512,6 +512,7 @@ Status TabletServerIntegrationTestBase::CheckTabletServersAreAlive(int num_table
 
 void TabletServerIntegrationTestBase::TearDown() {
   STLDeleteValues(&tablet_servers_);
+  TabletServerTestBase::TearDown();
 }
 
 void TabletServerIntegrationTestBase::CreateClient(shared_ptr<client::KuduClient>* client) {

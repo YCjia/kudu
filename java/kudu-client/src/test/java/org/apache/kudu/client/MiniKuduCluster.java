@@ -14,12 +14,17 @@
 
 package org.apache.kudu.client;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+
 import java.io.BufferedReader;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -34,6 +39,7 @@ import com.google.common.net.HostAndPort;
 import org.apache.kudu.Common.HostPortPB;
 import org.apache.kudu.tools.Tool.ControlShellRequestPB;
 import org.apache.kudu.tools.Tool.ControlShellResponsePB;
+import org.apache.kudu.tools.Tool.CreateClusterRequestPB.MiniKdcOptionsPB;
 import org.apache.kudu.tools.Tool.CreateClusterRequestPB;
 import org.apache.kudu.tools.Tool.DaemonIdentifierPB;
 import org.apache.kudu.tools.Tool.DaemonInfoPB;
@@ -41,6 +47,7 @@ import org.apache.kudu.tools.Tool.GetKDCEnvVarsRequestPB;
 import org.apache.kudu.tools.Tool.GetMastersRequestPB;
 import org.apache.kudu.tools.Tool.GetTServersRequestPB;
 import org.apache.kudu.tools.Tool.KdestroyRequestPB;
+import org.apache.kudu.tools.Tool.KinitRequestPB;
 import org.apache.kudu.tools.Tool.StartClusterRequestPB;
 import org.apache.kudu.tools.Tool.StartDaemonRequestPB;
 import org.apache.kudu.tools.Tool.StopDaemonRequestPB;
@@ -69,7 +76,7 @@ public class MiniKuduCluster implements AutoCloseable {
   // Thread that reads and logs stderr from the control shell.
   private Thread miniClusterErrorPrinter;
 
-  private class DaemonInfo {
+  private static class DaemonInfo {
     DaemonIdentifierPB id;
     boolean isRunning;
   }
@@ -86,17 +93,50 @@ public class MiniKuduCluster implements AutoCloseable {
   private final int numTservers;
   private final ImmutableList<String> extraTserverFlags;
   private final ImmutableList<String> extraMasterFlags;
+  private final String clusterRoot;
+
+  private MiniKdcOptionsPB kdcOptionsPb;
 
   private MiniKuduCluster(boolean enableKerberos,
       int numMasters,
       int numTservers,
       List<String> extraTserverFlags,
-      List<String> extraMasterFlags) {
+      List<String> extraMasterFlags,
+      MiniKdcOptionsPB kdcOptionsPb,
+      String clusterRoot) {
     this.enableKerberos = enableKerberos;
     this.numMasters = numMasters;
     this.numTservers = numTservers;
     this.extraTserverFlags = ImmutableList.copyOf(extraTserverFlags);
     this.extraMasterFlags = ImmutableList.copyOf(extraMasterFlags);
+    this.kdcOptionsPb = kdcOptionsPb;
+
+    if (clusterRoot == null) {
+      // If a cluster root was not set, create a  unique temp directory to use.
+      // The mini cluster will clean this directory up on exit.
+      try {
+        File tempRoot = getTempDirectory("mini-kudu-cluster");
+        this.clusterRoot = tempRoot.toString();
+      } catch (IOException ex) {
+        throw new RuntimeException("Could not create cluster root directory", ex);
+      }
+    } else {
+      this.clusterRoot = clusterRoot;
+    }
+  }
+
+  // Match the C++ MiniCluster test functionality for overriding the tmp directory used.
+  // See MakeClusterRoot in src/kudu/tools/tool_action_test.cc.
+  // If the TEST_TMPDIR environment variable is defined that directory will be used
+  // instead of the default temp directory.
+  private File getTempDirectory(String prefix) throws IOException  {
+    String testTmpdir = System.getenv("TEST_TMPDIR");
+    if (testTmpdir != null) {
+      LOG.info("Using the temp directory defined by TEST_TMPDIR: " + testTmpdir);
+      return Files.createTempDirectory(Paths.get(testTmpdir), prefix).toFile();
+    } else {
+      return Files.createTempDirectory(prefix).toFile();
+    }
   }
 
   /**
@@ -167,6 +207,8 @@ public class MiniKuduCluster implements AutoCloseable {
             .setEnableKerberos(enableKerberos)
             .addAllExtraMasterFlags(extraMasterFlags)
             .addAllExtraTserverFlags(extraTserverFlags)
+            .setMiniKdcOptions(kdcOptionsPb)
+            .setClusterRoot(clusterRoot)
             .build())
         .build());
     sendRequestToCluster(
@@ -285,6 +327,7 @@ public class MiniKuduCluster implements AutoCloseable {
     if (!d.isRunning) {
       return;
     }
+    LOG.info("Killing tserver {}", hp);
     sendRequestToCluster(ControlShellRequestPB.newBuilder()
         .setStopDaemon(StopDaemonRequestPB.newBuilder().setId(d.id).build())
         .build());
@@ -356,13 +399,25 @@ public class MiniKuduCluster implements AutoCloseable {
   }
 
   /**
-   * Removes all credentials for all principals from the KDC credential cache.
+   * Removes all credentials for all principals from the Kerberos credential cache.
    */
   public void kdestroy() throws IOException {
     sendRequestToCluster(ControlShellRequestPB.newBuilder()
                                               .setKdestroy(KdestroyRequestPB.getDefaultInstance())
                                               .build());
   }
+
+  /**
+   * Re-initialize Kerberos credentials for the given username, writing them
+   * into the Kerberos credential cache.
+   * @param username the username to kinit as
+   */
+  public void kinit(String username) throws IOException {
+    sendRequestToCluster(ControlShellRequestPB.newBuilder()
+        .setKinit(KinitRequestPB.newBuilder().setUsername(username).build())
+        .build());
+  }
+
 
   /** {@override} */
   @Override
@@ -442,7 +497,8 @@ public class MiniKuduCluster implements AutoCloseable {
     public void run() {
       try {
         String line;
-        BufferedReader in = new BufferedReader(new InputStreamReader(is));
+        BufferedReader in = new BufferedReader(
+            new InputStreamReader(is, UTF_8));
         while ((line = in.readLine()) != null) {
           LOG.info(line);
         }
@@ -473,6 +529,10 @@ public class MiniKuduCluster implements AutoCloseable {
     private boolean enableKerberos = false;
     private final List<String> extraTserverFlags = new ArrayList<>();
     private final List<String> extraMasterFlags = new ArrayList<>();
+    private String clusterRoot = null;
+
+    private MiniKdcOptionsPB.Builder kdcOptionsPb =
+        MiniKdcOptionsPB.newBuilder();
 
     public MiniKuduClusterBuilder numMasters(int numMasters) {
       this.numMasters = numMasters;
@@ -511,6 +571,25 @@ public class MiniKuduCluster implements AutoCloseable {
       return this;
     }
 
+    public MiniKuduClusterBuilder kdcTicketLifetime(String lifetime) {
+      this.kdcOptionsPb.setTicketLifetime(lifetime);
+      return this;
+    }
+
+    public MiniKuduClusterBuilder kdcRenewLifetime(String lifetime) {
+      this.kdcOptionsPb.setRenewLifetime(lifetime);
+      return this;
+    }
+
+    /**
+     * Sets the directory where the cluster's data and logs should be placed.
+     * @return this instance
+     */
+    public MiniKuduClusterBuilder clusterRoot(String clusterRoot) {
+      this.clusterRoot = clusterRoot;
+      return this;
+    }
+
     /**
      * Builds and starts a new {@link MiniKuduCluster} using builder state.
      * @return the newly started {@link MiniKuduCluster}
@@ -520,7 +599,8 @@ public class MiniKuduCluster implements AutoCloseable {
       MiniKuduCluster cluster =
           new MiniKuduCluster(enableKerberos,
               numMasters, numTservers,
-              extraTserverFlags, extraMasterFlags);
+              extraTserverFlags, extraMasterFlags,
+              kdcOptionsPb.build(), clusterRoot);
       try {
         cluster.start();
       } catch (IOException e) {

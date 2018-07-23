@@ -132,10 +132,15 @@ void TabletServerTestBase::StartTabletServer(int num_data_dirs) {
 
 Status TabletServerTestBase::WaitForTabletRunning(const char *tablet_id) {
   scoped_refptr<tablet::TabletReplica> tablet_replica;
-  RETURN_NOT_OK(mini_server_->server()->tablet_manager()->GetTabletReplica(tablet_id,
-                                                                           &tablet_replica));
+  const auto* tablet_manager = mini_server_->server()->tablet_manager();
+  RETURN_NOT_OK(tablet_manager->GetTabletReplica(tablet_id, &tablet_replica));
   RETURN_NOT_OK(tablet_replica->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
-  return tablet_replica->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10));
+  RETURN_NOT_OK(
+      tablet_replica->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+
+  // KUDU-2444: Even though the tablet replica is fully running, the tablet
+  // manager may regard it as still transitioning to the running state.
+  return tablet_manager->WaitForNoTransitionsForTests(MonoDelta::FromSeconds(10));
 }
 
 void TabletServerTestBase::UpdateTestRowRemote(int64_t row_idx,
@@ -441,7 +446,8 @@ void TabletServerTestBase::VerifyScanRequestFailure(
 }
 
 // Open a new scanner which scans all of the columns in the table.
-void TabletServerTestBase::OpenScannerWithAllColumns(ScanResponsePB* resp) {
+void TabletServerTestBase::OpenScannerWithAllColumns(ScanResponsePB* resp,
+                                                     ReadMode read_mode) {
   ScanRequestPB req;
   RpcController rpc;
 
@@ -449,6 +455,7 @@ void TabletServerTestBase::OpenScannerWithAllColumns(ScanResponsePB* resp) {
   const Schema& projection = schema_;
   NewScanRequestPB* scan = req.mutable_new_scan_request();
   scan->set_tablet_id(kTabletId);
+  scan->set_read_mode(read_mode);
   ASSERT_OK(SchemaToColumnPBs(projection, scan->mutable_projected_columns()));
   req.set_call_seq_id(0);
   req.set_batch_size_bytes(0); // so it won't return data right away

@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/tools/tool_action.h"
-
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
-#include <utility>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -43,15 +41,14 @@
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.pb.h"
+#include "kudu/tools/tool_action.h"
 #include "kudu/tools/tool_action_common.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tserver.pb.h"
@@ -150,7 +147,7 @@ class ReplicaDumper {
                                   &schema,
                                   &client_schema,
                                   client::KuduScanner::NO_FLAGS,
-                                  make_gscoped_ptr(resp.release_data())));
+                                  unique_ptr<RowwiseRowBlockPB>(resp.release_data())));
       vector<KuduRowResult> rows;
       results.ExtractRows(&rows);
       for (const auto& r : rows) {
@@ -434,9 +431,13 @@ unique_ptr<Mode> BuildRemoteReplicaMode() {
   unique_ptr<Action> unsafe_change_config =
       ActionBuilder("unsafe_change_config", &UnsafeChangeConfig)
       .Description("Force the specified replica to adopt a new Raft config")
-      .ExtraDescription("The members of the new Raft config must be a subset "
+      .ExtraDescription("This tool is useful when a config change is "
+                        "necessary because a tablet cannot make progress with "
+                        "its current Raft configuration (e.g. to evict "
+                        "followers when a majority is unavailable).\n\nNote: "
+                        "The members of the new Raft config must be a subset "
                         "of (or the same as) the members of the existing "
-                        "committed Raft config on that replica.")
+                        "committed Raft config.")
       .AddRequiredParameter({ kTServerAddressArg, kTServerAddressDesc })
       .AddRequiredParameter({ kTabletIdArg, kTabletIdArgDesc })
       .AddRequiredVariadicParameter({ kPeerUUIDsArg, kPeerUUIDsArgDesc })

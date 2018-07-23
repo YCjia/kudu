@@ -46,7 +46,6 @@
 #include "kudu/common/types.h"
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/array_view.h"
@@ -489,8 +488,8 @@ Status CFileReader::ReadBlock(const BlockPointer &ptr, CacheControl cache_contro
     CompressedBlockDecoder uncompressor(codec_, cfile_version_, block);
     Status s = uncompressor.Init();
     if (!s.ok()) {
-      LOG(WARNING) << "Unable to validate compressed block at "
-                   << ptr.offset() << " of size " << block.size() << ": "
+      LOG(WARNING) << "Unable to validate compressed block " << block_id().ToString()
+                   << " at " << ptr.offset() << " of size " << block.size() << ": "
                    << s.ToString();
       return s;
     }
@@ -506,7 +505,8 @@ Status CFileReader::ReadBlock(const BlockPointer &ptr, CacheControl cache_contro
     }
     s = uncompressor.UncompressIntoBuffer(decompressed_scratch.get());
     if (!s.ok()) {
-      LOG(WARNING) << "Unable to uncompress block at " << ptr.offset()
+      LOG(WARNING) << "Unable to uncompress block " << block_id().ToString()
+                   << " at " << ptr.offset()
                    << " of size " <<  block.size() << ": " << s.ToString();
       return s;
     }
@@ -685,7 +685,7 @@ Status CFileIterator::SeekToOrdinal(rowid_t ord_idx) {
 
     prepared_blocks_.push_back(b);
   } else {
-    // Otherwise, prepare a new cblock to scan.
+    // Otherwise, prepare a new block to scan.
     RETURN_NOT_OK(PrepareForNewSeek());
     if (PREDICT_FALSE(posidx_iter_ == nullptr)) {
       return Status::NotSupported("no positional index in file");
@@ -940,7 +940,7 @@ Status CFileIterator::ReadCurrentDataBlock(const IndexTreeIterator &idx_iter,
   }
 
   io_stats_.cells_read += num_rows_in_block;
-  io_stats_.cblocks_read++;
+  io_stats_.blocks_read++;
   io_stats_.bytes_read += data_block.size();
 
   prep_block->idx_in_block_ = 0;

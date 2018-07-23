@@ -17,6 +17,8 @@
 
 package org.apache.kudu.hive.metastore;
 
+import java.util.Map;
+
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.metastore.MetaStoreEventListener;
@@ -27,6 +29,7 @@ import org.apache.hadoop.hive.metastore.api.hive_metastoreConstants;
 import org.apache.hadoop.hive.metastore.events.AlterTableEvent;
 import org.apache.hadoop.hive.metastore.events.CreateTableEvent;
 import org.apache.hadoop.hive.metastore.events.DropTableEvent;
+import org.apache.hadoop.hive.metastore.events.ListenerEvent;
 
 /**
  * The {@code KuduMetastorePlugin} intercepts DDL operations on Kudu table entries
@@ -58,9 +61,15 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
   @VisibleForTesting
   static final String KUDU_STORAGE_HANDLER = "org.apache.kudu.hive.KuduStorageHandler";
   @VisibleForTesting
+  static final String LEGACY_KUDU_STORAGE_HANDLER = "com.cloudera.kudu.hive.KuduStorageHandler";
+  @VisibleForTesting
   static final String KUDU_TABLE_ID_KEY = "kudu.table_id";
   @VisibleForTesting
+  static final String LEGACY_KUDU_TABLE_NAME = "kudu.table_name";
+  @VisibleForTesting
   static final String KUDU_MASTER_ADDRS_KEY = "kudu.master_addresses";
+  @VisibleForTesting
+  static final String KUDU_MASTER_EVENT = "kudu.master_event";
 
   public KuduMetastorePlugin(Configuration config) {
     super(config);
@@ -78,6 +87,10 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
       return;
     }
 
+    if (!isKuduMasterAction(tableEvent)) {
+      throw new MetaException("Kudu tables may not be created through Hive");
+    }
+
     checkKuduProperties(table);
   }
 
@@ -93,6 +106,9 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
     if (targetTableId == null) {
       return;
     }
+
+    // The kudu.master_event property isn't checked, because the kudu.table_id
+    // property already implies this event is coming from a Kudu Master.
 
     Table table = tableEvent.getTable();
 
@@ -114,21 +130,31 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
     Table oldTable = tableEvent.getOldTable();
     Table newTable = tableEvent.getNewTable();
 
-    // Allow non-Kudu tables to be altered.
-    if (!isKuduTable(oldTable)) {
+    // Allow non-Kudu tables (even the legacy ones) to be altered.
+    if (!isKuduTable(oldTable) && !isLegacyKuduTable(oldTable)) {
       // But ensure that the alteration isn't introducing Kudu-specific properties.
       checkNoKuduProperties(newTable);
       return;
     }
 
-    // Check the altered table's properties.
-    checkKuduProperties(newTable);
+    // Check the altered table's properties. Kudu tables can be downgraded
+    // to the legacy format.
+    if (!isLegacyKuduTable(newTable)) {
+      checkKuduProperties(newTable);
+    }
 
-    // Check that the table ID isn't changing.
-    String oldTableId = oldTable.getParameters().get(KUDU_TABLE_ID_KEY);
-    String newTableId = newTable.getParameters().get(KUDU_TABLE_ID_KEY);
-    if (!newTableId.equals(oldTableId)) {
-      throw new MetaException("Kudu table ID does not match the existing HMS entry");
+    // Check that the non legacy Kudu table ID isn't changing.
+    if (!isLegacyKuduTable(oldTable) && !isLegacyKuduTable(newTable)) {
+      String oldTableId = oldTable.getParameters().get(KUDU_TABLE_ID_KEY);
+      String newTableId = newTable.getParameters().get(KUDU_TABLE_ID_KEY);
+      if (!newTableId.equals(oldTableId)) {
+        throw new MetaException("Kudu table ID does not match the existing HMS entry");
+      }
+    }
+
+    if (!isKuduMasterAction(tableEvent) &&
+        !oldTable.getSd().getCols().equals(newTable.getSd().getCols())) {
+      throw new MetaException("Kudu table columns may not be altered through Hive");
     }
   }
 
@@ -139,7 +165,20 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
    */
   private boolean isKuduTable(Table table) {
     return KUDU_STORAGE_HANDLER.equals(table.getParameters()
-                                            .get(hive_metastoreConstants.META_TABLE_STORAGE));
+        .get(hive_metastoreConstants.META_TABLE_STORAGE));
+  }
+
+  /**
+   * Checks whether the table is a Kudu table with legacy Kudu
+   * storage handler.
+   *
+   * @param table the table to check
+   * @return {@code true} if the table is a legacy Kudu table,
+   *         otherwise {@code false}
+   */
+  private boolean isLegacyKuduTable(Table table) {
+    return LEGACY_KUDU_STORAGE_HANDLER.equals(table.getParameters()
+        .get(hive_metastoreConstants.META_TABLE_STORAGE));
   }
 
   /**
@@ -181,10 +220,22 @@ public class KuduMetastorePlugin extends MetaStoreEventListener {
           "non-Kudu table entry must not contain a table ID property (%s)",
           KUDU_TABLE_ID_KEY));
     }
-    if (table.getParameters().containsKey(KUDU_MASTER_ADDRS_KEY)) {
-      throw new MetaException(String.format(
-          "non-Kudu table entry must not contain a Master addresses property (%s)",
-          KUDU_MASTER_ADDRS_KEY));
+  }
+
+  /**
+   * Returns true if the event is from the Kudu Master.
+   */
+  private boolean isKuduMasterAction(ListenerEvent event) {
+    EnvironmentContext environmentContext = event.getEnvironmentContext();
+    if (environmentContext == null) {
+      return false;
     }
+
+    Map<String, String> properties = environmentContext.getProperties();
+    if (properties == null) {
+      return false;
+    }
+
+    return Boolean.parseBoolean(properties.get(KUDU_MASTER_EVENT));
   }
 }

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <functional>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -28,7 +29,6 @@
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/acceptor_pool.h"
@@ -80,6 +80,10 @@ DEFINE_bool(rpc_server_allow_ephemeral_ports, false,
             "only allowed in tests.");
 TAG_FLAG(rpc_server_allow_ephemeral_ports, unsafe);
 
+DEFINE_bool(rpc_reuseport, false,
+            "Whether to set the SO_REUSEPORT option on listening RPC sockets.");
+TAG_FLAG(rpc_reuseport, experimental);
+
 namespace kudu {
 
 RpcServerOptions::RpcServerOptions()
@@ -88,7 +92,8 @@ RpcServerOptions::RpcServerOptions()
     num_acceptors_per_address(FLAGS_rpc_num_acceptors_per_address),
     num_service_threads(FLAGS_rpc_num_service_threads),
     default_port(0),
-    service_queue_length(FLAGS_rpc_service_queue_length) {
+    service_queue_length(FLAGS_rpc_service_queue_length),
+    rpc_reuseport(FLAGS_rpc_reuseport) {
 }
 
 RpcServer::RpcServer(RpcServerOptions opts)
@@ -150,6 +155,12 @@ Status RpcServer::RegisterService(gscoped_ptr<rpc::ServiceIf> service) {
     new rpc::ServicePool(std::move(service), messenger_->metric_entity(),
                          options_.service_queue_length);
   RETURN_NOT_OK(service_pool->Init(options_.num_service_threads));
+  auto* service_pool_raw_ptr = service_pool.get();
+  service_pool->set_too_busy_hook([this, service_pool_raw_ptr]() {
+      if (too_busy_hook_) {
+        too_busy_hook_(service_pool_raw_ptr);
+      }
+    });
   RETURN_NOT_OK(messenger_->RegisterService(service_name, service_pool));
   return Status::OK();
 }

@@ -24,19 +24,20 @@ import static org.junit.Assert.fail;
 
 import java.util.List;
 
+import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Callback;
 
 import org.junit.Assert;
 import org.junit.Test;
-
 import org.apache.kudu.consensus.Metadata;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
+import org.hamcrest.CoreMatchers;
 
 public class TestConnectToCluster {
 
-  private static final List<HostAndPort> MASTERS = ImmutableList.of(
+  private static final ImmutableList<HostAndPort> MASTERS = ImmutableList.of(
       HostAndPort.fromParts("0", 9000),
       HostAndPort.fromParts("1", 9000),
       HostAndPort.fromParts("2", 9000));
@@ -82,7 +83,7 @@ public class TestConnectToCluster {
         .build();
     int successes = 0;
     try {
-      String[] masterAddrs = cluster.getMasterAddresses().split(",");
+      String[] masterAddrs = cluster.getMasterAddresses().split(",", -1);
       assertEquals(3, masterAddrs.length);
       for (String masterAddr : masterAddrs) {
         KuduClient c = null;
@@ -97,6 +98,8 @@ public class TestConnectToCluster {
                   ".*Client configured with 1 master\\(s\\) " +
                   "\\(.+?\\) but cluster indicates it expects 3 master\\(s\\) " +
                   "\\(.+?,.+?,.+?\\).*"));
+          Assert.assertThat(Joiner.on("\n").join(e.getStackTrace()),
+              CoreMatchers.containsString("testConnectToOneOfManyMasters"));
         } finally {
           if (c != null) {
             c.close();

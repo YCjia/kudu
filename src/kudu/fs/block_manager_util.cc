@@ -33,6 +33,7 @@
 #include "kudu/util/env.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/test_util_prod.h"
 
 DECLARE_bool(enable_data_block_fsync);
@@ -48,8 +49,13 @@ using std::unordered_map;
 using std::vector;
 using strings::Substitute;
 
-// Evaluates 'status_expr' and if it results in a disk failure, logs a message
-// and fails the instance, returning with no error.
+// Evaluates 'status_expr' and if it results in a disk-failure error, logs a
+// message and marks the instance as unhealthy, returning with no error.
+//
+// Note: A disk failure may thwart attempts to read directory entries at the OS
+// level, leading to NotFound errors when reading the instance files. As such,
+// we treat missing instances the same way we treat those that yield more
+// blatant disk failure POSIX codes.
 //
 // Note: if a non-disk-failure error is produced, the instance will remain
 // healthy. These errors should be handled externally.
@@ -57,9 +63,9 @@ using strings::Substitute;
   const Status& _s = (status_expr); \
   if (PREDICT_FALSE(!_s.ok())) { \
     const Status _s_prepended = _s.CloneAndPrepend(msg); \
-    if (_s_prepended.IsDiskFailure()) { \
+    if (_s.IsNotFound() || _s.IsDiskFailure()) { \
       health_status_ = _s_prepended; \
-      LOG(ERROR) << "Instance failed: " << _s_prepended.ToString(); \
+      LOG(INFO) << "Instance is unhealthy: " << _s_prepended.ToString(); \
       return Status::OK(); \
     } \
     return _s_prepended; \
@@ -84,8 +90,25 @@ Status PathInstanceMetadataFile::Create(const string& uuid, const vector<string>
       "Creating a metadata file that's already locked would release the lock";
   DCHECK(ContainsKey(set<string>(all_uuids.begin(), all_uuids.end()), uuid));
 
+  // Create a temporary file with which to fetch the filesystem's block size.
+  //
+  // This is a safer bet than using the parent directory as some filesystems
+  // advertise different block sizes for directories than for files. On top of
+  // that, the value may inform intra-file layout decisions made by Kudu, so
+  // it's more correct to derive it from a file in any case.
+  string created_filename;
+  string tmp_template = JoinPathSegments(
+      DirName(filename_), Substitute("getblocksize$0.XXXXXX", kTmpInfix));
+  unique_ptr<WritableFile> tmp_file;
+  RETURN_NOT_OK(env_->NewTempWritableFile(WritableFileOptions(),
+                                          tmp_template,
+                                          &created_filename, &tmp_file));
+  SCOPED_CLEANUP({
+    WARN_NOT_OK(env_->DeleteFile(created_filename),
+                "could not delete temporary file");
+  });
   uint64_t block_size;
-  RETURN_NOT_OK(env_->GetBlockSize(DirName(filename_), &block_size));
+  RETURN_NOT_OK(env_->GetBlockSize(created_filename, &block_size));
 
   PathInstanceMetadataPB new_instance;
 
@@ -139,7 +162,9 @@ Status PathInstanceMetadataFile::Lock() {
 
   FileLock* lock;
   RETURN_NOT_OK_FAIL_INSTANCE_PREPEND(env_->LockFile(filename_, &lock),
-                                      Substitute("Could not lock $0", filename_));
+                                      "Could not lock block_manager_instance file. Make sure that "
+                                      "Kudu is not already running and you are not trying to run "
+                                      "Kudu with a different user than before");
   lock_.reset(lock);
   return Status::OK();
 }
@@ -174,7 +199,7 @@ Status PathInstanceMetadataFile::CheckIntegrity(
     }
   }
   if (first_healthy == -1) {
-    return Status::IOError("All data directories are unhealthy");
+    return Status::NotFound("no healthy data directories found");
   }
 
   // Map of instance UUID to path instance structure. Tracks duplicate UUIDs.

@@ -17,15 +17,19 @@
 
 #include "kudu/fs/block_manager.h"
 
+#include <algorithm>
 #include <mutex>
 #include <ostream>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/gutil/integral_types.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/flag_tags.h"
 
 // The default value is optimized for throughput in the case that
@@ -49,22 +53,16 @@ DEFINE_string(block_manager_preflush_control, "finalize",
               "never be pre-flushed but still be flushed when closed.");
 TAG_FLAG(block_manager_preflush_control, experimental);
 
-DEFINE_bool(block_manager_lock_dirs, true,
-            "Lock the data block directories to prevent concurrent usage. "
-            "Note that read-only concurrent usage is still allowed.");
-TAG_FLAG(block_manager_lock_dirs, unsafe);
-
 DEFINE_int64(block_manager_max_open_files, -1,
              "Maximum number of open file descriptors to be used for data "
-             "blocks. If -1, Kudu will use 40% of its resource limit as per "
-             "getrlimit(). This is a soft limit. It is an error to use a "
-             "value of 0.");
+             "blocks. If -1, Kudu will automatically calculate this value. "
+             "This is a soft limit. It is an error to use a value of 0.");
 TAG_FLAG(block_manager_max_open_files, advanced);
 TAG_FLAG(block_manager_max_open_files, evolving);
 
 static bool ValidateMaxOpenFiles(const char* /*flagname*/, int64_t value) {
-  if (value == 0) {
-    LOG(ERROR) << "Invalid max open files: cannot be 0";
+  if (value == 0 || value < -1) {
+    LOG(ERROR) << "Invalid max open files: cannot be " << value;
     return false;
   }
   return true;
@@ -83,19 +81,30 @@ int64_t GetFileCacheCapacityForBlockManager(Env* env) {
   // Maximize this process' open file limit first, if possible.
   static std::once_flag once;
   std::call_once(once, [&]() {
-    env->IncreaseOpenFileLimit();
+    env->IncreaseResourceLimit(Env::ResourceLimitType::OPEN_FILES_PER_PROCESS);
   });
 
+  uint64_t rlimit =
+      env->GetResourceLimit(Env::ResourceLimitType::OPEN_FILES_PER_PROCESS);
   // See block_manager_max_open_files.
   if (FLAGS_block_manager_max_open_files == -1) {
-    return (2 * env->GetOpenFileLimit()) / 5;
+    // Use file-max as a possible upper bound.
+    faststring buf;
+    uint64_t buf_val;
+    if (ReadFileToString(env, "/proc/sys/fs/file-max", &buf).ok() &&
+        safe_strtou64(buf.ToString(), &buf_val)) {
+      rlimit = std::min(rlimit, buf_val);
+    }
+
+    // Callers of this function expect a signed 64-bit integer, so we need to
+    // cap rlimit just in case it's too large.
+    return std::min((2 * rlimit) / 5, static_cast<uint64_t>(kint64max));
   }
-  int64_t file_limit = env->GetOpenFileLimit();
-  LOG_IF(FATAL, FLAGS_block_manager_max_open_files > file_limit) <<
+  LOG_IF(FATAL, FLAGS_block_manager_max_open_files > rlimit) <<
       Substitute(
           "Configured open file limit (block_manager_max_open_files) $0 "
-          "exceeds process fd limit (ulimit) $1",
-          FLAGS_block_manager_max_open_files, file_limit);
+          "exceeds process open file limit (ulimit) $1",
+          FLAGS_block_manager_max_open_files, rlimit);
   return FLAGS_block_manager_max_open_files;
 }
 

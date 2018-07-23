@@ -17,7 +17,9 @@
 
 package org.apache.kudu.client;
 
+import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.sql.Timestamp;
 import java.text.DateFormat;
 import java.text.FieldPosition;
 import java.text.SimpleDateFormat;
@@ -25,10 +27,12 @@ import java.util.BitSet;
 import java.util.Date;
 import java.util.TimeZone;
 
+import org.apache.kudu.util.TimestampUtil;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.util.Slice;
@@ -42,18 +46,6 @@ public class RowResult {
 
   private static final int INDEX_RESET_LOCATION = -1;
 
-  // Thread local DateFormat since they're not thread-safe.
-  private static final ThreadLocal<DateFormat> DATE_FORMAT = new ThreadLocal<DateFormat>() {
-    @Override
-    protected DateFormat initialValue() {
-      SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
-      sdf.setTimeZone(TimeZone.getTimeZone("UTC"));
-      return sdf;
-    }
-  };
-
-  private static final long MS_IN_S = 1000L;
-  private static final long US_IN_S = 1000L * 1000L;
   private int index = INDEX_RESET_LOCATION;
   private int offset;
   private BitSet nullsBitSet;
@@ -89,7 +81,8 @@ public class RowResult {
     // Pre-compute the columns offsets in rowData for easier lookups later.
     // If the schema has nullables, we also add the offset for the null bitmap at the end.
     for (int i = 1; i < columnOffsetsSize; i++) {
-      int previousSize = schema.getColumnByIndex(i - 1).getType().getSize();
+      org.apache.kudu.ColumnSchema column = schema.getColumnByIndex(i - 1);
+      int previousSize = column.getTypeSize();
       columnOffsets[i] = previousSize + currentOffset;
       currentOffset += previousSize;
     }
@@ -325,6 +318,68 @@ public class RowResult {
   }
 
   /**
+   * Get the specified column's Decimal.
+   *
+   * @param columnName name of the column to get data for
+   * @return a BigDecimal
+   * @throws IllegalArgumentException if the column doesn't exist or is null
+   */
+  public BigDecimal getDecimal(String columnName) {
+    return getDecimal(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's Decimal.
+   *
+   * @param columnIndex Column index in the schema
+   * @return a BigDecimal.
+   * @throws IllegalArgumentException if the column is null
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public BigDecimal getDecimal(int columnIndex) {
+    checkValidColumn(columnIndex);
+    checkNull(columnIndex);
+    checkType(columnIndex, Type.DECIMAL);
+    ColumnSchema column = schema.getColumnByIndex(columnIndex);
+    ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+    return Bytes.getDecimal(this.rowData.getRawArray(),
+        this.rowData.getRawOffset() + getCurrentRowDataOffsetForColumn(columnIndex),
+            typeAttributes.getPrecision(), typeAttributes.getScale());
+  }
+
+  /**
+   * Get the specified column's Timestamp.
+   *
+   * @param columnName name of the column to get data for
+   * @return a Timestamp
+   * @throws IllegalArgumentException if the column doesn't exist,
+   * is null, is unset, or the type doesn't match the column's type
+   */
+  public Timestamp getTimestamp(String columnName) {
+    return getTimestamp(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's Timestamp.
+   *
+   * @param columnIndex Column index in the schema
+   * @return a Timestamp
+   * @throws IllegalArgumentException if the column is null, is unset,
+   * or if the type doesn't match the column's type
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public Timestamp getTimestamp(int columnIndex) {
+    checkValidColumn(columnIndex);
+    checkNull(columnIndex);
+    checkType(columnIndex, Type.UNIXTIME_MICROS);
+    ColumnSchema column = schema.getColumnByIndex(columnIndex);
+    long micros = Bytes.getLong(this.rowData.getRawArray(),
+        this.rowData.getRawOffset() +
+            getCurrentRowDataOffsetForColumn(columnIndex));
+    return TimestampUtil.microsToTimestamp(micros);
+  }
+
+  /**
    * Get the schema used for this scanner's column projection.
    * @return a column projection as a schema.
    */
@@ -536,21 +591,6 @@ public class RowResult {
   }
 
   /**
-   * Transforms a timestamp into a string, whose formatting and timezone is consistent
-   * across Kudu.
-   * @param timestamp the timestamp, in microseconds
-   * @return a string, in the format: YYYY-MM-DDTHH:MM:SS.ssssssZ
-   */
-  static String timestampToString(long timestamp) {
-    long tsMillis = timestamp / MS_IN_S;
-    long tsMicros = timestamp % US_IN_S;
-    StringBuffer formattedTs = new StringBuffer();
-    DATE_FORMAT.get().format(new Date(tsMillis), formattedTs, new FieldPosition(0));
-    formattedTs.append(String.format(".%06dZ", tsMicros));
-    return formattedTs.toString();
-  }
-
-  /**
    * Return the actual data from this row in a stringified key=value
    * form.
    */
@@ -561,8 +601,13 @@ public class RowResult {
       if (i != 0) {
         buf.append(", ");
       }
-      buf.append(col.getType().name());
-      buf.append(" ").append(col.getName()).append("=");
+      Type type = col.getType();
+      buf.append(type.name());
+      buf.append(" ").append(col.getName());
+      if (col.getTypeAttributes() != null) {
+        buf.append(col.getTypeAttributes().toStringForType(type));
+      }
+      buf.append("=");
       if (isNull(i)) {
         buf.append("NULL");
       } else {
@@ -580,7 +625,7 @@ public class RowResult {
             buf.append(getLong(i));
             break;
           case UNIXTIME_MICROS: {
-            buf.append(timestampToString(getLong(i)));
+            buf.append(TimestampUtil.timestampToString(getLong(i)));
           } break;
           case STRING:
             buf.append(getString(i));
@@ -593,6 +638,9 @@ public class RowResult {
             break;
           case DOUBLE:
             buf.append(getDouble(i));
+            break;
+          case DECIMAL:
+            buf.append(getDecimal(i));
             break;
           case BOOL:
             buf.append(getBoolean(i));

@@ -63,11 +63,11 @@ namespace tablet {
 
 class DeltaFileReader;
 class DeltaMemStore;
-class MvccSnapshot;
 class OperationResultPB;
 class RowSetMetadata;
 class RowSetMetadataUpdate;
 struct ProbeStats;
+struct RowIteratorOptions;
 
 // The DeltaTracker is the part of a DiskRowSet which is responsible for
 // tracking modifications against the base data. It consists of a set of
@@ -83,13 +83,12 @@ class DeltaTracker {
   };
 
   static Status Open(const std::shared_ptr<RowSetMetadata>& rowset_metadata,
-                     rowid_t num_rows,
                      log::LogAnchorRegistry* log_anchor_registry,
                      const TabletMemTrackers& mem_trackers,
                      gscoped_ptr<DeltaTracker>* delta_tracker);
 
   Status WrapIterator(const std::shared_ptr<CFileSet::Iterator> &base,
-                      const MvccSnapshot &mvcc_snap,
+                      const RowIteratorOptions& opts,
                       gscoped_ptr<ColumnwiseIterator>* out) const;
 
   // Enum used for NewDeltaIterator() and CollectStores() below.
@@ -105,17 +104,14 @@ class DeltaTracker {
   // by this DeltaTracker. Depending on the value of 'which' (see above),
   // this iterator may include UNDOs, REDOs, or both.
   //
-  // 'schema' is the schema of the rows that are being read by the client.
-  // It must remain valid for the lifetime of the returned iterator.
-  Status NewDeltaIterator(const Schema* schema,
-                          const MvccSnapshot& snap,
+  // Pointers in 'opts' must remain valid for the lifetime of the returned iterator.
+  Status NewDeltaIterator(const RowIteratorOptions& opts,
                           WhichStores which,
                           std::unique_ptr<DeltaIterator>* out) const;
 
-  Status NewDeltaIterator(const Schema* schema,
-                          const MvccSnapshot& snap,
+  Status NewDeltaIterator(const RowIteratorOptions& opts,
                           std::unique_ptr<DeltaIterator>* out) const {
-    return NewDeltaIterator(schema, snap, UNDOS_AND_REDOS, out);
+    return NewDeltaIterator(opts, UNDOS_AND_REDOS, out);
   }
 
 
@@ -123,11 +119,10 @@ class DeltaTracker {
   // the DMS.
   // Returns the delta stores being merged in *included_stores.
   Status NewDeltaFileIterator(
-    const Schema* schema,
-    const MvccSnapshot &snap,
-    DeltaType type,
-    std::vector<std::shared_ptr<DeltaStore> >* included_stores,
-    std::unique_ptr<DeltaIterator>* out) const;
+      const RowIteratorOptions& opts,
+      DeltaType type,
+      std::vector<std::shared_ptr<DeltaStore>>* included_stores,
+      std::unique_ptr<DeltaIterator>* out) const;
 
   // Flushes the current DeltaMemStore and replaces it with a new one.
   // Caller selects whether to also have the RowSetMetadata (and consequently
@@ -223,12 +218,6 @@ class DeltaTracker {
                           const SharedDeltaStoreVector& new_stores,
                           DeltaType type);
 
-  // Return the number of rows encompassed by this DeltaTracker. Note that
-  // this is _not_ the number of updated rows, but rather the number of rows
-  // in the associated CFileSet base data. All updates must have a rowid
-  // strictly less than num_rows().
-  int64_t num_rows() const { return num_rows_; }
-
   // Get the delta MemStore's size in bytes, including pre-allocation.
   size_t DeltaMemStoreSize() const;
 
@@ -276,7 +265,7 @@ class DeltaTracker {
   FRIEND_TEST(TestMajorDeltaCompaction, TestCompact);
 
   DeltaTracker(std::shared_ptr<RowSetMetadata> rowset_metadata,
-               rowid_t num_rows, log::LogAnchorRegistry* log_anchor_registry,
+               log::LogAnchorRegistry* log_anchor_registry,
                TabletMemTrackers mem_trackers);
 
   Status DoOpen();
@@ -319,11 +308,6 @@ class DeltaTracker {
   std::string LogPrefix() const;
 
   std::shared_ptr<RowSetMetadata> rowset_metadata_;
-
-  // The number of rows in the DiskRowSet that this tracker is associated with.
-  // This is just used for assertions to make sure that we don't update a row
-  // which doesn't exist.
-  rowid_t num_rows_;
 
   bool open_;
 

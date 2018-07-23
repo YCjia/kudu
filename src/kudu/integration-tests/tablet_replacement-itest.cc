@@ -34,12 +34,13 @@
 #include "kudu/common/wire_protocol-test-util.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
@@ -56,6 +57,7 @@
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 
 using kudu::consensus::RaftPeerPB;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::itest::AddServer;
 using kudu::itest::RemoveServer;
 using kudu::itest::StartElection;
@@ -139,19 +141,29 @@ void TabletReplacementITest::TestDontEvictIfRemainingConfigIsUnstable(
     return;
   }
 
-  const MonoDelta kTimeout = MonoDelta::FromSeconds(10);
+  // The configuration is tuned to minimize chances of reporting on failed
+  // tablet replicas one-by-one. That's because by the scenario 2 replicas out
+  // of 3 are becoming unresponsive, and the scenario assumes the decision
+  // on whether to replace failed replicas is made knowing about both failed
+  // replicas.
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(60);
   constexpr auto kUnavailableSec = 3;
+  constexpr auto kTsToMasterHbIntervalSec = 2 * kUnavailableSec;
   constexpr auto kConsensusRpcTimeoutSec = 2;
   constexpr auto kNumReplicas = 3;
   const vector<string> ts_flags = {
-    "--enable_leader_failure_detection=false",
+    Substitute("--raft_prepare_replacement_before_eviction=$0", is_3_4_3_mode),
+
     Substitute("--follower_unavailable_considered_failed_sec=$0", kUnavailableSec),
     Substitute("--consensus_rpc_timeout_ms=$0", kConsensusRpcTimeoutSec * 1000),
-    Substitute("--raft_prepare_replacement_before_eviction=$0", is_3_4_3_mode),
+    Substitute("--heartbeat_interval_ms=$0", kTsToMasterHbIntervalSec * 1000),
+    "--raft_heartbeat_interval_ms=50",
+    "--enable_leader_failure_detection=false",
   };
   const vector<string> master_flags = {
-    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
     Substitute("--raft_prepare_replacement_before_eviction=$0", is_3_4_3_mode),
+
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
   };
   // Additional tablet server is needed when running in 3-4-3 replica management
   // scheme to allow for eviction of failed tablet replicas.
@@ -163,12 +175,15 @@ void TabletReplacementITest::TestDontEvictIfRemainingConfigIsUnstable(
   workload.Setup(); // Easy way to create a new tablet.
 
   TabletToReplicaUUIDs tablet_to_replicas;
-  ASSERT_OK(GetTabletToReplicaUUIDsMapping(kTimeout, &tablet_to_replicas));
-  // There should be only one tablet.
-  ASSERT_EQ(1, tablet_to_replicas.size());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(GetTabletToReplicaUUIDsMapping(kTimeout, &tablet_to_replicas));
+    // There should be only one tablet.
+    ASSERT_EQ(1, tablet_to_replicas.size());
+    // It takes some time to bootstrap all replicas across all tablet servers
+    ASSERT_EQ(kNumReplicas, tablet_to_replicas.cbegin()->second.size());
+  });
   const string tablet_id = tablet_to_replicas.cbegin()->first;
   const auto& replica_uuids = tablet_to_replicas.cbegin()->second;
-  ASSERT_EQ(kNumReplicas, replica_uuids.size());
 
   // Wait until all replicas are up and running.
   for (const auto& uuid : replica_uuids) {
@@ -187,7 +202,8 @@ void TabletReplacementITest::TestDontEvictIfRemainingConfigIsUnstable(
   }
 
   consensus::ConsensusStatePB cstate_initial;
-  ASSERT_OK(GetConsensusState(leader_ts, tablet_id, kTimeout, &cstate_initial));
+  ASSERT_OK(GetConsensusState(leader_ts, tablet_id, kTimeout, EXCLUDE_HEALTH_REPORT,
+                              &cstate_initial));
 
   const auto& kFollower1Id = replica_uuids[1];
   const auto& kFollower2Id = replica_uuids[2];
@@ -215,11 +231,12 @@ void TabletReplacementITest::TestDontEvictIfRemainingConfigIsUnstable(
   // which was a bug that we had (KUDU-2230) and that this test also serves as
   // a regression test for.
   auto min_sleep_required_sec = std::max(kUnavailableSec, kConsensusRpcTimeoutSec);
+  min_sleep_required_sec = std::max(min_sleep_required_sec, kTsToMasterHbIntervalSec);
   SleepFor(MonoDelta::FromSeconds(2 * min_sleep_required_sec));
 
   {
     consensus::ConsensusStatePB cstate;
-    ASSERT_OK(GetConsensusState(leader_ts, tablet_id, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader_ts, tablet_id, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
     SCOPED_TRACE(cstate.DebugString());
     ASSERT_FALSE(cstate.has_pending_config())
         << "Leader should not have issued any config change";
@@ -241,7 +258,7 @@ void TabletReplacementITest::TestDontEvictIfRemainingConfigIsUnstable(
   // evict the failed replica, resulting in Raft configuration update.
   ASSERT_EVENTUALLY([&] {
     consensus::ConsensusStatePB cstate;
-    ASSERT_OK(GetConsensusState(leader_ts, tablet_id, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader_ts, tablet_id, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
     ASSERT_GT(cstate.committed_config().opid_index(),
               cstate_initial.committed_config().opid_index() +
               (is_3_4_3_mode ? 1 : 0))
@@ -495,12 +512,15 @@ TEST_P(EvictAndReplaceDeadFollowerITest, UnreachableFollower) {
   workload.Setup(); // Easy way to create a new tablet.
 
   TabletToReplicaUUIDs tablet_to_replicas;
-  ASSERT_OK(GetTabletToReplicaUUIDsMapping(kTimeout, &tablet_to_replicas));
-  // There should be only one tablet.
-  ASSERT_EQ(1, tablet_to_replicas.size());
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_OK(GetTabletToReplicaUUIDsMapping(kTimeout, &tablet_to_replicas));
+    // There should be only one tablet.
+    ASSERT_EQ(1, tablet_to_replicas.size());
+    // It takes some time to bootstrap all replicas across all tablet servers
+    ASSERT_EQ(kNumReplicas, tablet_to_replicas.cbegin()->second.size());
+  });
   const string tablet_id = tablet_to_replicas.cbegin()->first;
   const auto& replica_uuids = tablet_to_replicas.cbegin()->second;
-  ASSERT_EQ(kNumReplicas, replica_uuids.size());
 
   // Wait until all replicas are up and running.
   for (const auto& uuid : replica_uuids) {

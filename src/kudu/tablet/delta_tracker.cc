@@ -46,7 +46,6 @@
 #include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/deltafile.h"
 #include "kudu/tablet/deltamemstore.h"
-#include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet.pb.h"
@@ -74,12 +73,11 @@ using std::vector;
 using strings::Substitute;
 
 Status DeltaTracker::Open(const shared_ptr<RowSetMetadata>& rowset_metadata,
-                          rowid_t num_rows,
                           LogAnchorRegistry* log_anchor_registry,
                           const TabletMemTrackers& mem_trackers,
                           gscoped_ptr<DeltaTracker>* delta_tracker) {
   gscoped_ptr<DeltaTracker> local_dt(
-      new DeltaTracker(rowset_metadata, num_rows, log_anchor_registry,
+      new DeltaTracker(rowset_metadata, log_anchor_registry,
                        mem_trackers));
   RETURN_NOT_OK(local_dt->DoOpen());
 
@@ -88,11 +86,9 @@ Status DeltaTracker::Open(const shared_ptr<RowSetMetadata>& rowset_metadata,
 }
 
 DeltaTracker::DeltaTracker(shared_ptr<RowSetMetadata> rowset_metadata,
-                           rowid_t num_rows,
                            LogAnchorRegistry* log_anchor_registry,
                            TabletMemTrackers mem_trackers)
     : rowset_metadata_(std::move(rowset_metadata)),
-      num_rows_(num_rows),
       open_(false),
       read_only_(false),
       log_anchor_registry_(log_anchor_registry),
@@ -183,9 +179,9 @@ Status DeltaTracker::MakeDeltaIteratorMergerUnlocked(size_t start_idx, size_t en
     target_stores->push_back(delta_store);
     target_blocks->push_back(dfr->block_id());
   }
-  RETURN_NOT_OK(DeltaIteratorMerger::Create(
-      inputs, projection,
-      MvccSnapshot::CreateSnapshotIncludingAllTransactions(), out));
+  RowIteratorOptions opts;
+  opts.projection = projection;
+  RETURN_NOT_OK(DeltaIteratorMerger::Create(inputs, opts, out));
   return Status::OK();
 }
 
@@ -552,20 +548,18 @@ void DeltaTracker::CollectStores(vector<shared_ptr<DeltaStore>>* deltas,
   }
 }
 
-Status DeltaTracker::NewDeltaIterator(const Schema* schema,
-                                      const MvccSnapshot& snap,
+Status DeltaTracker::NewDeltaIterator(const RowIteratorOptions& opts,
                                       WhichStores which,
                                       unique_ptr<DeltaIterator>* out) const {
-  std::vector<shared_ptr<DeltaStore> > stores;
+  std::vector<shared_ptr<DeltaStore>> stores;
   CollectStores(&stores, which);
-  return DeltaIteratorMerger::Create(stores, schema, snap, out);
+  return DeltaIteratorMerger::Create(stores, opts, out);
 }
 
 Status DeltaTracker::NewDeltaFileIterator(
-    const Schema* schema,
-    const MvccSnapshot& snap,
+    const RowIteratorOptions& opts,
     DeltaType type,
-    vector<shared_ptr<DeltaStore> >* included_stores,
+    vector<shared_ptr<DeltaStore>>* included_stores,
     unique_ptr<DeltaIterator>* out) const {
   {
     std::lock_guard<rw_spinlock> lock(component_lock_);
@@ -588,14 +582,14 @@ Status DeltaTracker::NewDeltaFileIterator(
     ignore_result(down_cast<DeltaFileReader*>(store.get()));
   }
 
-  return DeltaIteratorMerger::Create(*included_stores, schema, snap, out);
+  return DeltaIteratorMerger::Create(*included_stores, opts, out);
 }
 
 Status DeltaTracker::WrapIterator(const shared_ptr<CFileSet::Iterator> &base,
-                                  const MvccSnapshot &mvcc_snap,
+                                  const RowIteratorOptions& opts,
                                   gscoped_ptr<ColumnwiseIterator>* out) const {
   unique_ptr<DeltaIterator> iter;
-  RETURN_NOT_OK(NewDeltaIterator(&base->schema(), mvcc_snap, &iter));
+  RETURN_NOT_OK(NewDeltaIterator(opts, &iter));
 
   out->reset(new DeltaApplier(base, std::move(iter)));
   return Status::OK();
@@ -606,9 +600,8 @@ Status DeltaTracker::Update(Timestamp timestamp,
                             const RowChangeList &update,
                             const consensus::OpId& op_id,
                             OperationResultPB* result) {
-  // TODO: can probably lock this more fine-grained.
+  // TODO(todd): can probably lock this more fine-grained.
   shared_lock<rw_spinlock> lock(component_lock_);
-  DCHECK_LT(row_idx, num_rows_);
 
   Status s = dms_->Update(timestamp, row_idx, update, op_id);
   if (s.ok()) {
@@ -625,7 +618,6 @@ Status DeltaTracker::CheckRowDeleted(rowid_t row_idx, bool *deleted,
                                      ProbeStats* stats) const {
   shared_lock<rw_spinlock> lock(component_lock_);
 
-  DCHECK_LT(row_idx, num_rows_);
 
   *deleted = false;
   // Check if the row has a deletion in DeltaMemStore.
@@ -665,9 +657,9 @@ Status DeltaTracker::FlushDMS(DeltaMemStore* dms,
   gscoped_ptr<DeltaStats> stats;
   RETURN_NOT_OK(dms->FlushToFile(&dfw, &stats));
   RETURN_NOT_OK(dfw.Finish());
-  LOG_WITH_PREFIX(INFO) << "Flushed delta block: " << block_id.ToString()
-                        << " ts range: [" << stats->min_timestamp()
-                        << ", " << stats->max_timestamp() << "]";
+  LOG_WITH_PREFIX(INFO) << "Flushed delta block " << block_id.ToString()
+                        << " (" << dfw.written_size() << " bytes on disk) "
+                        << "stats: " << stats->ToString();
 
   // Now re-open for read
   unique_ptr<ReadableBlock> readable_block;
@@ -678,7 +670,7 @@ Status DeltaTracker::FlushDMS(DeltaMemStore* dms,
                                             REDO,
                                             std::move(options),
                                             dfr));
-  LOG_WITH_PREFIX(INFO) << "Reopened delta block for read: " << block_id.ToString();
+  VLOG_WITH_PREFIX(1) << "Opened new delta block " << block_id.ToString() << " for read";
 
   RETURN_NOT_OK(rowset_metadata_->CommitRedoDeltaDataBlock(dms->id(), block_id));
   if (flush_type == FLUSH_METADATA) {
@@ -724,7 +716,8 @@ Status DeltaTracker::Flush(MetadataFlushType flush_type) {
     redo_delta_stores_.push_back(old_dms);
   }
 
-  LOG_WITH_PREFIX(INFO) << "Flushing " << count << " deltas from DMS " << old_dms->id() << "...";
+  LOG_WITH_PREFIX(INFO) << "Flushing " << count << " deltas (" << old_dms->EstimateSize()
+                        << " bytes in memory) from DMS " << old_dms->id();
 
   // Now, actually flush the contents of the old DMS.
   //

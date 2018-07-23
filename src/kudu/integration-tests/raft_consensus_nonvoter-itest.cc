@@ -32,6 +32,7 @@
 #include "kudu/client/client.h"
 #include "kudu/client/replica_controller-internal.h"
 #include "kudu/client/shared_ptr.h"
+#include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/gutil/gscoped_ptr.h"
@@ -41,7 +42,7 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/raft_consensus-itest-base.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/master.pb.h"
@@ -75,9 +76,10 @@ using kudu::client::internal::ReplicaController;
 using kudu::cluster::ExternalDaemon;
 using kudu::cluster::ExternalMaster;
 using kudu::cluster::ExternalTabletServer;
-using kudu::consensus::RaftPeerPB;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::consensus::IsRaftConfigMember;
 using kudu::consensus::IsRaftConfigVoter;
+using kudu::consensus::RaftPeerPB;
 using kudu::itest::AddServer;
 using kudu::itest::GetConsensusState;
 using kudu::itest::GetInt64Metric;
@@ -256,7 +258,7 @@ TEST_F(RaftConsensusNonVoterITest, GetTableAndTabletLocations) {
   ASSERT_OK(WaitForNumTabletsOnTS(
       new_replica, 1, kTimeout, nullptr, tablet::RUNNING));
 
-  const auto count_roles = [this](const TabletLocationsPB& tablet_locations,
+  const auto count_roles = [](const TabletLocationsPB& tablet_locations,
       int* num_leaders, int* num_followers, int* num_learners) {
     *num_leaders = 0;
     *num_followers = 0;
@@ -361,7 +363,7 @@ TEST_F(RaftConsensusNonVoterITest, ReplicaMatchPolicy) {
   ASSERT_OK(WaitForNumTabletsOnTS(
       new_replica, 1, kTimeout, nullptr, tablet::RUNNING));
 
-  auto count_replicas = [this](KuduTable* table, size_t* count) {
+  auto count_replicas = [](KuduTable* table, size_t* count) {
     vector<KuduScanToken*> tokens;
     ElementDeleter deleter(&tokens);
     KuduScanTokenBuilder builder(table);
@@ -1387,7 +1389,7 @@ TEST_F(RaftConsensusNonVoterITest, TabletServerIsGoneAndBack) {
     ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
     // The reason for the outside ASSERT_EVENTUALLY is that the leader might
     // have changed in between of these two calls.
-    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
   });
   ASSERT_TRUE(IsRaftConfigMember(ts_with_replica->uuid(), cstate.committed_config()));
 
@@ -1395,13 +1397,13 @@ TEST_F(RaftConsensusNonVoterITest, TabletServerIsGoneAndBack) {
 }
 
 // A two-step sceanario: first, an existing tablet replica fails because it
-// fails behind the threshold of the GCed WAL segment threshold. The catalog
-// manager should notice that and add a new non-voter replica in attempt to
-// replace the failed replica. Then, the newly added non-voter replica becomes
-// unavailable before completing the tablet copy phase. The catalog manager
-// should add a new non-voter replica to make it possible to replace the failed
-// voter replica, so eventually the tablet has appropriate number of functional
-// replicas to guarantee the tablet's replication factor.
+// falls behind the threshold of the GCed WAL segment threshold. The catalog
+// manager should notice that and evict it right away. Then it should add a new
+// non-voter replica in attempt to replace the evicted one. The newly added
+// non-voter replica becomes unavailable before completing the tablet copy phase.
+// The catalog manager should add a new non-voter replica to make it possible to
+// replace the failed voter replica, so eventually the tablet has appropriate
+// number of functional replicas to guarantee the tablet's replication factor.
 TEST_F(RaftConsensusNonVoterITest, FailedTabletCopy) {
   if (!AllowSlowTests()) {
     LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
@@ -1470,22 +1472,32 @@ TEST_F(RaftConsensusNonVoterITest, FailedTabletCopy) {
     int64_t orig_term;
     NO_FATALS(CauseFollowerToFallBehindLogGC(
         replica_servers, &leader_uuid, &orig_term, &follower_uuid));
+
+    // Make sure this tablet server is not to host a functional tablet replica,
+    // even if the system tries to place one there after evicting current one.
+    ExternalTabletServer* ts =
+        cluster_->tablet_server_by_uuid(follower_uuid);
+    ASSERT_NE(nullptr, ts);
+    ASSERT_OK(cluster_->SetFlag(ts,
+                                "tablet_copy_fault_crash_on_fetch_all", "1.0"));
   }
 
   // The leader replica marks the non-responsive replica as failed after it
   // realizes the replica would not be able to catch up, and the catalog
-  // manager should add a new non-voter as a replacement.
+  // manager evicts the failed replica right away since it failed in an
+  // unrecoverable way.
   bool has_leader = false;
   TabletLocationsPB tablet_locations;
   ASSERT_OK(WaitForReplicasReportedToMaster(cluster_->master_proxy(),
-                                            kReplicasNum + 1,
+                                            kReplicasNum - 1,
                                             tablet_id_,
                                             kTimeout,
                                             WAIT_FOR_LEADER,
-                                            ANY_REPLICA,
+                                            VOTER_REPLICA,
                                             &has_leader,
                                             &tablet_locations));
 
+  // The system should add a new non-voter as a replacement.
   // However, the tablet server with the new non-voter replica crashes during
   // the tablet copy phase. Give the catalog manager some time to detect that
   // and purge the failed non-voter from the configuration. Also, the TS manager
@@ -1505,15 +1517,16 @@ TEST_F(RaftConsensusNonVoterITest, FailedTabletCopy) {
     ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
     // The reason for the outside ASSERT_EVENTUALLY is that the leader might
     // have changed in between of these two calls.
-    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
   });
-  // The original voter replica that fell behind WAL catchup threshold should
-  // still be there.
-  EXPECT_TRUE(IsRaftConfigMember(follower_uuid, cstate.committed_config()))
+  // The original voter replica that fell behind the WAL catchup threshold should
+  // not be there, it should be evicted.
+  EXPECT_FALSE(IsRaftConfigMember(follower_uuid, cstate.committed_config()))
       << pb_util::SecureDebugString(cstate.committed_config())
       << "fell behind WAL replica UUID: " << follower_uuid;
-  // The first non-voter replica failed on tablet copy should be evicted.
-  EXPECT_FALSE(IsRaftConfigMember(ts0->uuid(), cstate.committed_config()))
+  // The first non-voter replica failed on tablet copy cannot be evicted
+  // because no replacement replica is available at this point yet.
+  EXPECT_TRUE(IsRaftConfigMember(ts0->uuid(), cstate.committed_config()))
       << pb_util::SecureDebugString(cstate.committed_config())
       << "failed tablet copy replica UUID: " << ts0->uuid();
   // No replicas from the second tablet server should be in the config yet.
@@ -1543,7 +1556,7 @@ TEST_F(RaftConsensusNonVoterITest, FailedTabletCopy) {
 
     TServerDetails* leader = nullptr;
     ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
-    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
     // The original voter replica that fell behind the WAL catchup threshold
     // should be evicted.
     ASSERT_FALSE(IsRaftConfigMember(follower_uuid, cstate.committed_config()))
@@ -1701,13 +1714,18 @@ TEST_F(RaftConsensusNonVoterITest, RestartClusterWithNonVoter) {
                                             ANY_REPLICA,
                                             &has_leader,
                                             &tablet_locations));
+  // The newly added replica needs to be registered in the internal
+  // tablet_replicas_: this is necessary for the future calls like
+  // GetLeaderReplicaWithRetries() when the replica becomes a leader.
+  NO_FATALS(WaitForReplicasAndUpdateLocations(table_->name()));
+
   consensus::ConsensusStatePB cstate;
   ASSERT_EVENTUALLY([&] {
     TServerDetails* leader = nullptr;
     ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
     // The reason for the outside ASSERT_EVENTUALLY is that the leader might
     // have changed in between of these two calls.
-    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
   });
   // The failed voter replica should be evicted.
   EXPECT_FALSE(IsRaftConfigMember(failed_replica_uuid, cstate.committed_config()))
@@ -1799,13 +1817,13 @@ TEST_F(RaftConsensusNonVoterITest, NonVoterReplicasInConsensusQueue) {
   LOG(INFO) << "Waiting for pending config...";
   consensus::ConsensusStatePB cstate;
   ASSERT_EVENTUALLY([&] {
-    ASSERT_OK(GetConsensusState(leader, tablet_id, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader, tablet_id, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
     ASSERT_TRUE(cstate.has_pending_config());
   });
 
   // Ensure it does not commit.
   SleepFor(MonoDelta::FromSeconds(5));
-  ASSERT_OK(GetConsensusState(leader, tablet_id, kTimeout, &cstate));
+  ASSERT_OK(GetConsensusState(leader, tablet_id, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
   ASSERT_TRUE(cstate.has_pending_config());
 
   const auto& new_replica_uuid = new_replica->uuid();
@@ -1823,7 +1841,7 @@ TEST_F(RaftConsensusNonVoterITest, NonVoterReplicasInConsensusQueue) {
 
   // Once the new replicas come back online, this should be committed.
   ASSERT_EVENTUALLY([&] {
-    ASSERT_OK(GetConsensusState(leader, tablet_id, kTimeout, &cstate));
+    ASSERT_OK(GetConsensusState(leader, tablet_id, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
     ASSERT_FALSE(cstate.has_pending_config());
   });
 
@@ -1836,17 +1854,19 @@ TEST_F(RaftConsensusNonVoterITest, NonVoterReplicasInConsensusQueue) {
 // Also, it makes sure the tablet server crashes to signal the misconfiguration.
 class IncompatibleReplicaReplacementSchemesITest :
     public RaftConsensusNonVoterITest,
-    public ::testing::WithParamInterface<bool> {
+    public ::testing::WithParamInterface<std::tuple<bool, bool>> {
 };
 INSTANTIATE_TEST_CASE_P(, IncompatibleReplicaReplacementSchemesITest,
-                        ::testing::Bool());
+                        ::testing::Combine(::testing::Bool(),
+                                           ::testing::Bool()));
 TEST_P(IncompatibleReplicaReplacementSchemesITest, MasterAndTserverMisconfig) {
   FLAGS_num_tablet_servers = 1;
   FLAGS_num_replicas = 1;
   const MonoDelta kTimeout = MonoDelta::FromSeconds(60);
   const int64_t heartbeat_interval_ms = 500;
 
-  const bool is_3_4_3 = GetParam();
+  const bool is_incompatible_replica_management_fatal = std::get<0>(GetParam());
+  const bool is_3_4_3 = std::get<1>(GetParam());
 
   // The easiest way to have everything setup is to start the cluster with
   // compatible parameters.
@@ -1854,6 +1874,8 @@ TEST_P(IncompatibleReplicaReplacementSchemesITest, MasterAndTserverMisconfig) {
     Substitute("--raft_prepare_replacement_before_eviction=$0", is_3_4_3),
   };
   const vector<string> kTsFlags = {
+    Substitute("--heartbeat_incompatible_replica_management_is_fatal=$0",
+        is_incompatible_replica_management_fatal),
     Substitute("--heartbeat_interval_ms=$0", heartbeat_interval_ms),
     Substitute("--raft_prepare_replacement_before_eviction=$0", is_3_4_3),
   };
@@ -1875,17 +1897,182 @@ TEST_P(IncompatibleReplicaReplacementSchemesITest, MasterAndTserverMisconfig) {
 
   // Update corresponding flags to induce a misconfiguration between the master
   // and the tablet server.
-  ts->mutable_flags()->push_back(
+  ts->mutable_flags()->emplace_back(
       Substitute("--raft_prepare_replacement_before_eviction=$0", !is_3_4_3));
   ASSERT_OK(ts->Restart());
-
-  ASSERT_OK(ts->WaitForFatal(kTimeout));
-
+  if (is_incompatible_replica_management_fatal) {
+    ASSERT_OK(ts->WaitForFatal(kTimeout));
+  }
   SleepFor(MonoDelta::FromMilliseconds(heartbeat_interval_ms * 3));
 
   // The tablet server should not be registered with the master.
   ASSERT_OK(itest::ListTabletServers(cluster_->master_proxy(), kTimeout, &tservers));
   ASSERT_EQ(0, tservers.size());
+
+  // Inject feature flag not supported by the master and make sure the tablet
+  // server will not be registered with incompatible master.
+  ts->mutable_flags()->pop_back();
+  ts->mutable_flags()->emplace_back("--heartbeat_inject_required_feature_flag=999");
+  ts->Shutdown();
+  ASSERT_OK(ts->Restart());
+  if (is_incompatible_replica_management_fatal) {
+    ASSERT_OK(ts->WaitForFatal(kTimeout));
+  }
+  SleepFor(MonoDelta::FromMilliseconds(heartbeat_interval_ms * 3));
+
+  // The tablet server should not be registered with the master.
+  ASSERT_OK(itest::ListTabletServers(cluster_->master_proxy(), kTimeout, &tservers));
+  ASSERT_EQ(0, tservers.size());
+
+  if (!is_incompatible_replica_management_fatal) {
+    NO_FATALS(cluster_->AssertNoCrashes());
+  }
+}
+
+// This test scenario runs the system with the 3-4-3 replica management scheme
+// having the total number of tablet servers equal to the replication factor
+// of the tablet being tested. The scenario makes one follower replica
+// fall behind the WAL segment GC threshold. The system should be able to
+// replace the failed replica 'in-place', i.e. no additional tablet server is
+// needed for the cluster to recover in such situations. The scenario verifies
+// that the re-replication works as expected when the tablet server hosting the
+// failed replica is:
+//   ** paused and then resumed, emulating a lagging tablet server
+//   ** shut down and then started back up
+class ReplicaBehindWalGcThresholdITest :
+    public RaftConsensusNonVoterITest,
+    public ::testing::WithParamInterface<
+        std::tuple<RaftConsensusITestBase::BehindWalGcBehavior, bool>> {
+};
+INSTANTIATE_TEST_CASE_P(,
+    ReplicaBehindWalGcThresholdITest,
+    ::testing::Combine(
+        ::testing::Values(RaftConsensusITestBase::BehindWalGcBehavior::STOP_CONTINUE,
+                          RaftConsensusITestBase::BehindWalGcBehavior::SHUTDOWN_RESTART,
+                          RaftConsensusITestBase::BehindWalGcBehavior::SHUTDOWN),
+        ::testing::Bool()));
+TEST_P(ReplicaBehindWalGcThresholdITest, ReplicaReplacement) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+
+  const auto kReplicasNum = 3;
+  const auto kTimeoutSec = 60;
+  const auto kTimeout = MonoDelta::FromSeconds(kTimeoutSec);
+  const auto kUnavaiableFailedSec = 5;
+  FLAGS_num_replicas = kReplicasNum;
+  FLAGS_num_tablet_servers = kReplicasNum;
+  const auto tserver_behavior = std::get<0>(GetParam());
+  const bool do_delay_workload = std::get<1>(GetParam());
+
+  vector<string> master_flags = {
+    // This scenario runs with the 3-4-3 replica management scheme.
+    "--raft_prepare_replacement_before_eviction=true",
+  };
+  if (tserver_behavior != BehindWalGcBehavior::SHUTDOWN) {
+    // This scenario verifies that the system evicts the replica that's falling
+    // behind the WAL segment GC threshold. If not shutting down the tablet
+    // server hosting the affected replica, it's necessary to avoid races with
+    // catalog manager when it replaces the replica that has just been evicted.
+    master_flags.emplace_back("--master_add_server_when_underreplicated=false");
+  }
+
+  vector<string> tserver_flags = {
+    // This scenario is specific for the 3-4-3 replica management scheme.
+    "--raft_prepare_replacement_before_eviction=true",
+
+    // Detect unavailable replicas faster.
+    Substitute("--follower_unavailable_considered_failed_sec=$0", kUnavaiableFailedSec),
+  };
+  AddFlagsForLogRolls(&tserver_flags); // For CauseFollowerToFallBehindLogGC().
+
+  NO_FATALS(BuildAndStart(tserver_flags, master_flags));
+
+  string follower_uuid;
+  string leader_uuid;
+  int64_t orig_term;
+  MonoDelta delay;
+  if (do_delay_workload) {
+    // That's to make the leader replica to report the state of the tablet as
+    // FAILED first. Later on, when the replica falls behind the WAL segment GC
+    // threshold, the leader replica should report the follower's health status
+    // as FAILED_UNRECOVERABLE.
+    delay = MonoDelta::FromSeconds(3 * kUnavaiableFailedSec);
+  }
+  NO_FATALS(CauseFollowerToFallBehindLogGC(
+      tablet_servers_, &leader_uuid, &orig_term, &follower_uuid,
+      tserver_behavior, delay));
+
+  // The catalog manager should evict the replicas which fell behing the WAL
+  // segment GC threshold right away.
+  bool has_leader = false;
+  TabletLocationsPB tablet_locations;
+  const auto num_replicas = (tserver_behavior == BehindWalGcBehavior::SHUTDOWN)
+      ? kReplicasNum : kReplicasNum - 1;
+  ASSERT_OK(WaitForReplicasReportedToMaster(cluster_->master_proxy(),
+                                            num_replicas,
+                                            tablet_id_,
+                                            kTimeout,
+                                            WAIT_FOR_LEADER,
+                                            ANY_REPLICA,
+                                            &has_leader,
+                                            &tablet_locations));
+  consensus::ConsensusStatePB cstate;
+  ASSERT_EVENTUALLY([&] {
+    TServerDetails* leader = nullptr;
+    ASSERT_OK(GetLeaderReplicaWithRetries(tablet_id_, &leader));
+    // The reason for the outside ASSERT_EVENTUALLY is that the leader might
+    // have changed in between of these two calls.
+    ASSERT_OK(GetConsensusState(leader, tablet_id_, kTimeout, EXCLUDE_HEALTH_REPORT, &cstate));
+  });
+
+  if (tserver_behavior == BehindWalGcBehavior::SHUTDOWN) {
+    // The original voter replica that fell behind the WAL catchup threshold
+    // should be evicted and replaced with a non-voter replica. Since its
+    // tablet server is shutdown, the replica is not able to catch up with
+    // the leader yet (otherwise, it would be promoted to a voter replica).
+    EXPECT_TRUE(IsRaftConfigMember(follower_uuid, cstate.committed_config()))
+        << pb_util::SecureDebugString(cstate.committed_config())
+        << "fell behind WAL replica UUID: " << follower_uuid;
+    EXPECT_FALSE(IsRaftConfigVoter(follower_uuid, cstate.committed_config()))
+        << pb_util::SecureDebugString(cstate.committed_config())
+        << "fell behind WAL replica UUID: " << follower_uuid;
+    // Bring the tablet server with the affected replica back.
+    ASSERT_OK(cluster_->tablet_server_by_uuid(follower_uuid)->Restart());
+  } else {
+    // The replica that fell behind the WAL catchup threshold should be
+    // evicted and since the catalog manager is not yet adding replacement
+    // replicas, a replacement replica should not be added yet.
+    EXPECT_FALSE(IsRaftConfigMember(follower_uuid, cstate.committed_config()))
+        << pb_util::SecureDebugString(cstate.committed_config())
+        << "fell behind WAL replica UUID: " << follower_uuid;
+    // Restore back the default behavior of the catalog manager, so it would
+    // add a replacement replica.
+    for (auto idx = 0; idx < cluster_->num_masters(); ++idx) {
+      auto* master = cluster_->master(idx);
+      master->mutable_flags()->emplace_back(
+          "--master_add_server_when_underreplicated=true");
+      master->Shutdown();
+      ASSERT_OK(master->Restart());
+      ASSERT_OK(master->WaitForCatalogManager());
+    }
+  }
+
+  // The system should be able to recover, replacing the failed replica.
+  ASSERT_OK(WaitForReplicasReportedToMaster(cluster_->master_proxy(),
+                                            kReplicasNum,
+                                            tablet_id_,
+                                            kTimeout,
+                                            WAIT_FOR_LEADER,
+                                            VOTER_REPLICA,
+                                            &has_leader,
+                                            &tablet_locations));
+  NO_FATALS(cluster_->AssertNoCrashes());
+  ClusterVerifier v(cluster_.get());
+  v.SetOperationsTimeout(kTimeout);
+  v.SetVerificationTimeout(kTimeout);
+  NO_FATALS(v.CheckCluster());
 }
 
 }  // namespace tserver

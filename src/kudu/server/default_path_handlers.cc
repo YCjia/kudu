@@ -47,6 +47,8 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/server/pprof_path_handlers.h"
 #include "kudu/server/webserver.h"
+#include "kudu/util/array_view.h"
+#include "kudu/util/debug-util.h"
 #include "kudu/util/easy_json.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/flag_tags.h"
@@ -55,6 +57,7 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/process_memory.h"
 #include "kudu/util/status.h"
 #include "kudu/util/web_callback_registry.h"
@@ -142,6 +145,41 @@ static void FlagsHandler(const Webserver::WebRequest& req,
   (*output) << tags.pre_tag
             << CommandlineFlagsIntoString(as_text ? EscapeMode::NONE : EscapeMode::HTML)
             << tags.end_pre_tag;
+}
+
+// Registered to handle "/stacks".
+//
+// Prints out the current stack trace of all threads in the process.
+static void StacksHandler(const Webserver::WebRequest& /*req*/,
+                          Webserver::PrerenderedWebResponse* resp) {
+  std::ostringstream* output = resp->output;
+
+  StackTraceSnapshot snap;
+  auto start = MonoTime::Now();
+  Status s = snap.SnapshotAllStacks();
+  if (!s.ok()) {
+    *output << "Failed to collect stacks: " << s.ToString();
+    return;
+  }
+  auto dur = MonoTime::Now() - start;
+
+  *output << "Collected stacks from " << snap.num_threads() << " threads in "
+          << dur.ToString() << "\n";
+  if (snap.num_failed()) {
+    *output << "Failed to collect stacks from " << snap.num_failed() << " threads "
+            << "(they may have exited while we were iterating over the threads)\n";
+  }
+  *output << "\n";
+  snap.VisitGroups([&](ArrayView<StackTraceSnapshot::ThreadInfo> threads) {
+      if (threads.size() > 1) {
+        *output << threads.size() << " threads with same stack:\n";
+      }
+
+      for (auto& info : threads) {
+        *output << "TID " << info.tid << "(" << info.thread_name << "):\n";
+      }
+      *output << threads[0].stack.Symbolize() << "\n\n";
+    });
 }
 
 // Registered to handle "/memz", and prints out memory allocation statistics.
@@ -262,6 +300,10 @@ void AddDefaultPathHandlers(Webserver* webserver) {
                                             styled, on_nav_bar);
   webserver->RegisterPathHandler("/config", "Configuration", ConfigurationHandler,
                                   styled, on_nav_bar);
+
+  webserver->RegisterPrerenderedPathHandler("/stacks", "Stacks", StacksHandler,
+                                            /*is_styled=*/false,
+                                            /*is_on_nav_bar=*/false);
 
   AddPprofPathHandlers(webserver);
 }

@@ -30,7 +30,6 @@
 
 #include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -132,6 +131,10 @@ void ServicePool::RejectTooBusy(InboundCall* c) {
                     Status::ServiceUnavailable(err_msg));
   DLOG(INFO) << err_msg << " Contents of service queue:\n"
              << service_queue_.ToString();
+
+  if (too_busy_hook_) {
+    too_busy_hook_();
+  }
 }
 
 RpcMethodInfo* ServicePool::LookupMethod(const RemoteMethod& method) {
@@ -196,7 +199,7 @@ void ServicePool::RunThread() {
       return;
     }
 
-    incoming->RecordHandlingStarted(incoming_queue_time_);
+    incoming->RecordHandlingStarted(incoming_queue_time_.get());
     ADOPT_TRACE(incoming->trace());
 
     if (PREDICT_FALSE(incoming->ClientTimedOut())) {

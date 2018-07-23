@@ -17,22 +17,19 @@
 package org.apache.kudu.client;
 
 import static org.apache.kudu.util.AssertHelpers.assertEventuallyTrue;
+import static org.apache.kudu.util.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.util.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 import java.util.List;
 import org.apache.kudu.util.AssertHelpers.BooleanExpression;
-import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.google.common.net.HostAndPort;
 
 public class TestMultipleLeaderFailover extends BaseKuduTest {
-
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
-    BaseKuduTest.setUpBeforeClass();
-  }
 
   private void waitUntilRowCount(final KuduTable table, final int rowCount, long timeoutMs)
       throws Exception {

@@ -26,6 +26,10 @@
 race:_ULx86_64_init
 race:_ULx86_64_local_addr_space_init
 
+# TODO(todd) After upgrading to clang 6.0, libunwind's cache is getting
+# flagged as unsafe.
+race:_ULx86_64_step
+
 # libev uses some lock-free synchronization, but doesn't have TSAN annotations.
 race:epoll_ctl
 
@@ -95,3 +99,12 @@ race:kudu::consensus::LocalTestPeerProxy::~LocalTestPeerProxy
 # GetBoundAddresses()
 race:kudu::Webserver::GetBoundAddresses
 race:kudu::RpcServer::GetBoundAddresses
+
+# KUDU-2439: OpenSSL 1.1's atexit() handler may destroy global state while a
+# Messenger is shutting down and still accessing that state. See
+# https://github.com/openssl/openssl/issues/6214 for more details.
+#
+# This is carried out by OPENSSL_cleanup, but TSAN's unwinder doesn't
+# include any stack frame above the libcrypto lock destruction or memory release
+# call for some reason, so we have to do something more generic.
+called_from_lib:libcrypto.so

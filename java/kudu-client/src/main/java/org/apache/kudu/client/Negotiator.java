@@ -51,7 +51,6 @@ import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslClient;
 import javax.security.sasl.SaslException;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
@@ -92,8 +91,8 @@ import org.apache.kudu.util.SecurityUtil;
 public class Negotiator extends SimpleChannelUpstreamHandler {
   private static final Logger LOG = LoggerFactory.getLogger(Negotiator.class);
 
-  private static final SaslClientCallbackHandler SASL_CALLBACK = new SaslClientCallbackHandler();
-  private static final Set<RpcHeader.RpcFeatureFlag> SUPPORTED_RPC_FEATURES =
+  private final SaslClientCallbackHandler SASL_CALLBACK = new SaslClientCallbackHandler();
+  private static final ImmutableSet<RpcHeader.RpcFeatureFlag> SUPPORTED_RPC_FEATURES =
       ImmutableSet.of(
           RpcHeader.RpcFeatureFlag.APPLICATION_FEATURE_FLAGS,
           RpcHeader.RpcFeatureFlag.TLS);
@@ -110,6 +109,30 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
 
   static final int CONNECTION_CTX_CALL_ID = -3;
   static final int SASL_CALL_ID = -33;
+
+  /**
+   * The cipher suites, in order of our preference.
+   * This list is based on the kDefaultTlsCiphers list in security_flags.cc,
+   * See that file for details on how it was derived.
+   */
+  static final String[] PREFERRED_CIPHER_SUITES = new String[] {
+      "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", // Java 8
+      "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",   // Java 8
+      "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", // Java 8
+      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",   // Java 8
+      "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384", // Java 7 (TLS 1.2+ only)
+      "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",   // Java 7 (TLS 1.2+ only)
+      "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256", // Java 7 (TLS 1.2+ only)
+      "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",   // Java 7 (TLS 1.2+ only)
+      "TLS_RSA_WITH_AES_256_GCM_SHA384",         // Java 8
+      "TLS_RSA_WITH_AES_128_GCM_SHA256",         // Java 8
+      "TLS_RSA_WITH_AES_256_CBC_SHA256",         // Java 7 (TLS 1.2+ only)
+      "TLS_RSA_WITH_AES_128_CBC_SHA256",         // Java 7 (TLS 1.2+ only)
+      // The following two are critical to allow the client to connect to
+      // servers running versions of OpenSSL that don't support TLS 1.2.
+      "TLS_RSA_WITH_AES_256_CBC_SHA",            // All Java versions
+      "TLS_RSA_WITH_AES_128_CBC_SHA"             // All Java versions
+  };
 
   private enum State {
     INITIAL,
@@ -130,6 +153,20 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
    * ensure that it doesn't change over the course of a negotiation attempt.
    */
   private final SignedTokenPB authnToken;
+
+  private static enum AuthnTokenNotUsedReason {
+    NONE_AVAILABLE("no token is available"),
+    NO_TRUSTED_CERTS("no TLS certificates are trusted by the client"),
+    FORBIDDEN_BY_POLICY("this connection will be used to acquire a new token and " +
+                        "therefore requires primary credentials"),
+    NOT_CHOSEN_BY_SERVER("the server chose not to accept token authentication");
+
+    AuthnTokenNotUsedReason(String msg) {
+      this.msg = msg;
+    }
+    final String msg;
+  };
+  private AuthnTokenNotUsedReason authnTokenNotUsedReason = null;
 
   private State state = State.INITIAL;
   private SaslClient saslClient;
@@ -166,7 +203,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
 
   private Certificate peerCert;
 
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   boolean overrideLoopbackForTests;
 
   public Negotiator(String remoteHostname,
@@ -174,10 +211,20 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
                     boolean ignoreAuthnToken) {
     this.remoteHostname = remoteHostname;
     this.securityContext = securityContext;
-    if (ignoreAuthnToken) {
-      this.authnToken = null;
+    SignedTokenPB token = securityContext.getAuthenticationToken();
+    if (token != null) {
+      if (ignoreAuthnToken) {
+        this.authnToken = null;
+        this.authnTokenNotUsedReason = AuthnTokenNotUsedReason.FORBIDDEN_BY_POLICY;
+      } else if (!securityContext.hasTrustedCerts()) {
+        this.authnToken = null;
+        this.authnTokenNotUsedReason = AuthnTokenNotUsedReason.NO_TRUSTED_CERTS;
+      } else {
+        this.authnToken = token;
+      }
     } else {
-      this.authnToken = securityContext.getAuthenticationToken();
+      this.authnToken = null;
+      this.authnTokenNotUsedReason = AuthnTokenNotUsedReason.NONE_AVAILABLE;
     }
   }
 
@@ -206,7 +253,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
 
     // We may also have a token. But, we can only use the token
     // if we are able to use authenticated TLS to authenticate the server.
-    if (authnToken != null && securityContext.hasTrustedCerts()) {
+    if (authnToken != null) {
       builder.addAuthnTypesBuilder().setToken(
           AuthenticationTypePB.Token.getDefaultInstance());
     }
@@ -346,6 +393,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
   }
 
   private void chooseAndInitializeSaslMech(NegotiatePB response) throws KuduException {
+    securityContext.refreshSubject();
     // Gather the set of server-supported mechanisms.
     Map<String, String> errorsByMech = Maps.newHashMap();
     Set<SaslMechanism> serverMechs = Sets.newHashSet();
@@ -369,11 +417,17 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     // choose that mech.
     for (SaslMechanism clientMech : SaslMechanism.values()) {
 
-      if (clientMech.equals(SaslMechanism.GSSAPI) &&
-          (securityContext.getSubject() == null ||
-           securityContext.getSubject().getPrivateCredentials(KerberosTicket.class).isEmpty())) {
-        errorsByMech.put(clientMech.name(), "Client does not have Kerberos credentials (tgt)");
-        continue;
+      if (clientMech.equals(SaslMechanism.GSSAPI)) {
+        Subject s = securityContext.getSubject();
+        if (s == null ||
+            s.getPrivateCredentials(KerberosTicket.class).isEmpty()) {
+          errorsByMech.put(clientMech.name(), "client does not have Kerberos credentials (tgt)");
+          continue;
+        }
+        if (SecurityUtil.isTgtExpired(s)) {
+          errorsByMech.put(clientMech.name(), "client Kerberos credentials (TGT) have expired");
+          continue;
+        }
       }
 
       if (!serverMechs.contains(clientMech)) {
@@ -413,11 +467,16 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     if (serverMechs.size() == 1 && serverMechs.contains(SaslMechanism.GSSAPI)) {
       // Give a better error diagnostic for common case of an unauthenticated client connecting
       // to a secure server.
-      message = "server requires authentication, " +
-                "but client does not have Kerberos credentials available";
+      message = "server requires authentication, but " +
+          errorsByMech.get(SaslMechanism.GSSAPI.name());
     } else {
       message = "client/server supported SASL mechanism mismatch: [" +
                 Joiner.on(", ").withKeyValueSeparator(": ").join(errorsByMech) + "]";
+    }
+
+    if (authnTokenNotUsedReason != null) {
+      message += ". Authentication tokens were not used because " +
+          authnTokenNotUsedReason.msg;
     }
 
     // If client has valid secondary authn credentials (such as authn token),
@@ -445,6 +504,9 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     AuthenticationTypePB.TypeCase type = response.getAuthnTypes(0).getTypeCase();
     switch (type) {
       case SASL:
+        if (authnToken != null) {
+          authnTokenNotUsedReason = AuthnTokenNotUsedReason.NOT_CHOSEN_BY_SERVER;
+        }
         break;
       case TOKEN:
         if (authnToken == null) {
@@ -486,6 +548,21 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
         throw new AssertionError("unreachable");
     }
     engine.setUseClientMode(true);
+    Set<String> supported = Sets.newHashSet(engine.getSupportedCipherSuites());
+    List<String> toEnable = Lists.newArrayList();
+    for (String cipher : PREFERRED_CIPHER_SUITES) {
+      if (supported.contains(cipher)) {
+        toEnable.add(cipher);
+      }
+    }
+    if (toEnable.isEmpty()) {
+      // This should never be the case given the cipher suites we picked are
+      // supported by the standard JDK, but just in case, better to have a clear
+      // exception.
+      throw new RuntimeException("No preferred cipher suites were supported. " +
+          "Supported suites: " + Joiner.on(',').join(supported));
+    }
+    engine.setEnabledCipherSuites(toEnable.toArray(new String[0]));
     SslHandler handler = new SslHandler(engine);
     handler.setEnableRenegotiation(false);
     sslEmbedder = new DecoderEmbedder<>(handler);
@@ -684,6 +761,8 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
     chan.getPipeline().remove(this);
 
     Channels.write(chan, makeConnectionContext());
+    LOG.debug("Authenticated connection {} using {}/{}",
+        chan, chosenAuthnType, chosenMech);
     Channels.fireMessageReceived(chan, new Success(serverFeatures));
   }
 
@@ -692,7 +771,7 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
 
     // The UserInformationPB is deprecated, but used by servers prior to Kudu 1.1.
     RpcHeader.UserInformationPB.Builder userBuilder = RpcHeader.UserInformationPB.newBuilder();
-    String user = System.getProperty("user.name");
+    String user = securityContext.getRealUser();
     userBuilder.setEffectiveUser(user);
     userBuilder.setRealUser(user);
     builder.setDEPRECATEDUserInfo(userBuilder.build());
@@ -738,18 +817,20 @@ public class Negotiator extends SimpleChannelUpstreamHandler {
           ((GSSException) cause).getMajor() == GSSException.NO_CRED) {
         throw new NonRecoverableException(
             Status.ConfigurationError(
-                "Server requires Kerberos, but this client is not authenticated (kinit)"),
+                "Server requires Kerberos, but this client is not authenticated " +
+                "(missing or expired TGT)"),
             saslException);
       }
       throw saslException;
     }
   }
 
-  private static class SaslClientCallbackHandler implements CallbackHandler {
+  private class SaslClientCallbackHandler implements CallbackHandler {
+    @Override
     public void handle(Callback[] callbacks) throws UnsupportedCallbackException {
       for (Callback callback : callbacks) {
         if (callback instanceof NameCallback) {
-          ((NameCallback) callback).setName(System.getProperty("user.name"));
+          ((NameCallback) callback).setName(securityContext.getRealUser());
         } else if (callback instanceof PasswordCallback) {
           ((PasswordCallback) callback).setPassword(new char[0]);
         } else {

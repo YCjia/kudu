@@ -51,6 +51,7 @@ public class LocatedTablet {
     return replicas;
   }
 
+  @InterfaceAudience.LimitedPrivate("Impala")
   public Partition getPartition() {
     return partition;
   }
@@ -125,7 +126,7 @@ public class LocatedTablet {
       return pb.getTsInfo().getRpcAddressesList().get(0).getPort();
     }
 
-    public Role getRoleAsEnum() {
+    private Role getRoleAsEnum() {
       return pb.getRole();
     }
 
@@ -133,6 +134,7 @@ public class LocatedTablet {
       return pb.getRole().toString();
     }
 
+    @Override
     public String toString() {
       return pb.toString();
     }

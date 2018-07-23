@@ -40,7 +40,6 @@
 #include "kudu/consensus/opid_util.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/periodic.h"
@@ -227,8 +226,7 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
       request_.committed_index() : kMinimumOpIdIndex;
 
   if (PREDICT_FALSE(!s.ok())) {
-    LOG_WITH_PREFIX_UNLOCKED(INFO) << "Could not obtain request from queue for peer: "
-        << peer_pb_.permanent_uuid() << ". Status: " << s.ToString();
+    VLOG_WITH_PREFIX_UNLOCKED(1) << s.ToString();
     return;
   }
 
@@ -297,11 +295,12 @@ void Peer::ProcessResponse() {
   MAYBE_FAULT(FLAGS_fault_crash_after_leader_request_fraction);
 
   // Process RpcController errors.
-  if (!controller_.status().ok()) {
-    auto ps = controller_.status().IsRemoteError() ?
+  const auto controller_status = controller_.status();
+  if (!controller_status.ok()) {
+    auto ps = controller_status.IsRemoteError() ?
         PeerStatus::REMOTE_ERROR : PeerStatus::RPC_LAYER_ERROR;
-    queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, controller_.status());
-    ProcessResponseError(controller_.status());
+    queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, controller_status);
+    ProcessResponseError(controller_status);
     return;
   }
 
@@ -321,13 +320,19 @@ void Peer::ProcessResponse() {
   if (response_.has_error()) {
     Status response_status = StatusFromPB(response_.error().status());
     PeerStatus ps;
-    if (response_.error().code() == TabletServerErrorPB::TABLET_FAILED) {
-      ps = PeerStatus::TABLET_FAILED;
-    } else if (response_.error().code() == TabletServerErrorPB::TABLET_NOT_FOUND) {
-      ps = PeerStatus::TABLET_NOT_FOUND;
-    } else {
-      // Unknown kind of error.
-      ps = PeerStatus::REMOTE_ERROR;
+    TabletServerErrorPB resp_error = response_.error();
+    switch (response_.error().code()) {
+      // We treat WRONG_SERVER_UUID as failed.
+      case TabletServerErrorPB::WRONG_SERVER_UUID: FALLTHROUGH_INTENDED;
+      case TabletServerErrorPB::TABLET_FAILED:
+        ps = PeerStatus::TABLET_FAILED;
+        break;
+      case TabletServerErrorPB::TABLET_NOT_FOUND:
+        ps = PeerStatus::TABLET_NOT_FOUND;
+        break;
+      default:
+        // Unknown kind of error.
+        ps = PeerStatus::REMOTE_ERROR;
     }
     queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, response_status);
     ProcessResponseError(response_status);
@@ -360,8 +365,7 @@ void Peer::DoProcessResponse() {
   VLOG_WITH_PREFIX_UNLOCKED(2) << "Response from peer " << peer_pb().permanent_uuid() << ": "
       << SecureShortDebugString(response_);
 
-  bool more_pending;
-  queue_->ResponseFromPeer(peer_pb_.permanent_uuid(), response_, &more_pending);
+  bool send_more_immediately = queue_->ResponseFromPeer(peer_pb_.permanent_uuid(), response_);
 
   {
     std::unique_lock<simple_spinlock> lock(peer_lock_);
@@ -372,7 +376,7 @@ void Peer::DoProcessResponse() {
   // We're OK to read the state_ without a lock here -- if we get a race,
   // the worst thing that could happen is that we'll make one more request before
   // noticing a close.
-  if (more_pending) {
+  if (send_more_immediately) {
     SendNextRequest(true);
   }
 }
@@ -398,8 +402,9 @@ void Peer::ProcessTabletCopyResponse() {
   request_pending_ = false;
 
   // If the response is OK, or ALREADY_INPROGRESS, then consider the RPC successful.
+  const auto controller_status = controller_.status();
   bool success =
-    controller_.status().ok() &&
+    controller_status.ok() &&
     (!tc_response_.has_error() ||
      tc_response_.error().code() == TabletServerErrorPB::TabletServerErrorPB::ALREADY_INPROGRESS);
 
@@ -410,10 +415,10 @@ void Peer::ProcessTabletCopyResponse() {
               tc_response_.error().code() != TabletServerErrorPB::TabletServerErrorPB::THROTTLED) {
     // THROTTLED is a common response after a tserver with many replicas fails;
     // logging it would generate a great deal of log spam.
-    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin Tablet Copy on peer: "
-                                      << (controller_.status().ok() ?
+    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to start Tablet Copy on peer: "
+                                      << (controller_status.ok() ?
                                           SecureShortDebugString(tc_response_) :
-                                          controller_.status().ToString());
+                                          controller_status.ToString());
   }
 }
 
@@ -464,8 +469,8 @@ Peer::~Peer() {
 
 RpcPeerProxy::RpcPeerProxy(gscoped_ptr<HostPort> hostport,
                            gscoped_ptr<ConsensusServiceProxy> consensus_proxy)
-    : hostport_(std::move(hostport)),
-      consensus_proxy_(std::move(consensus_proxy)) {
+    : hostport_(std::move(DCHECK_NOTNULL(hostport))),
+      consensus_proxy_(std::move(DCHECK_NOTNULL(consensus_proxy))) {
 }
 
 void RpcPeerProxy::UpdateAsync(const ConsensusRequestPB* request,
@@ -487,10 +492,13 @@ void RpcPeerProxy::StartTabletCopy(const StartTabletCopyRequestPB* request,
                                    StartTabletCopyResponsePB* response,
                                    rpc::RpcController* controller,
                                    const rpc::ResponseCallback& callback) {
+  controller->set_timeout(MonoDelta::FromMilliseconds(FLAGS_consensus_rpc_timeout_ms));
   consensus_proxy_->StartTabletCopyAsync(*request, response, controller, callback);
 }
 
-RpcPeerProxy::~RpcPeerProxy() {}
+string RpcPeerProxy::PeerName() const {
+  return hostport_->ToString();
+}
 
 namespace {
 

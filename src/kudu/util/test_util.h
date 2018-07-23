@@ -23,9 +23,9 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/port.h"
@@ -35,6 +35,10 @@
   AssertEventually(expr); \
   NO_PENDING_FATALS(); \
 } while (0)
+
+namespace google {
+class FlagSaver;
+} // namespace google
 
 namespace kudu {
 
@@ -61,10 +65,14 @@ class KuduTest : public ::testing::Test {
   // Returns absolute path based on a unit test-specific work directory, given
   // a relative path. Useful for writing test files that should be deleted after
   // the test ends.
-  std::string GetTestPath(const std::string& relative_path);
+  std::string GetTestPath(const std::string& relative_path) const;
 
   Env* env_;
-  google::FlagSaver flag_saver_;  // Reset flags on every test.
+
+  // Reset flags on every test. Allocated on the heap so it can be destroyed
+  // (and the flags reset) before test_dir_ is deleted.
+  std::unique_ptr<google::FlagSaver> flag_saver_;
+
   std::string test_dir_;
 };
 
@@ -96,6 +104,9 @@ int SeedRandom();
 // if a KuduTest instance is available.
 std::string GetTestDataDirectory();
 
+// Return the directory which contains the test's executable.
+std::string GetTestExecutableDirectory();
+
 // Wait until 'f()' succeeds without adding any GTest 'fatal failures'.
 // For example:
 //
@@ -120,7 +131,10 @@ void AssertEventually(const std::function<void(void)>& f,
                       AssertBackoff backoff = AssertBackoff::EXPONENTIAL);
 
 // Count the number of open file descriptors in use by this process.
-int CountOpenFds(Env* env);
+// 'path_pattern' is a glob-style pattern. Only paths that match this
+// pattern are included. Note that '*' in this pattern is recursive
+// unlike the usual behavior of path globs.
+int CountOpenFds(Env* env, const std::string& path_pattern);
 
 // Waits for the subprocess to bind to any listening TCP port, and returns the port.
 Status WaitForTcpBind(pid_t pid, uint16_t* port, MonoDelta timeout) WARN_UNUSED_RESULT;

@@ -34,6 +34,7 @@
 #include "kudu/fs/error_manager.h"
 #include "kudu/fs/file_block_manager.h"
 #include "kudu/fs/fs.pb.h"
+#include "kudu/fs/fs_report.h"
 #include "kudu/fs/log_block_manager.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
@@ -57,7 +58,6 @@
 #include "kudu/util/pb_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
-#include "kudu/util/website_util.h"
 
 DEFINE_bool(enable_data_block_fsync, true,
             "Whether to enable fsync() of data blocks, metadata, and their parent directories. "
@@ -218,7 +218,7 @@ Status FsManager::Init() {
     string canonicalized;
     Status s = env_->Canonicalize(DirName(root), &canonicalized);
     if (PREDICT_FALSE(!s.ok())) {
-      if (s.IsDiskFailure()) {
+      if (s.IsNotFound() || s.IsDiskFailure()) {
         // If the directory fails to canonicalize due to disk failure, store
         // the non-canonicalized form and the returned error.
         canonicalized = DirName(root);
@@ -326,8 +326,7 @@ Status FsManager::Open(FsReport* report) {
     Status s = pb_util::ReadPBContainerFromPath(env_, GetInstanceMetadataPath(root.path),
                                                 pb.get());
     if (PREDICT_FALSE(!s.ok())) {
-      if (s.IsNotFound() &&
-          opts_.consistency_check != ConsistencyCheckBehavior::ENFORCE_CONSISTENCY) {
+      if (s.IsNotFound()) {
         missing_roots.emplace_back(root);
         continue;
       }
@@ -349,7 +348,7 @@ Status FsManager::Open(FsReport* report) {
   }
 
   if (!metadata_) {
-    return Status::Corruption("All instance files are missing");
+    return Status::NotFound("could not find a healthy instance file");
   }
 
   // Ensure all of the ancillary directories exist.
@@ -388,15 +387,6 @@ Status FsManager::Open(FsReport* report) {
                           "unable to create missing filesystem roots");
   }
 
-  // Remove leftover temporary files from the WAL root and fix permissions.
-  //
-  // Temporary files in the data directory roots will be removed by the block
-  // manager.
-  if (!opts_.read_only) {
-    CleanTmpFiles();
-    CheckAndFixPermissions();
-  }
-
   // Open the directory manager if it has not been opened already.
   if (!dd_manager_) {
     DataDirManagerOptions dm_opts;
@@ -410,6 +400,14 @@ Status FsManager::Open(FsReport* report) {
     }
   }
 
+  // Only clean temporary files after the data dir manager successfully opened.
+  // This ensures that we were able to obtain the exclusive directory locks
+  // on the data directories before we start deleting files.
+  if (!opts_.read_only) {
+    CleanTmpFiles();
+    CheckAndFixPermissions();
+  }
+
   // Set an initial error handler to mark data directories as failed.
   error_manager_->SetErrorNotificationCb(ErrorHandlerType::DISK,
       Bind(&DataDirManager::MarkDataDirFailedByUuid, Unretained(dd_manager_.get())));
@@ -418,6 +416,12 @@ Status FsManager::Open(FsReport* report) {
   InitBlockManager();
   LOG_TIMING(INFO, "opening block manager") {
     RETURN_NOT_OK(block_manager_->Open(report));
+  }
+
+  // Report wal and metadata directories.
+  if (report) {
+    report->wal_dir = canonicalized_wal_fs_root_.path;
+    report->metadata_dir = canonicalized_metadata_fs_root_.path;
   }
 
   if (FLAGS_enable_data_block_fsync) {
@@ -520,6 +524,7 @@ Status FsManager::CreateFileSystemRoots(
   CHECK(!opts_.read_only);
 
   // It's OK if a root already exists as long as there's nothing in it.
+  vector<string> non_empty_roots;
   for (const auto& root : canonicalized_roots) {
     if (!root.status.ok()) {
       return Status::IOError("cannot create FS layout; at least one directory "
@@ -533,10 +538,13 @@ Status FsManager::CreateFileSystemRoots(
     RETURN_NOT_OK_PREPEND(env_util::IsDirectoryEmpty(env_, root.path, &is_empty),
                           "unable to check if FSManager root is empty");
     if (!is_empty) {
-      return Status::AlreadyPresent(
-          Substitute("FSManager root is not empty. See $0", KuduDocsTroubleshootingUrl()),
-          root.path);
+      non_empty_roots.emplace_back(root.path);
     }
+  }
+
+  if (!non_empty_roots.empty()) {
+    return Status::AlreadyPresent(
+        Substitute("FSManager roots already exist: $0", JoinStrings(non_empty_roots, ",")));
   }
 
   // All roots are either empty or non-existent. Create missing roots and all
@@ -668,6 +676,8 @@ string FsManager::GetWalSegmentFileName(const string& tablet_id,
 
 void FsManager::CleanTmpFiles() {
   DCHECK(!opts_.read_only);
+  // Temporary files in the Block Manager directories are cleaned during
+  // Block Manager startup.
   for (const auto& s : { GetWalsRootDir(),
                          GetTabletMetadataDir(),
                          GetConsensusMetadataDir() }) {

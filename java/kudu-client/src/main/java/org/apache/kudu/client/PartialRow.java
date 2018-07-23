@@ -17,7 +17,9 @@
 
 package org.apache.kudu.client;
 
+import java.math.BigDecimal;
 import java.nio.ByteBuffer;
+import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -26,13 +28,16 @@ import java.util.ListIterator;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import org.apache.kudu.util.TimestampUtil;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 import org.jboss.netty.util.CharsetUtil;
 
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
+import org.apache.kudu.util.DecimalUtil;
 import org.apache.kudu.util.StringUtil;
 
 /**
@@ -479,6 +484,132 @@ public class PartialRow {
   }
 
   /**
+   * Add a Decimal for the specified column.
+   * @param columnIndex the column's index in the schema
+   * @param val value to add
+   * @throws IllegalArgumentException if the value doesn't match the column's type
+   * @throws IllegalStateException if the row was already applied
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public void addDecimal(int columnIndex, BigDecimal val) {
+    checkNotFrozen();
+    ColumnSchema column = schema.getColumnByIndex(columnIndex);
+    ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+    checkColumn(column, Type.DECIMAL);
+    BigDecimal coercedVal = DecimalUtil.coerce(val,typeAttributes.getPrecision(),
+        typeAttributes.getScale());
+    Bytes.setBigDecimal(rowAlloc, coercedVal, typeAttributes.getPrecision(),
+        getPositionInRowAllocAndSetBitSet(columnIndex));
+  }
+
+  /**
+   * Add a Decimal for the specified column.
+   *
+   * @param columnName Name of the column
+   * @param val value to add
+   * @throws IllegalArgumentException if the column doesn't exist
+   * or if the value doesn't match the column's type
+   * @throws IllegalStateException if the row was already applied
+   */
+  public void addDecimal(String columnName, BigDecimal val) {
+    addDecimal(schema.getColumnIndex(columnName), val);
+  }
+
+  /**
+   * Get the specified column's BigDecimal
+   *
+   * @param columnName name of the column to get data for
+   * @return a BigDecimal
+   * @throws IllegalArgumentException if the column doesn't exist,
+   * is null, is unset, or the type doesn't match the column's type
+   */
+  public BigDecimal getDecimal(String columnName) {
+    return getDecimal(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's Decimal.
+   *
+   * @param columnIndex Column index in the schema
+   * @return a BigDecimal
+   * @throws IllegalArgumentException if the column is null, is unset,
+   * or if the type doesn't match the column's type
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public BigDecimal getDecimal(int columnIndex) {
+    checkColumn(schema.getColumnByIndex(columnIndex), Type.DECIMAL);
+    checkColumnExists(schema.getColumnByIndex(columnIndex));
+    checkValue(columnIndex);
+    ColumnSchema column = schema.getColumnByIndex(columnIndex);
+    ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+    return Bytes.getDecimal(rowAlloc, schema.getColumnOffset(columnIndex),
+        typeAttributes.getPrecision(), typeAttributes.getScale());
+  }
+
+  /**
+   * Add a Timestamp for the specified column.
+   *
+   * Note: Timestamp instances with nanosecond precision are truncated to microseconds.
+   *
+   * @param columnIndex the column's index in the schema
+   * @param val value to add
+   * @throws IllegalArgumentException if the value doesn't match the column's type
+   * @throws IllegalStateException if the row was already applied
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public void addTimestamp(int columnIndex, Timestamp val) {
+    checkNotFrozen();
+    ColumnSchema column = schema.getColumnByIndex(columnIndex);
+    checkColumn(column, Type.UNIXTIME_MICROS);
+    long micros = TimestampUtil.timestampToMicros(val);
+    Bytes.setLong(rowAlloc, micros, getPositionInRowAllocAndSetBitSet(columnIndex));
+  }
+
+  /**
+   * Add a Timestamp for the specified column.
+   *
+   * Note: Timestamp instances with nanosecond precision are truncated to microseconds.
+   *
+   * @param columnName Name of the column
+   * @param val value to add
+   * @throws IllegalArgumentException if the column doesn't exist
+   * or if the value doesn't match the column's type
+   * @throws IllegalStateException if the row was already applied
+   */
+  public void addTimestamp(String columnName, Timestamp val) {
+    addTimestamp(schema.getColumnIndex(columnName), val);
+  }
+
+  /**
+   * Get the specified column's Timestamp.
+   *
+   * @param columnName name of the column to get data for
+   * @return a Timestamp
+   * @throws IllegalArgumentException if the column doesn't exist,
+   * is null, is unset, or the type doesn't match the column's type
+   */
+  public Timestamp getTimestamp(String columnName) {
+    return getTimestamp(this.schema.getColumnIndex(columnName));
+  }
+
+  /**
+   * Get the specified column's Timestamp.
+   *
+   * @param columnIndex Column index in the schema
+   * @return a Timestamp
+   * @throws IllegalArgumentException if the column is null, is unset,
+   * or if the type doesn't match the column's type
+   * @throws IndexOutOfBoundsException if the column doesn't exist
+   */
+  public Timestamp getTimestamp(int columnIndex) {
+    checkColumn(schema.getColumnByIndex(columnIndex), Type.UNIXTIME_MICROS);
+    checkColumnExists(schema.getColumnByIndex(columnIndex));
+    checkValue(columnIndex);
+    long micros = Bytes.getLong(rowAlloc, schema.getColumnOffset(columnIndex));
+    return TimestampUtil.microsToTimestamp(micros);
+  }
+
+  /**
    * Add a String for the specified column.
    * @param columnIndex the column's index in the schema
    * @param val value to add
@@ -860,6 +991,7 @@ public class PartialRow {
   }
 
   /** {@inheritDoc} */
+  @Override
   public String toString() {
     int numCols = schema.getColumnCount();
     StringBuilder sb = new StringBuilder();
@@ -878,6 +1010,9 @@ public class PartialRow {
 
       ColumnSchema col = schema.getColumnByIndex(idx);
       sb.append(col.getType().getName());
+      if (col.getTypeAttributes() != null) {
+        sb.append(col.getTypeAttributes().toStringForType(col.getType()));
+      }
       sb.append(' ');
       sb.append(col.getName());
       sb.append('=');
@@ -983,7 +1118,7 @@ public class PartialRow {
         sb.append(Bytes.getLong(rowAlloc, schema.getColumnOffset(idx)));
         return;
       case UNIXTIME_MICROS:
-        sb.append(RowResult.timestampToString(
+        sb.append(TimestampUtil.timestampToString(
             Bytes.getLong(rowAlloc, schema.getColumnOffset(idx))));
         return;
       case FLOAT:
@@ -991,6 +1126,11 @@ public class PartialRow {
         return;
       case DOUBLE:
         sb.append(Bytes.getDouble(rowAlloc, schema.getColumnOffset(idx)));
+        return;
+      case DECIMAL:
+        ColumnTypeAttributes typeAttributes = col.getTypeAttributes();
+        sb.append(Bytes.getDecimal(rowAlloc, schema.getColumnOffset(idx),
+            typeAttributes.getPrecision(), typeAttributes.getScale()));
         return;
       case BINARY:
       case STRING:
@@ -1016,7 +1156,8 @@ public class PartialRow {
    * @param index the index of the column to set to the minimum
    */
   void setMin(int index) {
-    Type type = schema.getColumnByIndex(index).getType();
+    ColumnSchema column = schema.getColumnByIndex(index);
+    Type type = column.getType();
     switch (type) {
       case BOOL:
         addBoolean(index, false);
@@ -1032,13 +1173,18 @@ public class PartialRow {
         break;
       case INT64:
       case UNIXTIME_MICROS:
-        addLong(index, Integer.MIN_VALUE);
+        addLong(index, Long.MIN_VALUE);
         break;
       case FLOAT:
         addFloat(index, -Float.MAX_VALUE);
         break;
       case DOUBLE:
         addDouble(index, -Double.MAX_VALUE);
+        break;
+      case DECIMAL:
+        ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+        addDecimal(index,
+            DecimalUtil.minValue(typeAttributes.getPrecision(), typeAttributes.getScale()));
         break;
       case STRING:
         addStringUtf8(index, AsyncKuduClient.EMPTY_ARRAY);
@@ -1057,7 +1203,8 @@ public class PartialRow {
    * @param value the raw value
    */
   void setRaw(int index, byte[] value) {
-    Type type = schema.getColumnByIndex(index).getType();
+    ColumnSchema column = schema.getColumnByIndex(index);
+    Type type = column.getType();
     switch (type) {
       case BOOL:
       case INT8:
@@ -1066,8 +1213,9 @@ public class PartialRow {
       case INT64:
       case UNIXTIME_MICROS:
       case FLOAT:
-      case DOUBLE: {
-        Preconditions.checkArgument(value.length == type.getSize());
+      case DOUBLE:
+      case DECIMAL: {
+        Preconditions.checkArgument(value.length == column.getTypeSize());
         System.arraycopy(value, 0, rowAlloc,
             getPositionInRowAllocAndSetBitSet(index), value.length);
         break;
@@ -1091,7 +1239,8 @@ public class PartialRow {
    *         it is already the maximum value
    */
   boolean incrementColumn(int index) {
-    Type type = schema.getColumnByIndex(index).getType();
+    ColumnSchema column = schema.getColumnByIndex(index);
+    Type type = column.getType();
     Preconditions.checkState(isSet(index));
     int offset = schema.getColumnOffset(index);
     switch (type) {
@@ -1143,12 +1292,24 @@ public class PartialRow {
         return true;
       }
       case DOUBLE: {
-        double existing = Bytes.getFloat(rowAlloc, offset);
+        double existing = Bytes.getDouble(rowAlloc, offset);
         double incremented = Math.nextAfter(existing, Double.POSITIVE_INFINITY);
         if (existing == incremented) {
           return false;
         }
         Bytes.setDouble(rowAlloc, incremented, offset);
+        return true;
+      }
+      case DECIMAL: {
+        int precision = column.getTypeAttributes().getPrecision();
+        int scale = column.getTypeAttributes().getScale();
+        BigDecimal existing = Bytes.getDecimal(rowAlloc, offset, precision, scale);
+        BigDecimal max = DecimalUtil.maxValue(precision, scale);
+        if (existing.equals(max)) {
+          return false;
+        }
+        BigDecimal smallest = DecimalUtil.smallestValue(scale);
+        Bytes.setBigDecimal(rowAlloc, existing.add(smallest), precision, offset);
         return true;
       }
       case STRING:
@@ -1212,7 +1373,8 @@ public class PartialRow {
     Preconditions.checkArgument(a.isSet(index));
     Preconditions.checkArgument(b.isSet(index));
 
-    Type type = a.getSchema().getColumnByIndex(index).getType();
+    ColumnSchema column = a.getSchema().getColumnByIndex(index);
+    Type type = column.getType();
     int offset = a.getSchema().getColumnOffset(index);
 
     switch (type) {
@@ -1231,6 +1393,12 @@ public class PartialRow {
         return Bytes.getFloat(a.rowAlloc, offset) == Bytes.getFloat(b.rowAlloc, offset);
       case DOUBLE:
         return Bytes.getDouble(a.rowAlloc, offset) == Bytes.getDouble(b.rowAlloc, offset);
+      case DECIMAL:
+        ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+        int precision = typeAttributes.getPrecision();
+        int scale = typeAttributes.getScale();
+        return Bytes.getDecimal(a.rowAlloc, offset, precision, scale)
+            .equals(Bytes.getDecimal(b.rowAlloc, offset, precision, scale));
       case STRING:
       case BINARY: {
         ByteBuffer aData = a.varLengthData.get(index).duplicate();
@@ -1272,7 +1440,8 @@ public class PartialRow {
     Preconditions.checkArgument(lower.isSet(index));
     Preconditions.checkArgument(upper.isSet(index));
 
-    Type type = lower.getSchema().getColumnByIndex(index).getType();
+    ColumnSchema column = lower.getSchema().getColumnByIndex(index);
+    Type type = column.getType();
     int offset = lower.getSchema().getColumnOffset(index);
 
     switch (type) {
@@ -1305,6 +1474,15 @@ public class PartialRow {
         return val != Double.POSITIVE_INFINITY &&
                Math.nextAfter(val, Double.POSITIVE_INFINITY) ==
                    Bytes.getDouble(upper.rowAlloc, offset);
+      }
+      case DECIMAL: {
+        ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+        int precision = typeAttributes.getPrecision();
+        int scale = typeAttributes.getScale();
+        BigDecimal val = Bytes.getDecimal(lower.rowAlloc, offset, precision, scale);
+        BigDecimal smallestVal = DecimalUtil.smallestValue(scale);
+        return val.add(smallestVal).equals(
+                Bytes.getDecimal(upper.rowAlloc, offset, precision, scale));
       }
       case STRING:
       case BINARY: {

@@ -52,6 +52,7 @@ ScanConfiguration::ScanConfiguration(KuduTable* table)
       read_mode_(KuduScanner::READ_LATEST),
       is_fault_tolerant_(false),
       snapshot_timestamp_(kNoTimestamp),
+      lower_bound_propagation_timestamp_(kNoTimestamp),
       timeout_(MonoDelta::FromMilliseconds(KuduScanner::kScanTimeoutMillis)),
       arena_(256),
       row_format_flags_(KuduScanner::NO_FLAGS) {
@@ -180,12 +181,24 @@ void ScanConfiguration::SetSnapshotRaw(uint64_t snapshot_timestamp) {
   snapshot_timestamp_ = snapshot_timestamp;
 }
 
+void ScanConfiguration::SetScanLowerBoundTimestampRaw(uint64_t propagation_timestamp) {
+  lower_bound_propagation_timestamp_ = propagation_timestamp;
+}
+
 void ScanConfiguration::SetTimeoutMillis(int millis) {
   timeout_ = MonoDelta::FromMilliseconds(millis);
 }
 
 Status ScanConfiguration::SetRowFormatFlags(uint64_t flags) {
   row_format_flags_ = flags;
+  return Status::OK();
+}
+
+Status ScanConfiguration::SetLimit(int64_t limit) {
+  if (limit < 0) {
+    return Status::InvalidArgument("Limit must be non-negative");
+  }
+  spec_.set_limit(limit);
   return Status::OK();
 }
 

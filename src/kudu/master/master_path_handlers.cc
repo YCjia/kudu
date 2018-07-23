@@ -21,6 +21,7 @@
 #include <array>
 #include <cstdint>
 #include <iosfwd>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -291,6 +292,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
   // up the partition schema, tablet summary, and tablet detail tables.
   std::vector<string> range_partitions;
   map<string, int> summary_states;
+  map<string, int> replica_counts;
   (*output)["detail_partition_schema_header"] = partition_schema.PartitionTableHeader(schema);
   EasyJson tablets_detail_json = output->Set("tablets_detail", EasyJson::kArray);
   for (const scoped_refptr<TabletInfo>& tablet : tablets) {
@@ -304,6 +306,7 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     if (l.data().pb.has_consensus_state()) {
       const ConsensusStatePB& cstate = l.data().pb.consensus_state();
       for (const auto& peer : cstate.committed_config().peers()) {
+        replica_counts[peer.permanent_uuid()]++;
         TabletDetailPeerInfo peer_info;
         shared_ptr<TSDescriptor> ts_desc;
         if (master_->ts_manager()->LookupTSByUUID(peer.permanent_uuid(), &ts_desc)) {
@@ -368,6 +371,22 @@ void MasterPathHandlers::HandleTablePage(const Webserver::WebRequest& req,
     state_json["percentage"] = tablets.empty() ? "0.0" : StringPrintf("%.2f", percentage);
   }
 
+  // Set up the report on replica distribution.
+  EasyJson replica_dist_json = output->Set("replica_distribution", EasyJson::kObject);
+  EasyJson counts_json = replica_dist_json.Set("counts", EasyJson::kArray);
+  int min_count = replica_counts.empty() ? 0 : std::numeric_limits<int>::max();
+  int max_count = 0;
+  for (const auto& entry : replica_counts) {
+    EasyJson count_json = counts_json.PushBack(EasyJson::kObject);
+    count_json["ts_uuid"] = entry.first;
+    count_json["count"] = entry.second;
+    min_count = std::min(min_count, entry.second);
+    max_count = std::max(max_count, entry.second);
+  }
+  replica_dist_json["max_count"] = max_count;
+  replica_dist_json["min_count"] = min_count;
+  replica_dist_json["skew"] = max_count - min_count;
+
   // Used to make the Impala CREATE TABLE statement.
   (*output)["master_addresses"] = MasterAddrsToCsv();
 
@@ -387,14 +406,21 @@ void MasterPathHandlers::HandleMasters(const Webserver::WebRequest& /*req*/,
     (*output)["error"] = msg;
     return;
   }
+  output->Set("even_masters", masters.size() % 2 == 0);
   output->Set("masters", EasyJson::kArray);
+  output->Set("errors", EasyJson::kArray);
+  output->Set("has_no_errors", true);
   for (const ServerEntryPB& master : masters) {
-    EasyJson master_json = (*output)["masters"].PushBack(EasyJson::kObject);
     if (master.has_error()) {
+      output->Set("has_no_errors", false);
+      EasyJson error_json = (*output)["errors"].PushBack(EasyJson::kObject);
       Status error = StatusFromPB(master.error());
-      master_json["error"] = error.ToString();
+      error_json["uuid"] = master.has_instance_id() ?
+                           master.instance_id().permanent_uuid() : "Unavailable";
+      error_json["error"] = error.ToString();
       continue;
     }
+    EasyJson master_json = (*output)["masters"].PushBack(EasyJson::kObject);
     const ServerRegistrationPB& reg = master.registration();
     master_json["uuid"] = master.instance_id().permanent_uuid();
     if (!reg.http_addresses().empty()) {

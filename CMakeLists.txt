@@ -438,27 +438,89 @@ if ("${KUDU_LINK}" STREQUAL "a")
   endif()
 endif()
 
-# Are we using the gold linker? It doesn't work with dynamic linking as
-# weak symbols aren't properly overridden, causing tcmalloc to be omitted.
-# Let's flag this as an error in RELEASE builds (we shouldn't release a
-# product like this).
+# Interrogates the linker version via the C++ compiler to determine whether
+# we're using the gold linker, and if so, extracts its version.
 #
-# See https://sourceware.org/bugzilla/show_bug.cgi?id=16979 for details.
+# If the gold linker is being used, sets GOLD_VERSION in the parent scope with
+# the extracted version.
 #
-# The gold linker is only for ELF binaries, which OSX doesn't use. We can
-# just skip.
-if (NOT APPLE)
-  execute_process(COMMAND ${CMAKE_CXX_COMPILER} -Wl,--version OUTPUT_VARIABLE LINKER_OUTPUT)
-endif ()
-if (LINKER_OUTPUT MATCHES "gold")
-  if ("${KUDU_LINK}" STREQUAL "d" AND
-      "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
-    message(SEND_ERROR "Cannot use gold with dynamic linking in a RELEASE build "
-      "as it would cause tcmalloc symbols to get dropped")
-  else()
-    message("Using gold linker")
+# Any additional arguments are passed verbatim into the C++ compiler invocation.
+function(GET_GOLD_VERSION)
+  # The gold linker is only for ELF binaries, which macOS doesn't use.
+  if (APPLE)
+    return()
   endif()
-  set(KUDU_USING_GOLD 1)
+
+  execute_process(COMMAND ${CMAKE_CXX_COMPILER} "-Wl,--version" ${ARGN}
+    ERROR_QUIET
+    OUTPUT_VARIABLE LINKER_OUTPUT)
+  # We're expecting LINKER_OUTPUT to look like one of these:
+  #   GNU gold (version 2.24) 1.11
+  #   GNU gold (GNU Binutils for Ubuntu 2.30) 1.15
+  if (LINKER_OUTPUT MATCHES "GNU gold")
+    string(REGEX MATCH "GNU gold \\([^\\)]*\\) (([0-9]+\\.?)+)" _ "${LINKER_OUTPUT}")
+    if (NOT CMAKE_MATCH_1)
+      message(SEND_ERROR "Could not extract GNU gold version. "
+        "Linker version output: ${LINKER_OUTPUT}")
+    endif()
+    set(GOLD_VERSION "${CMAKE_MATCH_1}" PARENT_SCOPE)
+  endif()
+endfunction()
+
+# Is the compiler hard-wired to use the gold linker?
+GET_GOLD_VERSION()
+if (GOLD_VERSION)
+  set(MUST_USE_GOLD 1)
+else()
+  # Can the compiler optionally enable the gold linker?
+  GET_GOLD_VERSION("-fuse-ld=gold")
+
+  # We can't use the gold linker if it's inside devtoolset because the compiler
+  # won't find it when invoked directly from make/ninja (which is typically
+  # done outside devtoolset).
+  execute_process(COMMAND which ld.gold
+    OUTPUT_VARIABLE GOLD_LOCATION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+  if ("${GOLD_LOCATION}" MATCHES "^/opt/rh/devtoolset")
+    message("Skipping optional gold linker (version ${GOLD_VERSION}) because "
+      "it's in devtoolset")
+    set(GOLD_VERSION)
+  endif()
+endif()
+if (GOLD_VERSION)
+  # Older versions of the gold linker are vulnerable to a bug [1] which
+  # prevents weak symbols from being overridden properly. This leads to
+  # omitting of Kudu's tcmalloc dependency.
+  #
+  # How we handle this situation depends on other factors:
+  # - If gold is optional, we won't use it.
+  # - If gold is required, we'll either:
+  #   - Raise an error in RELEASE builds (we shouldn't release such a product), or
+  #   - Drop tcmalloc in all other builds.
+  #
+  # 1. https://sourceware.org/bugzilla/show_bug.cgi?id=16979.
+  if ("${GOLD_VERSION}" VERSION_LESS "1.12")
+    set(KUDU_BUGGY_GOLD 1)
+  endif()
+  if (MUST_USE_GOLD)
+    message("Using hard-wired gold linker (version ${GOLD_VERSION})")
+    if (KUDU_BUGGY_GOLD)
+      if ("${KUDU_LINK}" STREQUAL "d" AND
+          "${CMAKE_BUILD_TYPE}" STREQUAL "RELEASE")
+        message(SEND_ERROR "Configured to use buggy gold with dynamic linking "
+          "in a RELEASE build; this would cause tcmalloc symbols to get dropped")
+      endif()
+      message("Hard-wired gold linker is buggy, dropping tcmalloc dependency")
+    endif()
+  elseif (NOT KUDU_BUGGY_GOLD)
+    # The Gold linker must be manually enabled.
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fuse-ld=gold")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fuse-ld=gold")
+    message("Using optional gold linker (version ${GOLD_VERSION})")
+  else()
+    message("Optional gold linker is buggy, using ld linker instead")
+  endif()
 else()
   message("Using ld linker")
 endif()
@@ -613,7 +675,9 @@ endif()
   # include sized deallocation (new in C++14). This reverses the setting from
   # non-exported (default) flags.
   if(COMPILER_SUPPORTS_SIZED_DEALLOCATION)
-    set(EXPORTED_FLAGS "${EXPORTED_FLAGS} -fno-sized-deallocation")
+    # Note: this is retained by the set_target_properties() call below.
+    target_compile_options(${EXPORTED_LIB_NAME}
+      PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fno-sized-deallocation>)
   endif()
 
   set_target_properties(${EXPORTED_LIB_NAME}
@@ -677,14 +741,56 @@ endfunction()
 #       Jenkins builds typically execute tests using dist-test, and that
 #       does not respect these timeouts. If a test suite is long enough
 #       to require a bumped timeout, consider enabling sharding of the
-#       test by adding it to the NUM_SHARDS_BY_TEST dictionary in dist_test.py.
+#       test (see below).
+#
+#   NUM_SHARDS <num shards>
+#       Sets the number of shards used for running this test.
+#
+#       This configuration splits up the test cases within the binary
+#       into several separate shards. Each shard becomes a separate
+#       test case when run by ctest or when submitted for distributed testing.
+#       This should be used whenever a test binary is long-running and
+#       consists of many separate test cases.
+#
+#       NOTE: sharding is still recommended even for tests with RUN_SERIAL
+#       or RESOURCE_LOCK properties. Even though the shards cannot run in
+#       parallel on a single machine using ctest, they will still run in
+#       parallel across separate machines using dist-test.
+#
+#   PROCESSORS <num processors>
+#   RUN_SERIAL true
+#       These built-in CMake properties should be used when a test is
+#       a heavy consumer of CPU.
+#
+#       The PROCESSORS flag allows ctest to ensure that tests are only
+#       scheduled in parallel when an appropriate number of cores are
+#       available. The default is to assume that a test uses a single core
+#       (i.e. equivalent to PROCESSORS 1).
+#
+#       RUN_SERIAL ensures that the test does not run in parallel with any
+#       other test. This should be used for stress tests which start many
+#       threads and attempt to monopolize the machine.
+#
+#       In order to determine an appropriate setting, you can run the test
+#       with the KUDU_MEASURE_TEST_CPU_CONSUMPTION environment variable
+#       set. See build-support/run-test.sh for more details.
+#
+#   DATA_FILES <file1> <file2> ...
+#       Specify data files that should be copied into the build directory
+#       next to test executable. These will also be automatically uploaded
+#       to the dist-test environment.
+#
+#       If the file is in a directory, an equivalent directory path will
+#       be made in the build directory. For example, 'testdata/foo' will
+#       ensure that an equivalent directory 'testdata/' is made in the
+#       build directory.
 #
 # Any other arguments will be passed to set_tests_properties().
 function(ADD_KUDU_TEST REL_TEST_NAME)
   # Parse out properties for which we have special handling.
   set(options)
-  set(one_value_args TIMEOUT)
-  set(multi_value_args)
+  set(one_value_args TIMEOUT NUM_SHARDS)
+  set(multi_value_args DATA_FILES)
   cmake_parse_arguments(ARG "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
   if(NOT ARG_TIMEOUT)
     # Default to 15 minutes.
@@ -692,6 +798,10 @@ function(ADD_KUDU_TEST REL_TEST_NAME)
     # in build-support/run-test.sh
     set(ARG_TIMEOUT 900)
   endif()
+  if(NOT ARG_NUM_SHARDS)
+    set(ARG_NUM_SHARDS 1)
+  endif()
+
   # Any unrecognized arguments go into ${ARG_UNPARSED_ARGUMENTS}, which we forward
   # along as properties down below.
 
@@ -719,25 +829,63 @@ function(ADD_KUDU_TEST REL_TEST_NAME)
     message(FATAL_ERROR "Neither ${REL_TEST_NAME} nor ${REL_TEST_NAME}.cc were found in ${CMAKE_CURRENT_SOURCE_DIR}/")
   endif()
 
-  add_test(${TEST_NAME}
-    ${BUILD_SUPPORT_DIR}/run-test.sh ${TEST_PATH})
-  if(ARG_UNPARSED_ARGUMENTS)
-    set_tests_properties(${TEST_NAME} PROPERTIES ${ARG_UNPARSED_ARGUMENTS})
-  endif()
-  # Set the ctest timeout to be a bit longer than the timeout we pass to
-  # our test wrapper. This gives the test wrapper some opportunity to do
-  # things like dump stacks, compress the log, etc.
-  math(EXPR EXTENDED_TIMEOUT "${ARG_TIMEOUT} + 30")
+  # Copy data files into the build directory.
+  foreach(DATA_FILE ${ARG_DATA_FILES})
+    get_filename_component(DST_DIR ${DATA_FILE} DIRECTORY)
+    set(DST_DIR ${EXECUTABLE_OUTPUT_PATH}/${DST_DIR})
+    # If there is a symlink there, replace it with a copy. This is to
+    # work around issues with incremental builds where earlier build
+    # setups had used symlinks into the build directory instead of
+    # copies.
+    if(IS_SYMLINK ${DST_DIR}/${DATA_FILE})
+      file(REMOVE ${DST_DIR}/${DATA_FILE})
+    endif()
+    file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/${DATA_FILE}
+      # Copy with read-only permissions since tests should not
+      # modify the data files in place.
+      DIRECTORY_PERMISSIONS OWNER_READ OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+      FILE_PERMISSIONS OWNER_READ GROUP_READ
+      DESTINATION ${DST_DIR})
+  endforeach()
 
-  # Add the configured timeout to the environment for the test wrapper.
-  get_test_property(${TEST_NAME} ENVIRONMENT CUR_TEST_ENV)
-  if(NOT CUR_TEST_ENV)
-    set(CUR_TEST_ENV "")
-  endif()
-  list(APPEND CUR_TEST_ENV "KUDU_TEST_TIMEOUT=${ARG_TIMEOUT}")
-  set_tests_properties(${TEST_NAME} PROPERTIES
-    TIMEOUT ${EXTENDED_TIMEOUT}
-    ENVIRONMENT "${CUR_TEST_ENV}")
+  math(EXPR MAX_SHARD "${ARG_NUM_SHARDS} - 1")
+  foreach(SHARD_NUM RANGE ${MAX_SHARD})
+    # Only name the targets with a '.<shard>' if the test is sharded.
+    if(${ARG_NUM_SHARDS} EQUAL 1)
+      set(TARGET ${TEST_NAME})
+    else()
+      set(TARGET ${TEST_NAME}.${SHARD_NUM})
+    endif()
+
+    add_test(${TARGET}
+      ${BUILD_SUPPORT_DIR}/run-test.sh ${TEST_PATH})
+    if(ARG_UNPARSED_ARGUMENTS)
+      set_tests_properties(${TARGET} PROPERTIES ${ARG_UNPARSED_ARGUMENTS})
+    endif()
+    # Set the ctest timeout to be a bit longer than the timeout we pass to
+    # our test wrapper. This gives the test wrapper some opportunity to do
+    # things like dump stacks, compress the log, etc.
+    math(EXPR EXTENDED_TIMEOUT "${ARG_TIMEOUT} + 30")
+
+    # Add the configured timeout to the environment for the test wrapper.
+    get_test_property(${TARGET} ENVIRONMENT CUR_TEST_ENV)
+    if(NOT CUR_TEST_ENV)
+      set(CUR_TEST_ENV "")
+    endif()
+    list(APPEND CUR_TEST_ENV "KUDU_TEST_TIMEOUT=${ARG_TIMEOUT}")
+    list(APPEND CUR_TEST_ENV "GTEST_TOTAL_SHARDS=${ARG_NUM_SHARDS}")
+    list(APPEND CUR_TEST_ENV "GTEST_SHARD_INDEX=${SHARD_NUM}")
+
+    # The only way we can pass information to dist-test is through the environment.
+    # So, use a comma-delimited environment variable to pass the list of data files
+    # that need to be uploaded.
+    string(REPLACE ";" "," DATA_FILES_ENV "${ARG_DATA_FILES}")
+    list(APPEND CUR_TEST_ENV "KUDU_DATA_FILES=${DATA_FILES_ENV}")
+
+    set_tests_properties(${TARGET} PROPERTIES
+      TIMEOUT ${EXTENDED_TIMEOUT}
+      ENVIRONMENT "${CUR_TEST_ENV}")
+  endforeach(SHARD_NUM)
 endfunction()
 
 # A wrapper for add_dependencies() that is compatible with NO_TESTS.
@@ -972,12 +1120,12 @@ ADD_THIRDPARTY_LIB(krb5
 
 ## Google PerfTools
 ##
-## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see comment
-## near definition of KUDU_USING_GOLD).
-find_package(GPerf REQUIRED)
+## Disabled with TSAN/ASAN as well as with gold+dynamic linking (see
+## earlier comment).
 if (NOT "${KUDU_USE_ASAN}" AND
     NOT "${KUDU_USE_TSAN}" AND
-    NOT ("${KUDU_USING_GOLD}" AND "${KUDU_LINK}" STREQUAL "d"))
+    NOT ("${KUDU_BUGGY_GOLD}" AND "${KUDU_LINK}" STREQUAL "d"))
+  find_package(GPerf REQUIRED)
   ADD_THIRDPARTY_LIB(tcmalloc
     STATIC_LIB "${TCMALLOC_STATIC_LIB}"
     SHARED_LIB "${TCMALLOC_SHARED_LIB}")
@@ -1003,6 +1151,11 @@ ADD_THIRDPARTY_LIB(pmemobj
   STATIC_LIB "${PMEMOBJ_STATIC_LIB}"
   SHARED_LIB "${PMEMOBJ_SHARED_LIB}"
   DEPS ${PMEMOBJ_DEPS})
+endif()
+
+if (EXISTS ${VMEM_SHARED_LIB})
+  set(HAVE_LIB_VMEM 1)
+  add_definitions(-DHAVE_LIB_VMEM=1)
 endif()
 
 ## curl
@@ -1084,14 +1237,37 @@ ADD_THIRDPARTY_LIB(boost_date_time
 # compiler options since we only do this when tcmalloc was
 # found and enabled.
 ############################################################
-if (KUDU_TCMALLOC_AVAILABLE AND
-    (("${COMPILER_FAMILY}" STREQUAL "clang" AND
-      "${COMPILER_VERSION}" VERSION_GREATER "3.7") OR
-     ("${COMPILER_FAMILY}" STREQUAL "gcc" AND
-      "${COMPILER_VERSION}" VERSION_GREATER "5.0")))
-  set(COMPILER_SUPPORTS_SIZED_DEALLOCATION TRUE)
+
+# On OS X 10.12 (El Capitan), sized-deallocation symbols are missing
+# in the libc++ library for some reason.
+if (APPLE)
+  get_filename_component(SIZED_DEALLOCATION_TEST_TCMALLOC_LIBDIR
+    ${TCMALLOC_STATIC_LIB} DIRECTORY)
+  execute_process(
+    COMMAND printf
+      "#include <new>\nint main(){(::operator delete)(0,256);return 0;}\n"
+    COMMAND ${CMAKE_CXX_COMPILER}
+      -x c++ -fsized-deallocation -O0 -fno-builtin
+      -L${SIZED_DEALLOCATION_TEST_TCMALLOC_LIBDIR} -ltcmalloc -o /dev/null -
+    RESULT_VARIABLE SIZED_DEALLOCATION_TEST_RESULT OUTPUT_QUIET ERROR_QUIET)
+  if (${SIZED_DEALLOCATION_TEST_RESULT} EQUAL 0)
+    set(COMPILER_SUPPORTS_SIZED_DEALLOCATION TRUE)
+  endif()
+else()
+  if (KUDU_TCMALLOC_AVAILABLE AND
+      (("${COMPILER_FAMILY}" STREQUAL "clang" AND
+        "${COMPILER_VERSION}" VERSION_GREATER "3.7") OR
+       ("${COMPILER_FAMILY}" STREQUAL "gcc" AND
+        "${COMPILER_VERSION}" VERSION_GREATER "5.0")))
+    set(COMPILER_SUPPORTS_SIZED_DEALLOCATION TRUE)
+  endif()
+endif()
+
+if(COMPILER_SUPPORTS_SIZED_DEALLOCATION)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsized-deallocation")
-  message("Enabling sized-deallocation")
+  message("sized-deallocation is ENABLED")
+else()
+  message("sized-deallocation is DISABLED")
 endif()
 
 ############################################################
@@ -1099,6 +1275,15 @@ endif()
 ############################################################
 set(KUDU_MIN_TEST_LIBS kudu_test_main kudu_test_util ${KUDU_BASE_LIBS})
 set(KUDU_TEST_LINK_LIBS ${KUDU_MIN_TEST_LIBS})
+
+# Use "thin archives" for our static libraries. We only use static libraries
+# internal to our own build, so thin ones are just as good and much smaller.
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+  set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  set(CMAKE_C_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  set(CMAKE_CXX_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  set(CMAKE_C_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+endif()
 
 ############################################################
 # "make ctags" target
@@ -1160,11 +1345,15 @@ if (UNIX)
 endif (UNIX)
 
 ############################################################
-# "make iwyu" target
+# "make iwyu" and "make iwyu-fix" target
 ############################################################
 if (UNIX)
-  add_custom_target(iwyu ${BUILD_SUPPORT_DIR}/iwyu/iwyu.sh)
-  add_dependencies(iwyu pb-gen krpc-gen)
+  add_custom_target(iwyu-generated-headers
+    DEPENDS pb-gen krpc-gen hms_thrift)
+  add_custom_target(iwyu ${BUILD_SUPPORT_DIR}/iwyu.py --from-git
+    DEPENDS iwyu-generated-headers)
+  add_custom_target(iwyu-fix ${BUILD_SUPPORT_DIR}/iwyu.py --fix --from-git
+    DEPENDS iwyu-generated-headers)
 endif (UNIX)
 
 ############################################################

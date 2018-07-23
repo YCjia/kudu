@@ -32,7 +32,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import javax.annotation.concurrent.GuardedBy;
 import javax.annotation.concurrent.NotThreadSafe;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -245,7 +244,7 @@ public class AsyncKuduSession implements SessionConfiguration {
    * Lets us set a specific seed for tests
    * @param seed
    */
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   void setRandomSeed(long seed) {
     this.randomizer.setSeed(seed);
   }
@@ -530,6 +529,9 @@ public class AsyncKuduSession implements SessionConfiguration {
    */
   public Deferred<OperationResponse> apply(final Operation operation) throws KuduException {
     Preconditions.checkNotNull(operation, "Can not apply a null operation");
+    Preconditions.checkArgument(operation.getTable().getAsyncClient() == client,
+        "Applied operations must be created from a KuduTable instance opened " +
+        "from the same client that opened this KuduSession");
 
     // Freeze the row so that the client can not concurrently modify it while it is in flight.
     operation.getRow().freeze();
@@ -774,7 +776,7 @@ public class AsyncKuduSession implements SessionConfiguration {
    * Analogous to BatchErrCallback above but for AUTO_FLUSH_SYNC which doesn't handle lists of
    * operations and responses.
    */
-  private final class SingleOperationErrCallback implements Callback<Object, Exception> {
+  private static final class SingleOperationErrCallback implements Callback<Object, Exception> {
 
     private final Operation operation;
 

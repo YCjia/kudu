@@ -23,6 +23,7 @@
 # See dist_test.py --help for usage information.
 
 import argparse
+from collections import deque
 import glob
 try:
   import simplejson as json
@@ -38,12 +39,19 @@ import shutil
 import subprocess
 import time
 
+from kudu_util import init_logging
+
 TEST_TIMEOUT_SECS = int(os.environ.get('TEST_TIMEOUT_SECS', '900'))
 ARTIFACT_ARCHIVE_GLOBS = ["build/*/test-logs/**/*"]
 ISOLATE_SERVER = os.environ.get('ISOLATE_SERVER',
                                 "http://isolate.cloudera.org:4242/")
 DIST_TEST_HOME = os.environ.get('DIST_TEST_HOME',
                                 os.path.expanduser("~/dist_test"))
+
+# Put some limit so someone doesn't accidentally try to loop all of the
+# tests 10,000 times and cost a bunch of money. If someone really has a good
+# reason to do this, they are can always edit this constant locally.
+MAX_TASKS_PER_JOB=10000
 
 # The number of times that flaky tests will be retried.
 # Our non-distributed implementation sets a number of _attempts_, not a number
@@ -52,7 +60,16 @@ FLAKY_TEST_RETRIES = int(os.environ.get('KUDU_FLAKY_TEST_ATTEMPTS', 1)) - 1
 
 PATH_TO_REPO = "../"
 
+# Matches the command line listings in 'ctest -V -N'. For example:
+#   262: Test command: /src/kudu/build-support/run-test.sh "/src/kudu/build/debug/bin/jsonwriter-test"
 TEST_COMMAND_RE = re.compile('Test command: (.+)$')
+
+# Matches the environment variable listings in 'ctest -V -N'. For example:
+#  262:  GTEST_TOTAL_SHARDS=1
+TEST_ENV_RE = re.compile('^\d+:  (\S+)=(.+)')
+
+# Matches the output lines of 'ldd'. For example:
+#   libcrypto.so.10 => /path/to/usr/lib64/libcrypto.so.10 (0x00007fb0cb0a5000)
 LDD_RE = re.compile(r'^\s+.+? => (\S+) \(0x.+\)')
 
 DEPS_FOR_ALL = \
@@ -61,6 +78,7 @@ DEPS_FOR_ALL = \
      "build-support/run_dist_test.py",
      "build-support/tsan-suppressions.txt",
      "build-support/lsan-suppressions.txt",
+     "build-support/java-home-candidates.txt",
 
      # The LLVM symbolizer is necessary for suppressions to work
      "thirdparty/installed/uninstrumented/bin/llvm-symbolizer",
@@ -84,22 +102,6 @@ DEPS_FOR_ALL = \
      "build/latest/bin/hms-plugin.jar",
      ]
 
-# The number of shards to split tests into. This is set on a per-test basis
-# since it's only worth doing when a test has lots of separate cases and
-# more than one of them runs relatively long.
-NUM_SHARDS_BY_TEST = {
-  'cfile-test': 4,
-  'client-test': 8,
-  'delete_table-itest': 4,
-  'delete_table-test': 8,
-  'flex_partitioning-itest': 8,
-  'mt-tablet-test': 4,
-  'raft_consensus-itest': 6,
-  'rowset_tree-test': 6,
-  'tablet_copy-itest': 6
-}
-
-
 class StagingDir(object):
   @staticmethod
   def new():
@@ -121,6 +123,22 @@ class StagingDir(object):
   def tasks_json_path(self):
     return os.path.join(self.dir, "tasks.json")
 
+class TestExecution(object):
+  """
+  An individual test execution that will be run.
+
+  One instance exists for each shard of a test case.
+  """
+  def __init__(self, argv=None, env=None):
+    self.argv = argv or []
+    self.env = env or {}
+
+  @property
+  def test_name(self):
+    return "%s.%d" % (os.path.basename(self.argv[1]), self.shard())
+
+  def shard(self):
+    return int(self.env.get("GTEST_SHARD_INDEX", "0"))
 
 def rel_to_abs(rel_path):
   dirname, _ = os.path.split(os.path.abspath(__file__))
@@ -137,21 +155,56 @@ def abs_to_rel(abs_path, staging):
   return rel
 
 
-def get_test_commandlines():
+def get_test_executions(options):
+  """
+  Return an array of TestExecution objects.
+  """
   ctest_bin = os.path.join(rel_to_abs("thirdparty/installed/common/bin/ctest"))
-  p = subprocess.Popen([ctest_bin, "-V", "-N", "-LE", "no_dist_test"], stdout=subprocess.PIPE)
+  ctest_argv = [ctest_bin, "-V", "-N", "-LE", "no_dist_test"]
+  if options.tests_regex:
+    ctest_argv.extend(['-R', options.tests_regex])
+  p = subprocess.Popen(ctest_argv,
+                       stdout=subprocess.PIPE,
+                       cwd=rel_to_abs("build/latest"))
   out, err = p.communicate()
   if p.returncode != 0:
-    print >>sys.stderr, "Unable to list tests with ctest"
+    logging.error("Unable to list tests with ctest")
     sys.exit(1)
-  lines = out.splitlines()
-  commands = []
-  for l in lines:
-    m = TEST_COMMAND_RE.search(l)
+  lines = deque(out.splitlines())
+  execs = []
+  # Output looks like:
+  # 262: Test command: /src/kudu/build-support/run-test.sh "/src/kudu/build/debug/bin/jsonwriter-test"
+  # 262: Environment variables:
+  # 262:  KUDU_TEST_TIMEOUT=900
+  # 262:  GTEST_TOTAL_SHARDS=1
+  # 262:  GTEST_SHARD_INDEX=0
+  #   Test #262: jsonwriter-test.0
+  #
+  # 263: Test command ...
+  # ...
+
+  while lines:
+    # Advance to the beginning of the next test block.
+    m = None
+    while lines and not m:
+      m = TEST_COMMAND_RE.search(lines.popleft())
     if not m:
-      continue
-    commands.append(shlex.split(m.group(1)))
-  return commands
+      break
+    argv = shlex.split(m.group(1))
+    # Next line should b the 'Environment variables' heading
+    l = lines.popleft()
+    if "Environment variables:" not in l:
+      raise Exception("Unexpected line in ctest -V output: %s" % l)
+    # Following lines should be environment variable pairs.
+    env = {}
+    while lines:
+      m = TEST_ENV_RE.match(lines[0])
+      if not m:
+        break
+      lines.popleft()
+      env[m.group(1)] = m.group(2)
+    execs.append(TestExecution(argv=argv, env=env))
+  return execs
 
 
 def is_lib_blacklisted(lib):
@@ -159,6 +212,20 @@ def is_lib_blacklisted(lib):
   if lib.startswith("/lib") or lib.startswith("/usr"):
     return True
   return False
+
+
+def get_base_deps():
+  deps = []
+  for d in DEPS_FOR_ALL:
+    d = os.path.realpath(rel_to_abs(d))
+    if os.path.isdir(d):
+      d += "/"
+    deps.append(d)
+    # DEPS_FOR_ALL may include binaries whose dependencies are not dependencies
+    # of the test executable. We must include those dependencies in the archive
+    # for the binaries to be usable.
+    deps.extend(ldd_deps(d))
+  return deps
 
 
 def is_outside_of_tree(path):
@@ -186,7 +253,7 @@ def copy_system_library(lib):
     shutil.copy2(rel_to_abs(lib), dst)
   return dst
 
-
+LDD_CACHE={}
 def ldd_deps(exe):
   """
   Runs 'ldd' on the provided 'exe' path, returning a list of
@@ -203,10 +270,13 @@ def ldd_deps(exe):
       exe.endswith(".txt") or
       os.path.isdir(exe)):
     return []
-  p = subprocess.Popen(["ldd", exe], stdout=subprocess.PIPE)
-  out, err = p.communicate()
-  if p.returncode != 0:
-    print >>sys.stderr, "failed to run ldd on ", exe
+  if exe not in LDD_CACHE:
+    p = subprocess.Popen(["ldd", exe], stdout=subprocess.PIPE)
+    out, err = p.communicate()
+    LDD_CACHE[exe] = (out, err, p.returncode)
+  out, err, rc = LDD_CACHE[exe]
+  if rc != 0:
+    logging.warning("failed to run ldd on %s", exe)
     return []
   ret = []
   for l in out.splitlines():
@@ -227,36 +297,24 @@ def ldd_deps(exe):
   return ret
 
 
-def create_archive_input(staging, argv,
-                         disable_sharding=False,
+def create_archive_input(staging, execution,
                          collect_tmpdir=False):
   """
   Generates .gen.json and .isolate files corresponding to the
-  test command 'argv'. The outputs are placed in the specified
-  staging directory.
-
-  Some larger tests are automatically sharded into several tasks.
-  If 'disable_sharding' is True, this behavior will be suppressed.
+  test 'execution', which must be a TestExecution instance.
+  The outputs are placed in the specified staging directory.
   """
+  argv = execution.argv
   if not argv[0].endswith('run-test.sh') or len(argv) < 2:
-    print >>sys.stderr, "Unable to handle test: ", argv
+    logging.warning("Unable to handle test: %s", argv)
     return
-  test_name = os.path.basename(argv[1])
   abs_test_exe = os.path.realpath(argv[1])
   rel_test_exe = abs_to_rel(abs_test_exe, staging)
   argv[1] = rel_test_exe
   files = []
   files.append(rel_test_exe)
   deps = ldd_deps(abs_test_exe)
-  for d in DEPS_FOR_ALL:
-    d = os.path.realpath(rel_to_abs(d))
-    if os.path.isdir(d):
-      d += "/"
-    deps.append(d)
-    # DEPS_FOR_ALL may include binaries whose dependencies are not dependencies
-    # of the test executable. We must include those dependencies in the archive
-    # for the binaries to be usable.
-    deps.extend(ldd_deps(d))
+  deps.extend(get_base_deps())
 
   # Deduplicate dependencies included via DEPS_FOR_ALL.
   for d in set(deps):
@@ -267,37 +325,44 @@ def create_archive_input(staging, argv,
       d = copy_system_library(d)
     files.append(abs_to_rel(d, staging))
 
-  if disable_sharding:
-    num_shards = 1
-  else:
-    num_shards = NUM_SHARDS_BY_TEST.get(test_name, 1)
-  for shard in xrange(0, num_shards):
-    out_archive = os.path.join(staging.dir, '%s.%d.gen.json' % (test_name, shard))
-    out_isolate = os.path.join(staging.dir, '%s.%d.isolate' % (test_name, shard))
+  # Add data file dependencies.
+  if 'KUDU_DATA_FILES' in execution.env:
+    for data_file in execution.env['KUDU_DATA_FILES'].split(","):
+      # Paths are relative to the test binary.
+      path = os.path.join(os.path.dirname(abs_test_exe), data_file)
+      files.append(abs_to_rel(path, staging))
 
-    command = ['../../build-support/run_dist_test.py',
-               '-e', 'GTEST_SHARD_INDEX=%d' % shard,
-               '-e', 'GTEST_TOTAL_SHARDS=%d' % num_shards,
-               '-e', 'KUDU_TEST_TIMEOUT=%d' % (TEST_TIMEOUT_SECS - 30),
-               '-e', 'KUDU_ALLOW_SLOW_TESTS=%s' % os.environ.get('KUDU_ALLOW_SLOW_TESTS', 1),
-               '-e', 'KUDU_COMPRESS_TEST_OUTPUT=%s' % \
-                      os.environ.get('KUDU_COMPRESS_TEST_OUTPUT', 0)]
-    if collect_tmpdir:
-      command += ["--collect-tmpdir"]
-    command.append('--')
-    command += argv[1:]
+  out_archive = os.path.join(staging.dir, '%s.gen.json' % (execution.test_name))
+  out_isolate = os.path.join(staging.dir, '%s.isolate' % (execution.test_name))
 
-    archive_json = dict(args=["-i", out_isolate,
-                              "-s", out_isolate + "d"],
-                        dir=rel_to_abs("."),
-                        name='%s.%d/%d' % (test_name, shard + 1, num_shards),
-                        version=1)
-    isolate_dict = dict(variables=dict(command=command,
-                                       files=files))
-    with open(out_archive, "w") as f:
-      json.dump(archive_json, f)
-    with open(out_isolate, "w") as f:
-      pprint.pprint(isolate_dict, f)
+  command = ['../../build-support/run_dist_test.py',
+             '-e', 'KUDU_TEST_TIMEOUT=%d' % (TEST_TIMEOUT_SECS - 30),
+             '-e', 'KUDU_ALLOW_SLOW_TESTS=%s' % os.environ.get('KUDU_ALLOW_SLOW_TESTS', 1),
+             '-e', 'KUDU_COMPRESS_TEST_OUTPUT=%s' % \
+                    os.environ.get('KUDU_COMPRESS_TEST_OUTPUT', 0)]
+  for k, v in execution.env.iteritems():
+    if k == 'KUDU_TEST_TIMEOUT':
+      # Currently we don't respect the test timeouts specified in ctest, since
+      # we want to make sure that the dist-test task timeout and the
+      # underlying test timeout are coordinated.
+      continue
+    command.extend(['-e', '%s=%s' % (k, v)])
+
+  if collect_tmpdir:
+    command += ["--collect-tmpdir"]
+  command.append('--')
+  command += argv[1:]
+
+  archive_json = dict(args=["-i", out_isolate,
+                            "-s", out_isolate + "d"],
+                      dir=rel_to_abs("."),
+                      version=1)
+  isolate_dict = dict(variables=dict(command=command,
+                                     files=files))
+  with open(out_archive, "w") as f:
+    json.dump(archive_json, f)
+  with open(out_isolate, "w") as f:
+    pprint.pprint(isolate_dict, f)
 
 
 def create_task_json(staging,
@@ -332,6 +397,10 @@ def create_task_json(staging,
                "max_retries": max_retries
                }] * replicate_tasks
 
+  if len(tasks) > MAX_TASKS_PER_JOB:
+    logging.error("Job contains %d tasks which is more than the maximum %d",
+                  len(tasks), MAX_TASKS_PER_JOB)
+    sys.exit(1)
   outmap = {"tasks": tasks}
 
   with file(staging.tasks_json_path(), "wt") as f:
@@ -353,7 +422,7 @@ def run_isolate(staging):
                            '-dump-json=' + staging.archive_dump_path(),
                            '--'] + staging.gen_json_paths())
   except:
-    print >>sys.stderr, "Failed to run", isolate_path
+    logging.error("Failed to run %s", isolate_path)
     raise
 
 def submit_tasks(staging, options):
@@ -365,9 +434,9 @@ def submit_tasks(staging, options):
   by 'create_task_json()'.
   """
   if not os.path.exists(DIST_TEST_HOME):
-    print >>sys.stderr, "Cannot find dist_test tools at path %s " \
-        "Set the DIST_TEST_HOME environment variable to the path to the dist_test directory. " \
-        % DIST_TEST_HOME,
+    logging.error("Cannot find dist_test tools at path %s " \
+                  "Set the DIST_TEST_HOME environment variable to the path to the dist_test directory. ",
+                  DIST_TEST_HOME)
     raise OSError("Cannot find path to dist_test tools")
   client_py_path = os.path.join(DIST_TEST_HOME, "bin", "client")
   try:
@@ -377,7 +446,7 @@ def submit_tasks(staging, options):
     cmd.append(staging.tasks_json_path())
     subprocess.check_call(cmd)
   except:
-    print >>sys.stderr, "Failed to run", client_py_path
+    logging.error("Failed to run %s", client_py_path)
     raise
 
 def get_flakies():
@@ -386,24 +455,46 @@ def get_flakies():
     return set()
   return set(l.strip() for l in file(path))
 
-def run_all_tests(parser, options):
+def run_tests(parser, options):
   """
   Gets all of the test command lines from 'ctest', isolates them,
   creates a task list, and submits the tasks to the testing service.
   """
-  commands = get_test_commandlines()
+  executions = get_test_executions(options)
+  if options.extra_args:
+    if options.extra_args[0] == '--':
+      del options.extra_args[0]
+    for e in executions:
+      e.argv.extend(options.extra_args)
   staging = StagingDir.new()
-  for command in commands:
-    create_archive_input(staging, command,
-                         disable_sharding=options.disable_sharding,
+  for execution in executions:
+    create_archive_input(staging, execution,
                          collect_tmpdir=options.collect_tmpdir)
   run_isolate(staging)
-  create_task_json(staging, flaky_test_set=get_flakies())
+  create_task_json(staging,
+                   flaky_test_set=get_flakies(),
+                   replicate_tasks=options.num_instances)
   submit_tasks(staging, options)
 
-def add_run_all_subparser(subparsers):
-  p = subparsers.add_parser('run-all', help='Run all of the dist-test-enabled tests')
-  p.set_defaults(func=run_all_tests)
+def add_run_subparser(subparsers):
+  p = subparsers.add_parser('run', help='Run the dist-test-enabled tests')
+
+  p.add_argument("--tests-regex", "-R", dest="tests_regex", type=str,
+                 metavar="REGEX",
+                 help="Only run tests matching regular expression. For example, " +
+                 "'run -R consensus' will run any tests with the word consensus in " +
+                 "their names.")
+  p.add_argument("--num-instances", "-n", dest="num_instances", type=int,
+                 default=1, metavar="NUM",
+                 help="Number of times to submit each matching test. This can be used to " +
+                 "loop a suite of tests to test for flakiness. Typically this should be used " +
+                 "in conjunction with the --tests-regex option above to select a small number " +
+                 "of tests.")
+  p.add_argument("extra_args", nargs=argparse.REMAINDER,
+                 help=("Optional arguments to append to the command line for all " +
+                       "submitted tasks. Passing a '--' argument before the list of " +
+                       "arguments to pass may be helpful."))
+  p.set_defaults(func=run_tests)
 
 def loop_test(parser, options):
   """
@@ -411,42 +502,95 @@ def loop_test(parser, options):
   """
   if options.num_instances < 1:
     parser.error("--num-instances must be >= 1")
-  command = ["run-test.sh", options.cmd] + options.args
+  execution = TestExecution(["run-test.sh", options.cmd] + options.args)
   staging = StagingDir.new()
-  create_archive_input(staging, command,
-                       disable_sharding=options.disable_sharding,
+  create_archive_input(staging, execution,
                        collect_tmpdir=options.collect_tmpdir)
   run_isolate(staging)
   create_task_json(staging, options.num_instances)
   submit_tasks(staging, options)
 
 def add_loop_test_subparser(subparsers):
-  p = subparsers.add_parser('loop', help='Run many instances of the same test',
-      epilog="if passing arguments to the test, you may want to use a '--' " +
-             "argument before <test-path>. e.g: loop -- foo-test --gtest_opt=123")
+  p = subparsers.add_parser('loop',
+                            help='Run many instances of the same test, specified by its full path',
+                            epilog="NOTE: if you would like to loop an entire suite of tests, you may " +
+                            "prefer to use the 'run' command instead. The 'run' command will automatically " +
+                            "shard bigger test suites into more granular tasks based on the shard count " +
+                            "configured in CMakeLists.txt. For example: " +
+                            "dist_test.py run -R '^raft_consensus-itest' -n 1000")
   p.add_argument("--num-instances", "-n", dest="num_instances", type=int,
-                 help="number of test instances to start", metavar="NUM",
+                 metavar="NUM",
+                 help="number of test instances to start. If passing arguments to the " +
+                 "test, you may want to use a '--' argument before <test-path>. " +
+                 "e.g: loop -- build/latest/bin/foo-test --gtest_opt=123",
                  default=100)
-  p.add_argument("cmd", help="test binary")
+  p.add_argument("cmd", help="the path to the test binary (e.g. build/latest/bin/foo-test)")
   p.add_argument("args", nargs=argparse.REMAINDER, help="test arguments")
   p.set_defaults(func=loop_test)
 
 
+def run_java_tests(parser, options):
+  subprocess.check_call([rel_to_abs("java/gradlew"), "distTest"],
+      cwd=rel_to_abs("java"))
+  staging = StagingDir(rel_to_abs("java/build/dist-test"))
+  run_isolate(staging)
+  create_task_json(staging, 1)
+  submit_tasks(staging, options)
+
+def loop_java_test(parser, options):
+  """
+  Runs many instances of a user-provided Java test class on the testing service.
+  """
+  if options.num_instances < 1:
+    parser.error("--num-instances must be >= 1")
+  subprocess.check_call(
+      [rel_to_abs("java/gradlew"), "distTest", "--classes", "**/%s" % options.pattern],
+      cwd=rel_to_abs("java"))
+  staging = StagingDir(rel_to_abs("java/build/dist-test"))
+  run_isolate(staging)
+  create_task_json(staging, options.num_instances)
+  submit_tasks(staging, options)
+
+
+def add_java_subparser(subparsers):
+  p = subparsers.add_parser('java', help='Run java tests via dist-test')
+  sp = p.add_subparsers()
+  run_all = sp.add_parser("run-all",
+      help="Run all of the Java tests via dist-test")
+  run_all.set_defaults(func=run_java_tests)
+
+  loop = sp.add_parser("loop", help="Loop a single Java test")
+  loop.add_argument("--num-instances", "-n", dest="num_instances", type=int,
+                 help="number of test instances to start", metavar="NUM",
+                 default=100)
+  loop.add_argument("pattern", help="Pattern matching a Java test class to run")
+  loop.set_defaults(func=loop_java_test)
+
+
+def dump_base_deps(parser, options):
+  print json.dumps(get_base_deps())
+
+
+def add_internal_commands(subparsers):
+  p = subparsers.add_parser('internal', help="[Internal commands not for users]")
+  p.add_subparsers().add_parser('dump_base_deps').set_defaults(func=dump_base_deps)
+
+
 def main(argv):
-  logging.basicConfig(level=logging.INFO)
   p = argparse.ArgumentParser()
-  p.add_argument("--disable-sharding", dest="disable_sharding", action="store_true",
-                 help="Disable automatic sharding of tests", default=False)
   p.add_argument("--collect-tmpdir", dest="collect_tmpdir", action="store_true",
                  help="Collect the test tmpdir of failed tasks as test artifacts", default=False)
   p.add_argument("--no-wait", dest="no_wait", action="store_true",
                  help="Return without waiting for the job to complete", default=False)
   sp = p.add_subparsers()
   add_loop_test_subparser(sp)
-  add_run_all_subparser(sp)
+  add_run_subparser(sp)
+  add_java_subparser(sp)
+  add_internal_commands(sp)
   args = p.parse_args(argv)
   args.func(p, args)
 
 
 if __name__ == "__main__":
+  init_logging()
   main(sys.argv[1:])

@@ -27,6 +27,7 @@
 package org.apache.kudu.client;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.kudu.tserver.Tserver.NewScanRequestPB;
 import static org.apache.kudu.tserver.Tserver.ScanRequestPB;
 import static org.apache.kudu.tserver.Tserver.ScanResponsePB;
@@ -118,9 +119,23 @@ public final class AsyncKuduScanner {
      * are sometimes not externally consistent even when action was taken to make them so.
      * In these cases Isolation may degenerate to mode "Read Committed". See KUDU-430.
      */
-    READ_AT_SNAPSHOT(Common.ReadMode.READ_AT_SNAPSHOT);
+    READ_AT_SNAPSHOT(Common.ReadMode.READ_AT_SNAPSHOT),
 
-    private Common.ReadMode pbVersion;
+    /**
+     * When @c READ_YOUR_WRITES is specified, the client will perform a read
+     * such that it follows all previously known writes and reads from this client.
+     * Specifically this mode:
+     *  (1) ensures read-your-writes and read-your-reads session guarantees,
+     *  (2) minimizes latency caused by waiting for outstanding write
+     *      transactions to complete.
+     *
+     * Reads in this mode are not repeatable: two READ_YOUR_WRITES reads, even if
+     * they provide the same propagated timestamp bound, can execute at different
+     * timestamps and thus may return different results.
+     */
+    READ_YOUR_WRITES(Common.ReadMode.READ_YOUR_WRITES);
+
+    private final Common.ReadMode pbVersion;
     ReadMode(Common.ReadMode pbVersion) {
       this.pbVersion = pbVersion;
     }
@@ -183,6 +198,8 @@ public final class AsyncKuduScanner {
 
   private long htTimestamp;
 
+  private long lowerBoundPropagationTimestamp = AsyncKuduClient.NO_TIMESTAMP;
+
   private final ReplicaSelection replicaSelection;
 
   /////////////////////
@@ -192,6 +209,8 @@ public final class AsyncKuduScanner {
   private boolean closed = false;
 
   private boolean hasMore = true;
+
+  private long numRowsReturned = 0;
 
   /**
    * The tabletSlice currently being scanned.
@@ -293,6 +312,13 @@ public final class AsyncKuduScanner {
     }
 
     this.replicaSelection = replicaSelection;
+
+    // For READ_YOUR_WRITES scan mode, get the latest observed timestamp
+    // and store it. Always use this one as the propagated timestamp for
+    // the duration of the scan to avoid unnecessary wait.
+    if (readMode == ReadMode.READ_YOUR_WRITES) {
+      this.lowerBoundPropagationTimestamp = this.client.getLastPropagatedTimestamp();
+    }
   }
 
   /**
@@ -303,6 +329,7 @@ public final class AsyncKuduScanner {
   private static ColumnSchema getStrippedColumnSchema(ColumnSchema columnToClone) {
     return new ColumnSchema.ColumnSchemaBuilder(columnToClone.getName(), columnToClone.getType())
         .nullable(columnToClone.isNullable())
+        .typeAttributes(columnToClone.getTypeAttributes())
         .build();
   }
 
@@ -352,6 +379,14 @@ public final class AsyncKuduScanner {
   }
 
   /**
+   * Returns the scan request timeout for this scanner.
+   * @return the scan request timeout, in milliseconds
+   */
+  public long getScanRequestTimeout() {
+    return scanRequestTimeout;
+  }
+
+  /**
    * Returns the projection schema of this scanner. If specific columns were
    * not specified during scanner creation, the table schema is returned.
    * @return the projection schema for this scanner
@@ -388,13 +423,31 @@ public final class AsyncKuduScanner {
             // context of the same scan.
             htTimestamp = resp.scanTimestamp;
           }
-          if (resp.propagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
-            client.updateLastPropagatedTimestamp(resp.propagatedTimestamp);
+
+          long lastPropagatedTimestamp = AsyncKuduClient.NO_TIMESTAMP;
+          if (readMode == ReadMode.READ_YOUR_WRITES &&
+              resp.scanTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
+            // For READ_YOUR_WRITES mode, update the latest propagated timestamp
+            // with the chosen snapshot timestamp sent back from the server, to
+            // avoid unnecessarily wait for subsequent reads. Since as long as
+            // the chosen snapshot timestamp of the next read is greater than
+            // the previous one, the scan does not violate READ_YOUR_WRITES
+            // session guarantees.
+            lastPropagatedTimestamp = resp.scanTimestamp;
+          } else if (resp.propagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
+            // Otherwise we just use the propagated timestamp returned from
+            // the server as the latest propagated timestamp.
+            lastPropagatedTimestamp = resp.propagatedTimestamp;
+          }
+          if (lastPropagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
+            client.updateLastPropagatedTimestamp(lastPropagatedTimestamp);
           }
 
           if (isFaultTolerant && resp.lastPrimaryKey != null) {
             lastPrimaryKey = resp.lastPrimaryKey;
           }
+
+          numRowsReturned += resp.data.getNumRows();
 
           if (!resp.more || resp.scannerId == null) {
             scanFinished();
@@ -409,6 +462,7 @@ public final class AsyncKuduScanner {
           return Deferred.fromResult(resp.data);
         }
 
+        @Override
         public String toString() {
           return "scanner opened";
         }
@@ -433,12 +487,13 @@ public final class AsyncKuduScanner {
             sequenceId = 0;
             return nextRows();
           } else {
-            LOG.warn("Can not open scanner", e);
+            LOG.debug("Can not open scanner", e);
             // Don't let the scanner think it's opened on this tablet.
             return Deferred.fromError(e); // Let the error propogate.
           }
         }
 
+        @Override
         public String toString() {
           return "open scanner errback";
         }
@@ -478,7 +533,9 @@ public final class AsyncKuduScanner {
    */
   private final Callback<RowResultIterator, Response> gotNextRow =
       new Callback<RowResultIterator, Response>() {
+        @Override
         public RowResultIterator call(final Response resp) {
+          numRowsReturned += resp.data.getNumRows();
           if (!resp.more) {  // We're done scanning this tablet.
             scanFinished();
             return resp.data;
@@ -489,6 +546,7 @@ public final class AsyncKuduScanner {
           return resp.data;
         }
 
+        @Override
         public String toString() {
           return "get nextRows response";
         }
@@ -517,6 +575,7 @@ public final class AsyncKuduScanner {
         }
       }
 
+      @Override
       public String toString() {
         return "NextRow errback";
       }
@@ -526,8 +585,9 @@ public final class AsyncKuduScanner {
   void scanFinished() {
     Partition partition = tablet.getPartition();
     pruner.removePartitionKeyRange(partition.getPartitionKeyEnd());
-    // Stop scanning if we have scanned until or past the end partition key.
-    if (!pruner.hasMorePartitionKeyRanges()) {
+    // Stop scanning if we have scanned until or past the end partition key, or
+    // if we have fulfilled the limit.
+    if (!pruner.hasMorePartitionKeyRanges() || numRowsReturned >= limit) {
       hasMore = false;
       closed = true; // the scanner is closed on the other side at this point
       return;
@@ -561,6 +621,7 @@ public final class AsyncKuduScanner {
   /** Callback+Errback invoked when the TabletServer closed our scanner.  */
   private Callback<RowResultIterator, Response> closedCallback() {
     return new Callback<RowResultIterator, Response>() {
+      @Override
       public RowResultIterator call(Response response) {
         closed = true;
         if (LOG.isDebugEnabled()) {
@@ -568,16 +629,18 @@ public final class AsyncKuduScanner {
               tablet);
         }
         invalidate();
-        scannerId = "client debug closed".getBytes();   // Make debugging easier.
+        scannerId = "client debug closed".getBytes(UTF_8);   // Make debugging easier.
         return response == null ? null : response.data;
       }
 
+      @Override
       public String toString() {
         return "scanner closed";
       }
     };
   }
 
+  @Override
   public String toString() {
     final String tablet = this.tablet == null ? "null" : this.tablet.getTabletId();
     final StringBuilder buf = new StringBuilder();
@@ -693,7 +756,7 @@ public final class AsyncKuduScanner {
 
     /**
      * The server timestamp to propagate, if set. If the server response does
-     * not contain propagation timestamp, this field is set to special value
+     * not contain propagated timestamp, this field is set to special value
      * AsyncKuduClient.NO_TIMESTAMP
      */
     private final long propagatedTimestamp;
@@ -714,6 +777,7 @@ public final class AsyncKuduScanner {
       this.lastPrimaryKey = lastPrimaryKey;
     }
 
+    @Override
     public String toString() {
       String ret = "AsyncKuduScanner$Response(scannerId = " + Bytes.pretty(scannerId) +
           ", data = " + data + ", more = " + more;
@@ -779,14 +843,22 @@ public final class AsyncKuduScanner {
           // is the easiest way.
           AsyncKuduScanner.this.tablet = super.getTablet();
           NewScanRequestPB.Builder newBuilder = NewScanRequestPB.newBuilder();
-          newBuilder.setLimit(limit); // currently ignored
+          newBuilder.setLimit(limit - AsyncKuduScanner.this.numRowsReturned);
           newBuilder.addAllProjectedColumns(ProtobufHelper.schemaToListPb(schema));
           newBuilder.setTabletId(UnsafeByteOperations.unsafeWrap(tablet.getTabletIdAsBytes()));
           newBuilder.setOrderMode(AsyncKuduScanner.this.getOrderMode());
           newBuilder.setCacheBlocks(cacheBlocks);
-          // if the last propagated timestamp is set send it with the scan
-          if (table.getAsyncClient().getLastPropagatedTimestamp() != AsyncKuduClient.NO_TIMESTAMP) {
-            newBuilder.setPropagatedTimestamp(table.getAsyncClient().getLastPropagatedTimestamp());
+          // If the last propagated timestamp is set, send it with the scan.
+          // For READ_YOUR_WRITES scan, use the propagated timestamp from
+          // the scanner.
+          long timestamp;
+          if (readMode == ReadMode.READ_YOUR_WRITES) {
+            timestamp = lowerBoundPropagationTimestamp;
+          } else {
+            timestamp = table.getAsyncClient().getLastPropagatedTimestamp();
+          }
+          if (timestamp != AsyncKuduClient.NO_TIMESTAMP) {
+            newBuilder.setPropagatedTimestamp(timestamp);
           }
           newBuilder.setReadMode(AsyncKuduScanner.this.getReadMode().pbVersion());
 
@@ -888,6 +960,7 @@ public final class AsyncKuduScanner {
       return new Pair<Response, Object>(response, error);
     }
 
+    @Override
     public String toString() {
       return "ScanRequest(scannerId=" + Bytes.pretty(scannerId) +
           (tablet != null ? ", tablet=" + tablet.getTabletId() : "") +
@@ -918,6 +991,7 @@ public final class AsyncKuduScanner {
      * Builds an {@link AsyncKuduScanner} using the passed configurations.
      * @return a new {@link AsyncKuduScanner}
      */
+    @Override
     public AsyncKuduScanner build() {
       return new AsyncKuduScanner(
           client, table, projectedColumnNames, projectedColumnIndexes, readMode, isFaultTolerant,

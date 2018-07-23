@@ -34,7 +34,6 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.CodedOutputStream;
 import com.google.protobuf.InvalidProtocolBufferException;
@@ -64,6 +63,14 @@ import org.apache.kudu.util.Slice;
  * familiar with the term "defensive copy", we don't do it in order to avoid
  * unnecessary memory copies when you know you won't be changing (or event
  * holding a reference to) the byte array, which is frequently the case.
+ *
+ *
+ * <h1>Note regarding {@code KuduRpc} instances passed into {@link AsyncKuduSession}</h1>
+ * Every {@link KuduRpc} passed to a method of AsyncKuduSession should not be
+ * changed or re-used until the {@code Deferred} returned by that method
+ * calls you back.  <strong>Changing or re-using any {@link KuduRpc} for
+ * an RPC in flight will lead to <em>unpredictable</em> results and voids
+ * your warranty</strong>.
  */
 @InterfaceAudience.Private
 public abstract class KuduRpc<R> {
@@ -72,7 +79,7 @@ public abstract class KuduRpc<R> {
    * This along with {@link Status#MAX_MESSAGE_LENGTH} dictates how big all the messages
    * in a trace can be.
    */
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   public static final int MAX_TRACES_SIZE = 100;
 
   /**
@@ -228,7 +235,9 @@ public abstract class KuduRpc<R> {
     }
     deferred = null;
     attempt = 0;
-    if (isRequestTracked()) {
+    // If the subclass is a "tracked RPC" unregister it, unless it never
+    // got to the point of being registered.
+    if (isRequestTracked() && sequenceId != RequestTracker.NO_SEQ_NO) {
       table.getAsyncClient().getRequestTracker().rpcCompleted(sequenceId);
       sequenceId = RequestTracker.NO_SEQ_NO;
     }
@@ -350,6 +359,7 @@ public abstract class KuduRpc<R> {
     this.sequenceId = sequenceId;
   }
 
+  @Override
   public String toString() {
     final StringBuilder buf = new StringBuilder();
     buf.append("KuduRpc(method=");

@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <cstdint>
+#include <cstdint> // IWYU pragma: keep
 #include <memory>
-#include <ostream>
+#include <ostream> // IWYU pragma: keep
 #include <set>
 #include <string>
 #include <vector>
@@ -25,23 +25,24 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client-test-util.h"
+#include "kudu/client/client-test-util.h" // IWYU pragma: keep
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/split.h"
-#include "kudu/gutil/strings/strip.h"
+#include "kudu/gutil/strings/strip.h" // IWYU pragma: keep
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
-#include "kudu/master/sys_catalog.h"
+#include "kudu/master/sys_catalog.h" // IWYU pragma: keep
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/net_util.h" // IWYU pragma: keep
 #include "kudu/util/random.h"
 #include "kudu/util/status.h"
-#include "kudu/util/subprocess.h"
+#include "kudu/util/subprocess.h" // IWYU pragma: keep
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
@@ -70,7 +71,8 @@ using std::vector;
 using strings::Split;
 using strings::Substitute;
 
-class MasterFailoverTest : public KuduTest {
+class MasterFailoverTest : public KuduTest,
+                           public ::testing::WithParamInterface<HmsMode> {
  public:
   enum CreateTableMode {
     kWaitForCreate = 0,
@@ -78,9 +80,9 @@ class MasterFailoverTest : public KuduTest {
   };
 
   MasterFailoverTest() {
-    opts_.master_rpc_ports = { 11010, 11011, 11012 };
-    opts_.num_masters = num_masters_ = opts_.master_rpc_ports.size();
+    opts_.num_masters = 3;
     opts_.num_tablet_servers = kNumTabletServerReplicas;
+    opts_.hms_mode = GetParam();
 
     // Reduce various timeouts below as to make the detection of
     // leader master failures (specifically, failures as result of
@@ -150,17 +152,20 @@ class MasterFailoverTest : public KuduTest {
   }
 
  protected:
-  int num_masters_;
   ExternalMiniClusterOptions opts_;
   unique_ptr<ExternalMiniCluster> cluster_;
   shared_ptr<KuduClient> client_;
 };
 
+// Run the test with the HMS integration enabled and disabled.
+INSTANTIATE_TEST_CASE_P(HmsConfigurations, MasterFailoverTest,
+                        ::testing::Values(HmsMode::NONE, HmsMode::ENABLE_METASTORE_INTEGRATION));
+
 // Test that synchronous CreateTable (issue CreateTable call and then
 // wait until the table has been created) works even when the original
 // leader master has been paused.
-TEST_F(MasterFailoverTest, TestCreateTableSync) {
-  const char* kTableName = "testCreateTableSync";
+TEST_P(MasterFailoverTest, TestCreateTableSync) {
+  const char* kTableName = "default.test_create_table_sync";
 
   if (!AllowSlowTests()) {
     LOG(INFO) << "This test can only be run in slow mode.";
@@ -182,7 +187,7 @@ TEST_F(MasterFailoverTest, TestCreateTableSync) {
   // 5. Client times out, finds the new master, and retries CreateTable().
   // 6. The retry fails because the table was already created in step 3.
   Status s = CreateTable(kTableName, kWaitForCreate);
-  ASSERT_TRUE(s.ok() || s.IsAlreadyPresent());
+  ASSERT_TRUE(s.ok() || s.IsAlreadyPresent()) << s.ToString();
 
   shared_ptr<KuduTable> table;
   ASSERT_OK(client_->OpenTable(kTableName, &table));
@@ -192,8 +197,8 @@ TEST_F(MasterFailoverTest, TestCreateTableSync) {
 // Test that we can issue a CreateTable call, pause the leader master
 // immediately after, then verify that the table has been created on
 // the newly elected leader master.
-TEST_F(MasterFailoverTest, TestPauseAfterCreateTableIssued) {
-  const char* kTableName = "testPauseAfterCreateTableIssued";
+TEST_P(MasterFailoverTest, TestPauseAfterCreateTableIssued) {
+  const char* kTableName = "default.test_pause_after_create_table_issued";
 
   if (!AllowSlowTests()) {
     LOG(INFO) << "This test can only be run in slow mode.";
@@ -223,8 +228,8 @@ TEST_F(MasterFailoverTest, TestPauseAfterCreateTableIssued) {
 // Test the scenario where we create a table, pause the leader master,
 // and then issue the DeleteTable call: DeleteTable should go to the newly
 // elected leader master and succeed.
-TEST_F(MasterFailoverTest, TestDeleteTableSync) {
-  const char* kTableName = "testDeleteTableSync";
+TEST_P(MasterFailoverTest, TestDeleteTableSync) {
+  const char* kTableName = "default.test_delete_table_sync";
   if (!AllowSlowTests()) {
     LOG(INFO) << "This test can only be run in slow mode.";
     return;
@@ -241,11 +246,11 @@ TEST_F(MasterFailoverTest, TestDeleteTableSync) {
   // It's possible for DeleteTable() to delete the table and still return
   // NotFound. See TestCreateTableSync for details.
   Status s = client_->DeleteTable(kTableName);
-  ASSERT_TRUE(s.ok() || s.IsNotFound());
+  ASSERT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
 
   shared_ptr<KuduTable> table;
   s = client_->OpenTable(kTableName, &table);
-  ASSERT_TRUE(s.IsNotFound());
+  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
 }
 
 // Test the scenario where we create a table, pause the leader master,
@@ -253,11 +258,11 @@ TEST_F(MasterFailoverTest, TestDeleteTableSync) {
 // should go to the newly elected leader master and succeed, renaming
 // the table.
 //
-// TODO: Add an equivalent async test. Add a test for adding and/or
+// TODO(unknown): Add an equivalent async test. Add a test for adding and/or
 // renaming a column in a table.
-TEST_F(MasterFailoverTest, TestRenameTableSync) {
-  const char* kTableNameOrig = "testAlterTableSync";
-  const char* kTableNameNew = "testAlterTableSyncRenamed";
+TEST_P(MasterFailoverTest, TestRenameTableSync) {
+  const char* kTableNameOrig = "default.test_alter_table_sync";
+  const char* kTableNameNew = "default.test_alter_table_sync_renamed";
 
   if (!AllowSlowTests()) {
     LOG(INFO) << "This test can only be run in slow mode.";
@@ -275,17 +280,17 @@ TEST_F(MasterFailoverTest, TestRenameTableSync) {
   // It's possible for AlterTable() to rename the table and still return
   // NotFound. See TestCreateTableSync for details.
   Status s = RenameTable(kTableNameOrig, kTableNameNew);
-  ASSERT_TRUE(s.ok() || s.IsNotFound());
+  ASSERT_TRUE(s.ok() || s.IsNotFound()) << s.ToString();
 
   shared_ptr<KuduTable> table;
   ASSERT_OK(client_->OpenTable(kTableNameNew, &table));
   s = client_->OpenTable(kTableNameOrig, &table);
-  ASSERT_TRUE(s.IsNotFound());
+  ASSERT_TRUE(s.IsNotFound()) << s.ToString();
 }
 
 
-TEST_F(MasterFailoverTest, TestKUDU1374) {
-  const char* kTableName = "testKUDU1374";
+TEST_P(MasterFailoverTest, TestKUDU1374) {
+  const char* kTableName = "default.test_kudu_1374";
 
   // Wait at least one additional heartbeat interval after creating the table.
   // The idea is to guarantee that all tservers sent a tablet report with the
@@ -328,7 +333,7 @@ TEST_F(MasterFailoverTest, TestKUDU1374) {
   NO_PENDING_FATALS();
 }
 
-TEST_F(MasterFailoverTest, TestMasterUUIDResolution) {
+TEST_P(MasterFailoverTest, TestMasterUUIDResolution) {
   // After a fresh start, the masters should have received RPCs asking for
   // their UUIDs.
   for (int i = 0; i < cluster_->num_masters(); i++) {
@@ -367,7 +372,7 @@ TEST_F(MasterFailoverTest, TestMasterUUIDResolution) {
   }
 }
 
-TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
+TEST_P(MasterFailoverTest, TestMasterPermanentFailure) {
   const string kBinPath = cluster_->GetBinaryPath("kudu");
   Random r(SeedRandom());
 
@@ -451,7 +456,7 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
 
     // Do some operations.
 
-    string table_name = Substitute("table-$0", i);
+    string table_name = Substitute("default.table_$0", i);
     ASSERT_OK(CreateTable(table_name, kWaitForCreate));
 
     shared_ptr<KuduTable> table;
@@ -465,7 +470,7 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
       for (int j = 0; j < cluster_->num_masters(); j++) {
         ASSERT_OK(cluster_->master(j)->Pause());
         ScopedResumeExternalDaemon resume_daemon(cluster_->master(j));
-        string table_name = Substitute("table-$0-$1", i, j);
+        string table_name = Substitute("default.table_$0_$1", i, j);
 
         // See TestCreateTableSync to understand why we must check for
         // IsAlreadyPresent as well.

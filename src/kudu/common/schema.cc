@@ -46,6 +46,29 @@ static const ColumnId kFirstColumnId(0);
 static const ColumnId  kFirstColumnId(10);
 #endif
 
+bool ColumnTypeAttributes::EqualsForType(ColumnTypeAttributes other,
+                                         DataType type) const {
+  switch (type) {
+    case DECIMAL32:
+    case DECIMAL64:
+    case DECIMAL128:
+      return precision == other.precision && scale == other.scale;
+    default:
+      return true; // true because unhandled types don't use ColumnTypeAttributes.
+  }
+}
+
+string ColumnTypeAttributes::ToStringForType(DataType type) const {
+  switch (type) {
+    case DECIMAL32:
+    case DECIMAL64:
+    case DECIMAL128:
+      return strings::Substitute("($0, $1)", precision, scale);
+    default:
+      return "";
+  }
+}
+
 string ColumnStorageAttributes::ToString() const {
   return strings::Substitute("encoding=$0, compression=$1, cfile_block_size=$2",
                              EncodingType_Name(encoding),
@@ -99,8 +122,9 @@ string ColumnSchema::ToString() const {
 }
 
 string ColumnSchema::TypeToString() const {
-  return strings::Substitute("$0 $1",
+  return strings::Substitute("$0$1 $2",
                              type_info_->name(),
+                             type_attributes().ToStringForType(type_info()->type()),
                              is_nullable_ ? "NULLABLE" : "NOT NULL");
 }
 
@@ -334,6 +358,13 @@ Status Schema::GetMappedReadProjection(const Schema& projection,
 }
 
 string Schema::ToString() const {
+  if (cols_.empty()) return "Schema []";
+
+  vector<string> pk_strs;
+  for (int i = 0; i < num_key_columns_; i++) {
+    pk_strs.push_back(cols_[i].name());
+  }
+
   vector<string> col_strs;
   if (has_column_ids()) {
     for (int i = 0; i < cols_.size(); ++i) {
@@ -345,7 +376,9 @@ string Schema::ToString() const {
     }
   }
 
-  return StrCat("Schema [\n\t",
+  return StrCat("Schema [\n\tprimary key (",
+                JoinStrings(pk_strs, ", "),
+                "),\n\t",
                 JoinStrings(col_strs, ",\n\t"),
                 "\n]");
 }

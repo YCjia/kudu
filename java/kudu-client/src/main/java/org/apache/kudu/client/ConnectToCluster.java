@@ -24,7 +24,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Functions;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
@@ -81,12 +80,12 @@ final class ConnectToCluster {
     this.numMasters = masterAddrs.size();
   }
 
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   public Deferred<ConnectToClusterResponse> getDeferred() {
     return responseD;
   }
 
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   List<Exception> getExceptionsReceived() {
     return exceptionsReceived;
   }
@@ -158,14 +157,16 @@ final class ConnectToCluster {
     return connector.responseD;
   }
 
-  @VisibleForTesting
-  void connectToMasters(KuduTable masterTable,
-                        KuduRpc<?> parentRpc,
-                        long defaultTimeoutMs,
-                        Connection.CredentialsPolicy credentialsPolicy) {
+  @InterfaceAudience.LimitedPrivate("Test")
+  List<Deferred<ConnectToMasterResponsePB>> connectToMasters(
+      KuduTable masterTable,
+      KuduRpc<?> parentRpc,
+      long defaultTimeoutMs,
+      Connection.CredentialsPolicy credentialsPolicy) {
     // Try to connect to each master. The ConnectToCluster instance
     // waits until it gets a good response before firing the returned
     // deferred.
+    List<Deferred<ConnectToMasterResponsePB>> deferreds = new ArrayList<>();
     for (HostAndPort hostAndPort : masterAddrs) {
       Deferred<ConnectToMasterResponsePB> d;
       RpcProxy proxy = masterTable.getAsyncClient().newMasterRpcProxy(
@@ -179,7 +180,9 @@ final class ConnectToCluster {
         d = Deferred.fromError(new NonRecoverableException(statusIOE));
       }
       d.addCallbacks(callbackForNode(hostAndPort), errbackForNode(hostAndPort));
+      deferreds.add(d);
     }
+    return deferreds;
   }
 
   /**
@@ -189,7 +192,7 @@ final class ConnectToCluster {
    *                    be valid.
    * @return The callback object that can be added to the RPC request.
    */
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   Callback<Void, ConnectToMasterResponsePB> callbackForNode(HostAndPort hostAndPort) {
     return new ConnectToMasterCB(hostAndPort);
   }
@@ -201,7 +204,7 @@ final class ConnectToCluster {
    *                    purposes.
    * @return The errback object that can be added to the RPC request.
    */
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   Callback<Void, Exception> errbackForNode(HostAndPort hostAndPort) {
     return new ConnectToMasterErrCB(hostAndPort);
   }
@@ -356,7 +359,7 @@ final class ConnectToCluster {
 
     @Override
     public Void call(Exception e) throws Exception {
-      LOG.warn("Error receiving response from {}", hostAndPort, e);
+      LOG.info("Unable to connect to master {}: {}", hostAndPort, e.getMessage());
       exceptionsReceived.add(e);
       incrementCountAndCheckExhausted();
       return null;

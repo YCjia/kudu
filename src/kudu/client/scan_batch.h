@@ -32,6 +32,7 @@
 #include "kudu/client/stubs.h"
 #endif
 
+#include "kudu/util/int128.h"
 #include "kudu/util/kudu_export.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
@@ -62,7 +63,7 @@ class KuduSchema;
 /// regular for loop (C++03):
 /// @code
 ///   for (KuduScanBatch::const_iterator it = batch.begin(), it != batch.end();
-///        ++i) {
+///        ++it) {
 ///     KuduScanBatch::RowPtr row(*it);
 ///     ...
 ///   }
@@ -194,6 +195,10 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
 
   Status GetFloat(const Slice& col_name, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(const Slice& col_name, double* val) const WARN_UNUSED_RESULT;
+
+#if KUDU_INT128_SUPPORTED
+  Status GetUnscaledDecimal(const Slice& col_name, int128_t* val) const WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Getters for integral type columns by column index.
@@ -224,6 +229,10 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
 
   Status GetFloat(int col_idx, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(int col_idx, double* val) const WARN_UNUSED_RESULT;
+
+#if KUDU_INT128_SUPPORTED
+  Status GetUnscaledDecimal(int col_idx, int128_t* val) const WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Getters for string/binary column by column name.

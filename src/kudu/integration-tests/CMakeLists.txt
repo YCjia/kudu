@@ -24,9 +24,9 @@ set(INTEGRATION_TESTS_SRCS
   cluster_itest_util.cc
   cluster_verifier.cc
   external_mini_cluster-itest-base.cc
-  external_mini_cluster_fs_inspector.cc
   internal_mini_cluster-itest-base.cc
   log_verifier.cc
+  mini_cluster_fs_inspector.cc
   raft_consensus-itest-base.cc
   test_workload.cc
   ts_itest-base.cc
@@ -34,9 +34,9 @@ set(INTEGRATION_TESTS_SRCS
 
 add_library(itest_util ${INTEGRATION_TESTS_SRCS})
 target_link_libraries(itest_util
-  tserver
+  tserver_proto
   tserver_test_util
-  master
+  master_proto
   mini_cluster
   ksck
   kudu_client
@@ -47,69 +47,76 @@ target_link_libraries(itest_util
   kudu_tools_util
   security_test_util)
 add_dependencies(itest_util
-  kudu-tserver
-  kudu-master)
+  kudu-master
+  kudu-tserver)
 
 # Tests
 set(KUDU_TEST_LINK_LIBS itest_util ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(all_types-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(alter_table-randomized-test)
-ADD_KUDU_TEST(alter_table-test)
+ADD_KUDU_TEST(all_types-itest
+  PROCESSORS 4
+  NUM_SHARDS 8)
+ADD_KUDU_TEST(alter_table-randomized-test NUM_SHARDS 2 PROCESSORS 4)
+ADD_KUDU_TEST(alter_table-test PROCESSORS 3)
 ADD_KUDU_TEST(authn_token_expire-itest)
-ADD_KUDU_TEST(catalog_manager_tsk-itest)
+ADD_KUDU_TEST(catalog_manager_tsk-itest PROCESSORS 2)
 ADD_KUDU_TEST(client_failover-itest)
-ADD_KUDU_TEST(client-negotiation-failover-itest
-  RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(client-negotiation-failover-itest)
 ADD_KUDU_TEST(client-stress-test
-  RESOURCE_LOCK "master-rpc-ports"
   RUN_SERIAL true)
-ADD_KUDU_TEST(consistency-itest)
-ADD_KUDU_TEST(create-table-itest)
-ADD_KUDU_TEST(create-table-stress-test)
-ADD_KUDU_TEST(delete_table-itest)
-ADD_KUDU_TEST(delete_tablet-itest)
-ADD_KUDU_TEST(disk_failure-itest)
+ADD_KUDU_TEST(consensus_peer_health_status-itest)
+ADD_KUDU_TEST(consistency-itest PROCESSORS 5)
+ADD_KUDU_TEST(create-table-itest PROCESSORS 3)
+ADD_KUDU_TEST(create-table-stress-test RUN_SERIAL true)
+ADD_KUDU_TEST(decimal-itest)
+ADD_KUDU_TEST(delete_table-itest NUM_SHARDS 8 PROCESSORS 4)
+ADD_KUDU_TEST(delete_tablet-itest PROCESSORS 2)
+ADD_KUDU_TEST(disk_failure-itest PROCESSORS 2)
 ADD_KUDU_TEST(disk_reservation-itest)
 ADD_KUDU_TEST(exactly_once_writes-itest)
-ADD_KUDU_TEST(flex_partitioning-itest TIMEOUT 1800)
+ADD_KUDU_TEST(flex_partitioning-itest TIMEOUT 1800 NUM_SHARDS 8 PROCESSORS 2)
 ADD_KUDU_TEST(full_stack-insert-scan-test RUN_SERIAL true)
 ADD_KUDU_TEST(fuzz-itest RUN_SERIAL true)
 ADD_KUDU_TEST(heavy-update-compaction-itest RUN_SERIAL true)
-ADD_KUDU_TEST(linked_list-test RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(linked_list-test RUN_SERIAL true)
 ADD_KUDU_TEST(log-rolling-itest)
-ADD_KUDU_TEST(master_cert_authority-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(master_failover-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(master_migration-itest RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(master_cert_authority-itest PROCESSORS 2)
+ADD_KUDU_TEST(master_failover-itest NUM_SHARDS 4 PROCESSORS 3)
+ADD_KUDU_TEST_DEPENDENCIES(master_failover-itest
+  kudu)
+ADD_KUDU_TEST(master_hms-itest RUN_SERIAL true PROCESSORS 4)
+ADD_KUDU_TEST(master_migration-itest)
 ADD_KUDU_TEST_DEPENDENCIES(master_migration-itest
   kudu)
-ADD_KUDU_TEST(master_replication-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(master-stress-test RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(master_replication-itest)
+ADD_KUDU_TEST(master-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(multidir_cluster-itest)
-ADD_KUDU_TEST(open-readonly-fs-itest)
+ADD_KUDU_TEST(open-readonly-fs-itest PROCESSORS 4)
 ADD_KUDU_TEST(raft_config_change-itest)
-ADD_KUDU_TEST(raft_consensus_election-itest)
+ADD_KUDU_TEST(raft_consensus_election-itest PROCESSORS 4)
 ADD_KUDU_TEST(raft_consensus_failure_detector-imc-itest)
-ADD_KUDU_TEST(raft_consensus_nonvoter-itest)
-ADD_KUDU_TEST(raft_consensus-itest RUN_SERIAL true)
+ADD_KUDU_TEST(raft_consensus_nonvoter-itest PROCESSORS 3)
+ADD_KUDU_TEST(raft_consensus_stress-itest RUN_SERIAL true)
+ADD_KUDU_TEST(raft_consensus-itest RUN_SERIAL true NUM_SHARDS 6)
+ADD_KUDU_TEST(replace_tablet-itest)
 ADD_KUDU_TEST(registration-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(security-faults-itest)
 ADD_KUDU_TEST(security-itest)
-ADD_KUDU_TEST(security-master-certificates-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(security-unknown-tsk-itest)
-ADD_KUDU_TEST(stop_tablet-itest)
+ADD_KUDU_TEST(security-master-auth-itest)
+ADD_KUDU_TEST(security-unknown-tsk-itest PROCESSORS 4)
+ADD_KUDU_TEST(stop_tablet-itest PROCESSORS 4)
 ADD_KUDU_TEST(table_locations-itest)
-ADD_KUDU_TEST(tablet_copy-itest)
+ADD_KUDU_TEST(tablet_copy-itest NUM_SHARDS 6 PROCESSORS 4)
 ADD_KUDU_TEST(tablet_copy_client_session-itest)
 ADD_KUDU_TEST(tablet_history_gc-itest)
 ADD_KUDU_TEST(tablet_replacement-itest)
 ADD_KUDU_TEST(tombstoned_voting-imc-itest)
 ADD_KUDU_TEST(tombstoned_voting-itest)
 ADD_KUDU_TEST(tombstoned_voting-stress-test RUN_SERIAL true)
-ADD_KUDU_TEST(token_signer-itest RESOURCE_LOCK "master-rpc-ports")
-ADD_KUDU_TEST(ts_recovery-itest)
+ADD_KUDU_TEST(token_signer-itest)
+ADD_KUDU_TEST(ts_recovery-itest PROCESSORS 4)
 ADD_KUDU_TEST(ts_tablet_manager-itest)
 ADD_KUDU_TEST(update_scan_delta_compact-test RUN_SERIAL true)
-ADD_KUDU_TEST(webserver-stress-itest RESOURCE_LOCK "master-rpc-ports")
+ADD_KUDU_TEST(webserver-stress-itest RUN_SERIAL true)
 ADD_KUDU_TEST(write_throttling-itest)
 
 if (NOT APPLE)
@@ -117,7 +124,7 @@ if (NOT APPLE)
   # Opens too many files on macOS because we're not using a file cache for
   # reading log segments.
   # TODO(wdb): Re-enable once a file cache is being used.
-  ADD_KUDU_TEST(dense_node-itest)
+  ADD_KUDU_TEST(dense_node-itest RUN_SERIAL true)
 endif()
 
 # Tests that should not be run automatically by ctest.

@@ -16,6 +16,8 @@
 // under the License.
 package org.apache.kudu.client;
 
+import static org.apache.kudu.util.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -46,10 +48,9 @@ public class TestTimeouts extends BaseKuduTest {
     }
 
     createTable(TABLE_NAME, basicSchema, getBasicCreateTableOptions());
-    KuduTable table = openTable(TABLE_NAME);
+    KuduTable table = lowTimeoutsClient.openTable(TABLE_NAME);
 
     KuduSession lowTimeoutSession = lowTimeoutsClient.newSession();
-
 
     OperationResponse response = lowTimeoutSession.apply(createBasicSchemaInsert(table, 1));
     assertTrue(response.hasRowError());

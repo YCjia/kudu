@@ -36,6 +36,7 @@
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
+#include "kudu/gutil/callback.h"  // IWYU pragma: keep
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
@@ -138,6 +139,10 @@ class Log : public RefCountedThreadSafe<Log> {
   // Delete all WAL data from the log associated with this tablet.
   // REQUIRES: The Log must be closed.
   static Status DeleteOnDiskData(FsManager* fs_manager, const std::string& tablet_id);
+
+  // Removes the recovery directory and all files contained therein, if it exists.
+  // Intended to be invoked after log replay successfully completes.
+  static Status RemoveRecoveryDirIfExists(FsManager* fs_manager, const std::string& tablet_id);
 
   // Returns a reader that is able to read through the previous segments,
   // provided the log is initialized and not yet closed. After being closed,
@@ -260,7 +265,7 @@ class Log : public RefCountedThreadSafe<Log> {
 
   Log(LogOptions options, FsManager* fs_manager, std::string log_path,
       std::string tablet_id, const Schema& schema, uint32_t schema_version,
-      const scoped_refptr<MetricEntity>& metric_entity);
+      scoped_refptr<MetricEntity> metric_entity);
 
   // Initializes a new one or continues an existing log.
   Status Init();

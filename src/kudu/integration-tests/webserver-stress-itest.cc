@@ -47,8 +47,16 @@ TEST_F(KuduTest, TestWebUIDoesNotCrashCluster) {
   const int kNumTablets = 50;
 
   ExternalMiniClusterOptions opts;
-  opts.master_rpc_ports = { 11010, 11011, 11012 };
-  opts.num_masters = opts.master_rpc_ports.size();
+#ifdef __linux__
+  // We can only do explicit webserver ports on Linux, where we use
+  // IPs like 127.x.y.z to bind the minicluster servers to different
+  // hosts. This might make the test marginally flaky on OSX, but
+  // it's easier than adding the ability to pipe separate webserver
+  // ports to each server.
+  opts.extra_master_flags.emplace_back("-webserver_port=11013");
+  opts.extra_tserver_flags.emplace_back("-webserver_port=11014");
+#endif
+  opts.num_masters = 3;
 
   ExternalMiniCluster cluster(opts);
   ASSERT_OK(cluster.Start());

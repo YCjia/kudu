@@ -19,7 +19,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -62,6 +61,8 @@ using strings::Substitute;
 
 namespace kudu {
 namespace client {
+
+using internal::MetaCache;
 
 KuduScanToken::Data::Data(KuduTable* table,
                           ScanTokenPB message,
@@ -164,6 +165,9 @@ Status KuduScanToken::Data::PBIntoScanner(KuduClient* client,
       case ReadMode::READ_AT_SNAPSHOT:
         RETURN_NOT_OK(scan_builder->SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
         break;
+      case ReadMode::READ_YOUR_WRITES:
+        RETURN_NOT_OK(scan_builder->SetReadMode(KuduScanner::READ_YOUR_WRITES));
+        break;
       default:
         return Status::InvalidArgument("scan token has unrecognized read mode");
     }
@@ -179,12 +183,26 @@ Status KuduScanToken::Data::PBIntoScanner(KuduClient* client,
 
   RETURN_NOT_OK(scan_builder->SetCacheBlocks(message.cache_blocks()));
 
+  // Since the latest observed timestamp from the given client might be
+  // more recent than the one when the token is created, the performance
+  // of the scan could be affected if using READ_YOUR_WRITES mode.
+  //
+  // We choose to keep it this way because the code path is simpler.
+  // Beside, in practice it's very rarely the case that an active client
+  // is permanently being written to and read from (using scan tokens).
+  //
+  // However it is worth to note that this is a possible optimization, if
+  // we ever notice READ_YOUR_WRITES read stalling with scan tokens.
   if (message.has_propagated_timestamp()) {
     client->data_->UpdateLatestObservedTimestamp(message.propagated_timestamp());
   }
 
   if (message.has_batch_size_bytes()) {
     RETURN_NOT_OK(scan_builder->SetBatchSizeBytes(message.batch_size_bytes()));
+  }
+
+  if (message.has_scan_request_timeout_ms()) {
+    scan_builder->SetTimeoutMillis(message.scan_request_timeout_ms());
   }
 
   *scanner = scan_builder.release();
@@ -234,14 +252,21 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
     case KuduScanner::READ_LATEST:
       pb.set_read_mode(kudu::READ_LATEST);
       if (configuration_.has_snapshot_timestamp()) {
-        LOG(WARNING) << "Ignoring snapshot timestamp since not in "
-                        "READ_AT_SNAPSHOT mode.";
+        return Status::InvalidArgument("Snapshot timestamp should only be configured "
+                                       "for READ_AT_SNAPSHOT scan mode.");
       }
       break;
     case KuduScanner::READ_AT_SNAPSHOT:
       pb.set_read_mode(kudu::READ_AT_SNAPSHOT);
       if (configuration_.has_snapshot_timestamp()) {
         pb.set_snap_timestamp(configuration_.snapshot_timestamp());
+      }
+      break;
+    case KuduScanner::READ_YOUR_WRITES:
+      pb.set_read_mode(kudu::READ_YOUR_WRITES);
+      if (configuration_.has_snapshot_timestamp()) {
+        return Status::InvalidArgument("Snapshot timestamp should only be configured "
+                                       "for READ_AT_SNAPSHOT scan mode.");
       }
       break;
     default:
@@ -251,6 +276,7 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
   pb.set_cache_blocks(configuration_.spec().cache_blocks());
   pb.set_fault_tolerant(configuration_.is_fault_tolerant());
   pb.set_propagated_timestamp(client->GetLatestObservedTimestamp());
+  pb.set_scan_request_timeout_ms(configuration_.timeout().ToMilliseconds());
 
   if (configuration_.has_batch_size_bytes()) {
     pb.set_batch_size_bytes(configuration_.batch_size_bytes());
@@ -264,12 +290,12 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
     scoped_refptr<internal::RemoteTablet> tablet;
     Synchronizer sync;
     const string& partition_key = pruner.NextPartitionKey();
-    client->data_->meta_cache_->LookupTabletByKeyOrNext(table,
-                                                        partition_key,
-                                                        deadline,
-                                                        &tablet,
-                                                        sync.AsStatusCallback(),
-                                                        internal::kFetchTabletsPerRangeLookup);
+    client->data_->meta_cache_->LookupTabletByKey(table,
+                                                  partition_key,
+                                                  deadline,
+                                                  MetaCache::LookupType::kLowerBound,
+                                                  &tablet,
+                                                  sync.AsStatusCallback());
     Status s = sync.Wait();
     if (s.IsNotFound()) {
       // No more tablets in the table.

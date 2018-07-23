@@ -39,7 +39,6 @@
 #include "kudu/consensus/raft_consensus.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/result_tracker.h"
@@ -132,9 +131,8 @@ TabletReplica::TabletReplica(
 }
 
 TabletReplica::~TabletReplica() {
-  // We should either have called Shutdown(), or we should have never called
-  // Init().
-  CHECK(!tablet_)
+  // We are required to call Shutdown() before destroying a TabletReplica.
+  CHECK(state_ == SHUTDOWN || state_ == FAILED)
       << "TabletReplica not fully shut down. State: "
       << TabletStatePB_Name(state_);
 }
@@ -142,6 +140,7 @@ TabletReplica::~TabletReplica() {
 Status TabletReplica::Init(ThreadPool* raft_pool) {
   CHECK_EQ(NOT_INITIALIZED, state_);
   TRACE("Creating consensus instance");
+  SetStatusMessage("Initializing consensus...");
   ConsensusOptions options;
   options.tablet_id = meta_->tablet_id();
   shared_ptr<RaftConsensus> consensus;
@@ -152,6 +151,7 @@ Status TabletReplica::Init(ThreadPool* raft_pool) {
                                       &consensus));
   consensus_ = std::move(consensus);
   set_state(INITIALIZED);
+  SetStatusMessage("Initialized. Waiting to start...");
   return Status::OK();
 }
 

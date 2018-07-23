@@ -312,22 +312,24 @@ class PeriodicWebUIChecker {
     // List of master and ts web pages to fetch
     std::vector<std::string> master_pages, ts_pages;
 
-    master_pages.emplace_back("/metrics");
-    master_pages.emplace_back("/masters");
-    master_pages.emplace_back("/tables");
     master_pages.emplace_back("/dump-entities");
-    master_pages.emplace_back("/tablet-servers");
+    master_pages.emplace_back("/masters");
     master_pages.emplace_back("/mem-trackers");
+    master_pages.emplace_back("/metrics");
+    master_pages.emplace_back("/stacks");
+    master_pages.emplace_back("/tables");
+    master_pages.emplace_back("/tablet-servers");
 
+    ts_pages.emplace_back("/maintenance-manager");
+    ts_pages.emplace_back("/mem-trackers");
     ts_pages.emplace_back("/metrics");
+    ts_pages.emplace_back("/scans");
+    ts_pages.emplace_back("/stacks");
     ts_pages.emplace_back("/tablets");
     if (!tablet_id.empty()) {
       ts_pages.push_back(strings::Substitute("/transactions?tablet_id=$0",
                                              tablet_id));
     }
-    ts_pages.emplace_back("/maintenance-manager");
-    ts_pages.emplace_back("/mem-trackers");
-    ts_pages.emplace_back("/scans");
 
     // Generate list of urls for each master and tablet server
     for (int i = 0; i < cluster.num_masters(); i++) {
@@ -361,6 +363,8 @@ class PeriodicWebUIChecker {
  private:
   void CheckThread() {
     EasyCurl curl;
+    // Set some timeout so that if the page deadlocks, we fail the test.
+    curl.set_timeout(MonoDelta::FromSeconds(120));
     faststring dst;
     LOG(INFO) << "Curl thread will poll the following URLs every " << period_.ToMilliseconds()
         << " ms: ";
@@ -370,10 +374,16 @@ class PeriodicWebUIChecker {
     while (is_running_.Load()) {
       // Poll all of the URLs.
       const MonoTime start = MonoTime::Now();
+      bool compression_enabled = true;
       for (const auto& url : urls_) {
-        if (curl.FetchURL(url, &dst).ok()) {
+        // Switch compression back and forth.
+        Status s = compression_enabled ? curl.FetchURL(url, &dst, {"Accept-Encoding: gzip"})
+                                       : curl.FetchURL(url, &dst);
+        compression_enabled = !compression_enabled;
+        if (s.ok()) {
           CHECK_GT(dst.length(), 0);
         }
+        CHECK(!s.IsTimedOut()) << "timed out fetching url " << url;
       }
       // Sleep until the next period
       const MonoDelta elapsed = MonoTime::Now() - start;

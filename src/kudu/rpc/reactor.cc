@@ -148,7 +148,7 @@ Status ReactorThread::Init() {
   DVLOG(6) << "Called ReactorThread::Init()";
   // Register to get async notifications in our epoll loop.
   async_.set(loop_);
-  async_.set<ReactorThread, &ReactorThread::AsyncHandler>(this);
+  async_.set<ReactorThread, &ReactorThread::AsyncHandler>(this); // NOLINT(*)
   async_.start();
 
   // Register the timer watcher.
@@ -179,7 +179,7 @@ void ReactorThread::InvokePendingCb(struct ev_loop* loop) {
   // Contribute this to our histogram.
   ReactorThread* thr = static_cast<ReactorThread*>(ev_userdata(loop));
   if (thr->invoke_us_histogram_) {
-    thr->invoke_us_histogram_->Increment(dur_cycles * 1e6 / base::CyclesPerSecond());
+    thr->invoke_us_histogram_->Increment(dur_cycles * 1000000 / base::CyclesPerSecond());
   }
 }
 
@@ -243,13 +243,20 @@ void ReactorThread::ShutdownInternal() {
   // These won't be found in the ReactorThread's list of pending tasks
   // because they've been "run" (that is, they've been scheduled).
   Status aborted = ShutdownError(true); // aborted
-  for (DelayedTask* task : scheduled_tasks_) {
-    task->Abort(aborted); // should also free the task.
+  while (!scheduled_tasks_.empty()) {
+    DelayedTask* t = &scheduled_tasks_.front();
+    scheduled_tasks_.pop_front();
+    t->Abort(aborted); // should also free the task.
   }
-  scheduled_tasks_.clear();
 
   // Remove the OpenSSL thread state.
+  //
+  // As of OpenSSL 1.1, this [1] is a no-op and can be ignored.
+  //
+  // 1. https://www.openssl.org/docs/man1.1.0/crypto/ERR_remove_thread_state.html
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
   ERR_remove_thread_state(nullptr);
+#endif
 }
 
 ReactorTask::ReactorTask() {
@@ -675,14 +682,15 @@ DelayedTask::DelayedTask(boost::function<void(const Status&)> func,
 void DelayedTask::Run(ReactorThread* thread) {
   DCHECK(thread_ == nullptr) << "Task has already been scheduled";
   DCHECK(thread->IsCurrentThread());
+  DCHECK(!is_linked()) << "Should not be linked on pending_tasks_ anymore";
 
   // Schedule the task to run later.
   thread_ = thread;
   timer_.set(thread->loop_);
-  timer_.set<DelayedTask, &DelayedTask::TimerHandler>(this);
+  timer_.set<DelayedTask, &DelayedTask::TimerHandler>(this); // NOLINT(*)
   timer_.start(when_.ToSeconds(), // after
                0);                // repeat
-  thread_->scheduled_tasks_.insert(this);
+  thread_->scheduled_tasks_.push_back(*this);
 }
 
 void DelayedTask::Abort(const Status& abort_status) {
@@ -690,9 +698,10 @@ void DelayedTask::Abort(const Status& abort_status) {
   delete this;
 }
 
-void DelayedTask::TimerHandler(ev::timer& watcher, int revents) {
+void DelayedTask::TimerHandler(ev::timer& /*watcher*/, int revents) {
+  DCHECK(is_linked()) << "should be linked on scheduled_tasks_";
   // We will free this task's memory.
-  thread_->scheduled_tasks_.erase(this);
+  thread_->scheduled_tasks_.erase(thread_->scheduled_tasks_.iterator_to(*this));
 
   if (EV_ERROR & revents) {
     string msg = "Delayed task got an error in its timer handler";

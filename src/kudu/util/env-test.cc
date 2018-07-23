@@ -27,6 +27,8 @@
 #define FALLOC_FL_PUNCH_HOLE  0x02 /* de-allocates range */
 #endif
 
+#include "kudu/util/env.h"
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -48,13 +50,13 @@
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/bind.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
 #include "kudu/util/array_view.h" // IWYU pragma: keep
-#include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
@@ -105,16 +107,18 @@ class TestEnv : public KuduTest {
     if (checked) return;
 
 #if defined(__linux__)
-    int fd = creat(GetTestPath("check-fallocate").c_str(), S_IWUSR);
-    PCHECK(fd >= 0);
-    int err = fallocate(fd, 0, 0, 4096);
+    int fd;
+    RETRY_ON_EINTR(fd, creat(GetTestPath("check-fallocate").c_str(), S_IWUSR));
+    CHECK_ERR(fd);
+    int err;
+    RETRY_ON_EINTR(err, fallocate(fd, 0, 0, 4096));
     if (err != 0) {
       PCHECK(errno == ENOTSUP);
     } else {
       fallocate_supported_ = true;
 
-      err = fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
-                      1024, 1024);
+      RETRY_ON_EINTR(err, fallocate(fd, FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+                                    1024, 1024));
       if (err != 0) {
         PCHECK(errno == ENOTSUP);
       } else {
@@ -122,7 +126,7 @@ class TestEnv : public KuduTest {
       }
     }
 
-    close(fd);
+    RETRY_ON_EINTR(err, close(fd));
 #endif
 
     checked = true;
@@ -664,12 +668,27 @@ TEST_F(TestEnv, TestIsDirectory) {
   ASSERT_FALSE(is_dir);
 }
 
-// Regression test for KUDU-1776.
-TEST_F(TestEnv, TestIncreaseOpenFileLimit) {
-  int64_t limit_before = env_->GetOpenFileLimit();
-  env_->IncreaseOpenFileLimit();
-  int64_t limit_after = env_->GetOpenFileLimit();
-  ASSERT_GE(limit_after, limit_before) << "Failed to retain/increase open file limit";
+class ResourceLimitTypeTest : public TestEnv,
+                              public ::testing::WithParamInterface<Env::ResourceLimitType> {};
+
+INSTANTIATE_TEST_CASE_P(ResourceLimitTypes,
+                        ResourceLimitTypeTest,
+                        ::testing::Values(Env::ResourceLimitType::OPEN_FILES_PER_PROCESS,
+                                          Env::ResourceLimitType::RUNNING_THREADS_PER_EUID));
+
+// Regression test for KUDU-1798.
+TEST_P(ResourceLimitTypeTest, TestIncreaseLimit) {
+  // Increase the resource limit. It should either increase or remain the same.
+  Env::ResourceLimitType t = GetParam();
+  int64_t limit_before = env_->GetResourceLimit(t);
+  env_->IncreaseResourceLimit(t);
+  int64_t limit_after = env_->GetResourceLimit(t);
+  ASSERT_GE(limit_after, limit_before);
+
+  // Try again. It should definitely be the same now.
+  env_->IncreaseResourceLimit(t);
+  int64_t limit_after_again = env_->GetResourceLimit(t);
+  ASSERT_EQ(limit_after, limit_after_again);
 }
 
 static Status TestWalkCb(unordered_set<string>* actual,

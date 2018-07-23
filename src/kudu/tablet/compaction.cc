@@ -42,7 +42,6 @@
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -91,9 +90,12 @@ class MemRowSetCompactionInput : public CompactionInput {
   MemRowSetCompactionInput(const MemRowSet& memrowset,
                            const MvccSnapshot& snap,
                            const Schema* projection)
-    : iter_(memrowset.NewIterator(projection, snap)),
-      arena_(32*1024),
+    : arena_(32*1024),
       has_more_blocks_(false) {
+    RowIteratorOptions opts;
+    opts.projection = projection;
+    opts.snap_to_include = snap;
+    iter_.reset(memrowset.NewIterator(opts));
   }
 
   Status Init() override {
@@ -857,15 +859,20 @@ Status CompactionInput::Create(const DiskRowSet &rowset,
   gscoped_ptr<RowwiseIterator> base_iter(new MaterializingIterator(base_cwise));
 
   // Creates a DeltaIteratorMerger that will only include the relevant REDO deltas.
+  RowIteratorOptions redo_opts;
+  redo_opts.projection = projection;
+  redo_opts.snap_to_include = snap;
   unique_ptr<DeltaIterator> redo_deltas;
   RETURN_NOT_OK_PREPEND(rowset.delta_tracker_->NewDeltaIterator(
-      projection, snap, DeltaTracker::REDOS_ONLY, &redo_deltas), "Could not open REDOs");
+      redo_opts, DeltaTracker::REDOS_ONLY, &redo_deltas), "Could not open REDOs");
   // Creates a DeltaIteratorMerger that will only include UNDO deltas. Using the
   // "empty" snapshot ensures that all deltas are included.
+  RowIteratorOptions undo_opts;
+  undo_opts.projection = projection;
+  undo_opts.snap_to_include = MvccSnapshot::CreateSnapshotIncludingNoTransactions();
   unique_ptr<DeltaIterator> undo_deltas;
   RETURN_NOT_OK_PREPEND(rowset.delta_tracker_->NewDeltaIterator(
-      projection, MvccSnapshot::CreateSnapshotIncludingNoTransactions(),
-      DeltaTracker::UNDOS_ONLY, &undo_deltas), "Could not open UNDOs");
+      undo_opts, DeltaTracker::UNDOS_ONLY, &undo_deltas), "Could not open UNDOs");
 
   out->reset(new DiskRowSetCompactionInput(std::move(base_iter),
                                            std::move(redo_deltas),
@@ -1188,10 +1195,10 @@ Status ReupdateMissedDeltas(const string &tablet_name,
   VLOG(1) << "Reupdating missed deltas between snapshot " <<
     snap_to_exclude.ToString() << " and " << snap_to_include.ToString();
 
-  // Collect the delta trackers that we'll push the updates into.
-  deque<DeltaTracker *> delta_trackers;
+  // Collect the disk rowsets that we'll push the updates into.
+  deque<DiskRowSet *> diskrowsets;
   for (const shared_ptr<RowSet> &rs : output_rowsets) {
-    delta_trackers.push_back(down_cast<DiskRowSet *>(rs.get())->delta_tracker());
+    diskrowsets.push_back(down_cast<DiskRowSet *>(rs.get()));
   }
 
   // The set of updated delta trackers.
@@ -1285,25 +1292,30 @@ Status ReupdateMissedDeltas(const string &tablet_name,
         DVLOG(3) << "Flushing missed delta for row " << output_row_offset
                  << " @" << mut->timestamp() << ": " << mut->changelist().ToString(*schema);
 
-        DeltaTracker *cur_tracker = delta_trackers.front();
+        rowid_t num_rows;
+        DiskRowSet* cur_drs = diskrowsets.front();
+        RETURN_NOT_OK(cur_drs->CountRows(&num_rows));
 
         // The index on the input side isn't necessarily the index on the output side:
         // we may have output several small DiskRowSets, so we need to find the index
         // relative to the current one.
         int64_t idx_in_delta_tracker = output_row_offset - delta_tracker_base_row;
-        while (idx_in_delta_tracker >= cur_tracker->num_rows()) {
+        while (idx_in_delta_tracker >= num_rows) {
           // If the current index is higher than the total number of rows in the current
           // DeltaTracker, that means we're now processing the next one in the list.
           // Pop the current front tracker, and make the indexes relative to the next
           // in the list.
-          delta_tracker_base_row += cur_tracker->num_rows();
-          idx_in_delta_tracker -= cur_tracker->num_rows();
+          delta_tracker_base_row += num_rows;
+          idx_in_delta_tracker -= num_rows;
           DCHECK_GE(idx_in_delta_tracker, 0);
-          delta_trackers.pop_front();
-          cur_tracker = delta_trackers.front();
+          diskrowsets.pop_front();
+          cur_drs = diskrowsets.front();
+          RETURN_NOT_OK(cur_drs->CountRows(&num_rows));
         }
 
+        DeltaTracker* cur_tracker = cur_drs->delta_tracker();
         gscoped_ptr<OperationResultPB> result(new OperationResultPB);
+        DCHECK_LT(idx_in_delta_tracker, num_rows);
         Status s = cur_tracker->Update(mut->timestamp(),
                                        idx_in_delta_tracker,
                                        mut->changelist(),

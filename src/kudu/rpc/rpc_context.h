@@ -70,7 +70,7 @@ class RpcContext {
   RpcContext(InboundCall *call,
              const google::protobuf::Message *request_pb,
              google::protobuf::Message *response_pb,
-             const scoped_refptr<ResultTracker>& result_tracker);
+             scoped_refptr<ResultTracker> result_tracker);
 
   ~RpcContext();
 
@@ -203,6 +203,9 @@ class RpcContext {
   // account for transmission delays between the client and the server.
   // If the client did not specify a deadline, returns MonoTime::Max().
   MonoTime GetClientDeadline() const;
+
+  // Return the time when the inbound call was received.
+  MonoTime GetTimeReceived() const;
 
   // Whether the results of this RPC are tracked with a ResultTracker.
   // If this returns true, both result_tracker() and request_id() should return non-null results.

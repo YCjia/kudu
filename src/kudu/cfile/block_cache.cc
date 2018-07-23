@@ -15,19 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/cfile/block_cache.h"
+
+#include <cstddef>
+#include <cstdint>
 #include <ostream>
 #include <string>
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
-#include "kudu/cfile/block_cache.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
+#include "kudu/util/process_memory.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/string_case.h"
 
 DEFINE_int64(block_cache_capacity_mb, 512, "block cache capacity in MB");
 TAG_FLAG(block_cache_capacity_mb, stable);
+
+// Yes, it's strange: the default value is 'true' but that's intentional.
+// The idea is to avoid the corresponding group flag validator striking
+// while running anything but master and tserver. As for the master and tserver,
+// those have the default value for this flag set to 'false'.
+DEFINE_bool(force_block_cache_capacity, true,
+            "Force Kudu to accept the block cache size, even if it is unsafe.");
+TAG_FLAG(force_block_cache_capacity, unsafe);
+TAG_FLAG(force_block_cache_capacity, hidden);
 
 DEFINE_string(block_cache_type, "DRAM",
               "Which type of block cache to use for caching data. "
@@ -35,6 +53,8 @@ DEFINE_string(block_cache_type, "DRAM",
               "caches data in regular memory. 'NVM' caches data "
               "in a memory-mapped file using the NVML library.");
 TAG_FLAG(block_cache_type, experimental);
+
+using strings::Substitute;
 
 template <class T> class scoped_refptr;
 
@@ -47,20 +67,55 @@ namespace cfile {
 namespace {
 
 Cache* CreateCache(int64_t capacity) {
-  CacheType t;
-  ToUpperCase(FLAGS_block_cache_type, &FLAGS_block_cache_type);
-  if (FLAGS_block_cache_type == "NVM") {
-    t = NVM_CACHE;
-  } else if (FLAGS_block_cache_type == "DRAM") {
-    t = DRAM_CACHE;
-  } else {
-    LOG(FATAL) << "Unknown block cache type: '" << FLAGS_block_cache_type
-               << "' (expected 'DRAM' or 'NVM')";
-  }
+  CacheType t = BlockCache::GetConfiguredCacheTypeOrDie();
   return NewLRUCache(t, capacity, "block_cache");
 }
 
+// Validates the block cache capacity won't permit the cache to grow large enough
+// to cause pernicious flushing behavior. See KUDU-2318.
+bool ValidateBlockCacheCapacity() {
+  if (FLAGS_force_block_cache_capacity) {
+    return true;
+  }
+  int64_t capacity = FLAGS_block_cache_capacity_mb * 1024 * 1024;
+  int64_t mpt = process_memory::MemoryPressureThreshold();
+  if (capacity > mpt) {
+    LOG(ERROR) << Substitute("Block cache capacity exceeds the memory pressure "
+                             "threshold ($0 bytes vs. $1 bytes). This will "
+                             "cause instability and harmful flushing behavior. "
+                             "Lower --block_cache_capacity_mb or raise "
+                             "--memory_limit_hard_bytes.",
+                             capacity, mpt);
+    return false;
+  }
+  if (capacity > mpt / 2) {
+    LOG(WARNING) << Substitute("Block cache capacity exceeds 50% of the memory "
+                               "pressure threshold ($0 bytes vs. 50% of $1 bytes). "
+                               "This may cause performance problems. Consider "
+                               "lowering --block_cache_capacity_mb or raising "
+                               "--memory_limit_hard_bytes.",
+                               capacity, mpt);
+  }
+  return true;
+}
+
 } // anonymous namespace
+
+GROUP_FLAG_VALIDATOR(block_cache_capacity_mb, ValidateBlockCacheCapacity);
+
+CacheType BlockCache::GetConfiguredCacheTypeOrDie() {
+    ToUpperCase(FLAGS_block_cache_type, &FLAGS_block_cache_type);
+  if (FLAGS_block_cache_type == "NVM") {
+    return NVM_CACHE;
+  }
+  if (FLAGS_block_cache_type == "DRAM") {
+    return DRAM_CACHE;
+  }
+
+  LOG(FATAL) << "Unknown block cache type: '" << FLAGS_block_cache_type
+             << "' (expected 'DRAM' or 'NVM')";
+  __builtin_unreachable();
+}
 
 BlockCache::BlockCache()
   : BlockCache(FLAGS_block_cache_capacity_mb * 1024 * 1024) {
@@ -70,10 +125,9 @@ BlockCache::BlockCache(size_t capacity)
   : cache_(CreateCache(capacity)) {
 }
 
-BlockCache::PendingEntry BlockCache::Allocate(const CacheKey& key, size_t val_size) {
+BlockCache::PendingEntry BlockCache::Allocate(const CacheKey& key, size_t block_size) {
   Slice key_slice(reinterpret_cast<const uint8_t*>(&key), sizeof(key));
-  int charge = val_size;
-  return PendingEntry(cache_.get(), cache_->Allocate(key_slice, val_size, charge));
+  return PendingEntry(cache_.get(), cache_->Allocate(key_slice, block_size));
 }
 
 bool BlockCache::Lookup(const CacheKey& key, Cache::CacheBehavior behavior,

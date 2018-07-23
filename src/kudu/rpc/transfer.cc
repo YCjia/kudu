@@ -19,8 +19,10 @@
 
 #include <sys/uio.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <set>
 
 #include <gflags/gflags.h>
@@ -34,17 +36,22 @@
 #include "kudu/util/logging.h"
 #include "kudu/util/net/socket.h"
 
-DEFINE_int32(rpc_max_message_size, (50 * 1024 * 1024),
+DEFINE_int64(rpc_max_message_size, (50 * 1024 * 1024),
              "The maximum size of a message that any RPC that the server will accept. "
              "Must be at least 1MB.");
 TAG_FLAG(rpc_max_message_size, advanced);
 TAG_FLAG(rpc_max_message_size, runtime);
 
-static bool ValidateMaxMessageSize(const char* flagname, int32_t value) {
+static bool ValidateMaxMessageSize(const char* flagname, int64_t value) {
   if (value < 1 * 1024 * 1024) {
     LOG(ERROR) << flagname << " must be at least 1MB.";
     return false;
   }
+  if (value > std::numeric_limits<int32_t>::max()) {
+    LOG(ERROR) << flagname << " must be less than "
+               << std::numeric_limits<int32_t>::max() << " bytes.";
+  }
+
   return true;
 }
 static bool dummy = google::RegisterFlagValidator(
@@ -58,13 +65,16 @@ using std::set;
 using std::string;
 using strings::Substitute;
 
-#define RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status) \
-  if (PREDICT_FALSE(!status.ok())) {                            \
-    if (Socket::IsTemporarySocketError(status.posix_code())) {  \
-      return Status::OK(); /* EAGAIN, etc. */                   \
-    }                                                           \
-    return status;                                              \
-  }
+#define RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status)               \
+  do {                                                            \
+    Status _s = (status);                                         \
+    if (PREDICT_FALSE(!_s.ok())) {                                \
+      if (Socket::IsTemporarySocketError(_s.posix_code())) {      \
+        return Status::OK(); /* EAGAIN, etc. */                   \
+      }                                                           \
+      return _s;                                                  \
+    }                                                             \
+  } while (0)
 
 TransferCallbacks::~TransferCallbacks()
 {}
@@ -77,7 +87,7 @@ InboundTransfer::InboundTransfer()
 
 Status InboundTransfer::ReceiveBuffer(Socket &socket) {
   if (cur_offset_ < kMsgLengthPrefixLength) {
-    // receive int32 length prefix
+    // receive uint32 length prefix
     int32_t rem = kMsgLengthPrefixLength - cur_offset_;
     int32_t nread;
     Status status = socket.Recv(&buf_[cur_offset_], rem, &nread);
@@ -116,7 +126,13 @@ Status InboundTransfer::ReceiveBuffer(Socket &socket) {
 
   // receive message body
   int32_t nread;
-  int32_t rem = total_length_ - cur_offset_;
+
+  // Socket::Recv() handles at most INT_MAX at a time, so cap the remainder at
+  // INT_MAX. The message will be split across multiple Recv() calls.
+  // Note that this is only needed when rpc_max_message_size > INT_MAX, which is
+  // currently only used for unit tests.
+  int32_t rem = std::min(total_length_ - cur_offset_,
+      static_cast<uint32_t>(std::numeric_limits<int32_t>::max()));
   Status status = socket.Recv(&buf_[cur_offset_], rem, &nread);
   RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status);
   cur_offset_ += nread;
@@ -157,6 +173,7 @@ OutboundTransfer::OutboundTransfer(int32_t call_id,
     cur_offset_in_slice_(0),
     callbacks_(callbacks),
     call_id_(call_id),
+    started_(false),
     aborted_(false) {
 
   n_payload_slices_ = n_payload_slices;
@@ -183,6 +200,7 @@ void OutboundTransfer::Abort(const Status &status) {
 Status OutboundTransfer::SendBuffer(Socket &socket) {
   CHECK_LT(cur_slice_idx_, n_payload_slices_);
 
+  started_ = true;
   int n_iovecs = n_payload_slices_ - cur_slice_idx_;
   struct iovec iovec[n_iovecs];
   {
@@ -196,7 +214,7 @@ Status OutboundTransfer::SendBuffer(Socket &socket) {
     }
   }
 
-  int32_t written;
+  int64_t written;
   Status status = socket.Writev(iovec, n_iovecs, &written);
   RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status);
 
@@ -230,7 +248,7 @@ Status OutboundTransfer::SendBuffer(Socket &socket) {
 }
 
 bool OutboundTransfer::TransferStarted() const {
-  return cur_offset_in_slice_ != 0 || cur_slice_idx_ != 0;
+  return started_;
 }
 
 bool OutboundTransfer::TransferFinished() const {

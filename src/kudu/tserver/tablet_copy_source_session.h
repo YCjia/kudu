@@ -97,7 +97,7 @@ struct ImmutableReadableBlockInfo {
 // on expiration while it is in use by another thread.
 class TabletCopySourceSession : public RefCountedThreadSafe<TabletCopySourceSession> {
  public:
-  TabletCopySourceSession(const scoped_refptr<tablet::TabletReplica>& tablet_replica,
+  TabletCopySourceSession(scoped_refptr<tablet::TabletReplica> tablet_replica,
                           std::string session_id,
                           std::string requestor_uuid,
                           FsManager* fs_manager,
@@ -116,6 +116,9 @@ class TabletCopySourceSession : public RefCountedThreadSafe<TabletCopySourceSess
 
   // Return ID of tablet corresponding to this session.
   const std::string& tablet_id() const;
+
+  // Return ID of session.
+  const std::string& session_id() const { return session_id_; }
 
   // Return UUID of the requestor that initiated this session.
   const std::string& requestor_uuid() const;

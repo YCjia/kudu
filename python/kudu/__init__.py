@@ -27,8 +27,10 @@ from kudu.client import (Client, Table, Scanner, Session,  # noqa
                          FLUSH_MANUAL,
                          READ_LATEST,
                          READ_AT_SNAPSHOT,
+                         READ_YOUR_WRITES,
                          EXCLUSIVE_BOUND,
-                         INCLUSIVE_BOUND)
+                         INCLUSIVE_BOUND,
+                         CLIENT_SUPPORTS_DECIMAL)
 
 from kudu.errors import (KuduException, KuduBadStatus, KuduNotFound,  # noqa
                          KuduNotSupported,
@@ -36,7 +38,7 @@ from kudu.errors import (KuduException, KuduBadStatus, KuduNotFound,  # noqa
 
 from kudu.schema import (int8, int16, int32, int64, string_ as string,  # noqa
                          double_ as double, float_, float_ as float, binary,
-                         unixtime_micros, bool_ as bool,
+                         unixtime_micros, bool_ as bool, decimal,
                          KuduType,
                          SchemaBuilder, ColumnSpec, Schema, ColumnSchema,
                          COMPRESSION_DEFAULT,

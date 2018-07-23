@@ -94,6 +94,8 @@ using master::ListTabletServersResponsePB;
 using master::MasterErrorPB;
 using master::MasterFeatures;
 using master::MasterServiceProxy;
+using master::ReplaceTabletRequestPB;
+using master::ReplaceTabletResponsePB;
 using master::TableIdentifierPB;
 using pb_util::SecureShortDebugString;
 using rpc::CredentialsPolicy;
@@ -291,7 +293,7 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
   }
 }
 
-// Explicit specialization for callers outside this compilation unit.
+// Explicit specializations for callers outside this compilation unit.
 template
 Status KuduClient::Data::SyncLeaderMasterRpc(
     const MonoTime& deadline,
@@ -338,6 +340,18 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     const boost::function<Status(MasterServiceProxy*,
                                  const ListMastersRequestPB&,
                                  ListMastersResponsePB*,
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags);
+template
+Status KuduClient::Data::SyncLeaderMasterRpc(
+    const MonoTime& deadline,
+    KuduClient* client,
+    const ReplaceTabletRequestPB& req,
+    ReplaceTabletResponsePB* resp,
+    const char* func_name,
+    const boost::function<Status(MasterServiceProxy*,
+                                 const ReplaceTabletRequestPB&,
+                                 ReplaceTabletResponsePB*,
                                  RpcController*)>& func,
     vector<uint32_t> required_feature_flags);
 
@@ -689,6 +703,7 @@ void KuduClient::Data::ConnectedToClusterCb(
     if (status.ok()) {
       leader_master_hostport_ = HostPort(leader_hostname, leader_addr.port());
       master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr, leader_hostname));
+      master_proxy_->set_user_credentials(user_credentials_);
     }
   }
 
@@ -785,6 +800,7 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
         deadline,
         client->default_rpc_timeout(),
         messenger_,
+        user_credentials_,
         creds_policy));
 
     if (creds_policy == CredentialsPolicy::PRIMARY_CREDENTIALS) {

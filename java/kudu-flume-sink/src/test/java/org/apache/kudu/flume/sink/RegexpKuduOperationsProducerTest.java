@@ -18,12 +18,14 @@
  */
 package org.apache.kudu.flume.sink;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.MASTER_ADDRESSES;
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.PRODUCER;
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.PRODUCER_PREFIX;
 import static org.apache.kudu.flume.sink.KuduSinkConfigurationConstants.TABLE_NAME;
 import static org.apache.kudu.flume.sink.RegexpKuduOperationsProducer.OPERATION_PROP;
 import static org.apache.kudu.flume.sink.RegexpKuduOperationsProducer.PATTERN_PROP;
+import static org.apache.kudu.util.ClientTestUtil.scanTableToStrings;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -41,6 +43,7 @@ import org.apache.flume.Transaction;
 import org.apache.flume.channel.MemoryChannel;
 import org.apache.flume.conf.Configurables;
 import org.apache.flume.event.EventBuilder;
+import org.apache.kudu.util.DecimalUtil;
 import org.junit.Test;
 
 import org.apache.kudu.ColumnSchema;
@@ -54,7 +57,7 @@ public class RegexpKuduOperationsProducerTest extends BaseKuduTest {
   private static final String TEST_REGEXP =
       "(?<key>\\d+),(?<byteFld>\\d+),(?<shortFld>\\d+),(?<intFld>\\d+)," +
       "(?<longFld>\\d+),(?<binaryFld>\\w+),(?<stringFld>\\w+),(?<boolFld>\\w+)," +
-      "(?<floatFld>\\d+\\.\\d*),(?<doubleFld>\\d+.\\d*)";
+      "(?<floatFld>\\d+\\.\\d*),(?<doubleFld>\\d+.\\d*),(?<decimalFld>\\d+.\\d*)";
 
   private KuduTable createNewTable(String tableName) throws Exception {
     ArrayList<ColumnSchema> columns = new ArrayList<>(10);
@@ -68,6 +71,8 @@ public class RegexpKuduOperationsProducerTest extends BaseKuduTest {
     columns.add(new ColumnSchema.ColumnSchemaBuilder("boolFld", Type.BOOL).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("floatFld", Type.FLOAT).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("doubleFld", Type.DOUBLE).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("decimalFld", Type.DECIMAL)
+        .typeAttributes(DecimalUtil.typeAttributes(9, 1)).build());
     CreateTableOptions createOptions =
         new CreateTableOptions().addHashPartitions(ImmutableList.of("key"), 3).setNumReplicas(1);
     KuduTable table = createTable(tableName, new Schema(columns), createOptions);
@@ -127,11 +132,11 @@ public class RegexpKuduOperationsProducerTest extends BaseKuduTest {
       StringBuilder payload = new StringBuilder();
       for (int j = 0; j < perEventRowCount; j++) {
         String baseRow = "|1%1$d%2$d1,%1$d,%1$d,%1$d,%1$d,binary," +
-            "string,false,%1$d.%1$d,%1$d.%1$d,%1$d|";
+            "string,false,%1$d.%1$d,%1$d.%1$d,%1$d.%1$d,%1$d|";
         String row = String.format(baseRow, i, j);
         payload.append(row);
       }
-      Event e = EventBuilder.withBody(payload.toString().getBytes());
+      Event e = EventBuilder.withBody(payload.toString().getBytes(UTF_8));
       channel.put(e);
     }
 
@@ -142,10 +147,10 @@ public class RegexpKuduOperationsProducerTest extends BaseKuduTest {
         StringBuilder upserts = new StringBuilder();
         for (int j = 0; j < perEventRowCount; j++) {
           String row = String.format("|1%2$d%3$d1,%1$d,%1$d,%1$d,%1$d,binary," +
-              "string,false,%1$d.%1$d,%1$d.%1$d,%1$d|", 1, 0, j);
+              "string,false,%1$d.%1$d,%1$d.%1$d,%1$d.%1$d,%1$d|", 1, 0, j);
           upserts.append(row);
         }
-        Event e = EventBuilder.withBody(upserts.toString().getBytes());
+        Event e = EventBuilder.withBody(upserts.toString().getBytes(UTF_8));
         channel.put(e);
       }
 
@@ -154,7 +159,7 @@ public class RegexpKuduOperationsProducerTest extends BaseKuduTest {
       String emptyString = "";
       String[] testCases = {mismatchInInt, emptyString};
       for (String testCase : testCases) {
-        Event e = EventBuilder.withBody(testCase.getBytes());
+        Event e = EventBuilder.withBody(testCase.getBytes(UTF_8));
         channel.put(e);
       }
     }
@@ -181,7 +186,7 @@ public class RegexpKuduOperationsProducerTest extends BaseKuduTest {
         String baseAnswer = "INT32 key=1%2$d%3$d1, INT8 byteFld=%1$d, INT16 shortFld=%1$d, " +
             "INT32 intFld=%1$d, INT64 longFld=%1$d, BINARY binaryFld=\"binary\", " +
             "STRING stringFld=string, BOOL boolFld=false, FLOAT floatFld=%1$d.%1$d, " +
-            "DOUBLE doubleFld=%1$d.%1$d";
+            "DOUBLE doubleFld=%1$d.%1$d, DECIMAL decimalFld(9, 1)=%1$d.%1$d";
         String rightAnswer = String.format(baseAnswer, value, i, j);
         rightAnswers.add(rightAnswer);
       }

@@ -34,6 +34,7 @@ ADD_EXPORTABLE_LIBRARY(master_proto
 
 set(MASTER_SRCS
   catalog_manager.cc
+  hms_notification_log_listener.cc
   master.cc
   master_cert_authority.cc
   master_options.cc
@@ -51,6 +52,7 @@ target_link_libraries(master
   krpc
   kserver
   kudu_common
+  kudu_hms
   kudu_util
   master_proto
   rpc_header_proto
@@ -67,9 +69,11 @@ set(KUDU_TEST_LINK_LIBS
   kudu_client
   kudu_curl_util
   master
-  master_proto)
+  master_proto
+  mini_hms)
 
 ADD_KUDU_TEST(catalog_manager-test)
+ADD_KUDU_TEST(hms_notification_log_listener-test)
 ADD_KUDU_TEST(master-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(mini_master-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(sys_catalog-test RESOURCE_LOCK "master-web-port")

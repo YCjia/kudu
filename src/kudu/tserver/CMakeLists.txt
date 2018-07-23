@@ -132,8 +132,8 @@ target_link_libraries(tserver
   server_process
   tablet
   tablet_copy_proto
-  tserver_proto
   tserver_admin_proto
+  tserver_proto
   tserver_service_proto)
 
 #########################################
@@ -175,7 +175,7 @@ ADD_KUDU_TEST(mini_tablet_server-test)
 ADD_KUDU_TEST(tablet_copy_client-test)
 ADD_KUDU_TEST(tablet_copy_source_session-test)
 ADD_KUDU_TEST(tablet_copy_service-test)
-ADD_KUDU_TEST(tablet_server-test)
+ADD_KUDU_TEST(tablet_server-test PROCESSORS 3)
 ADD_KUDU_TEST(tablet_server-stress-test RUN_SERIAL true)
 ADD_KUDU_TEST(scanners-test)
 ADD_KUDU_TEST(ts_tablet_manager-test)

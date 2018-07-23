@@ -32,6 +32,7 @@
 #include "kudu/client/client.h"
 #include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h"
+#include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
 #include "kudu/consensus/raft_consensus.h"
@@ -39,6 +40,7 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
+#include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
@@ -59,6 +61,7 @@
 #include "kudu/util/test_util.h"
 
 DECLARE_bool(allow_unsafe_replication_factor);
+DECLARE_bool(catalog_manager_evict_excess_replicas);
 DECLARE_bool(catalog_manager_wait_for_new_tablets_to_elect_leader);
 DECLARE_bool(enable_leader_failure_detection);
 DECLARE_bool(raft_prepare_replacement_before_eviction);
@@ -75,6 +78,7 @@ using kudu::cluster::InternalMiniClusterOptions;
 using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::GetConsensusRole;
 using kudu::consensus::HealthReportPB;
+using kudu::consensus::INCLUDE_HEALTH_REPORT;
 using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftConsensus;
 using kudu::consensus::RaftPeerPB;
@@ -86,6 +90,7 @@ using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::tablet::TabletReplica;
 using kudu::tserver::MiniTabletServer;
+using kudu::ClusterVerifier;
 using std::map;
 using std::shared_ptr;
 using std::string;
@@ -213,28 +218,11 @@ TEST_P(FailedTabletsAreReplacedITest, OneReplica) {
     ASSERT_EQ(1, tablet_ids.size());
     tablet_id = tablet_ids[0];
   });
+  work.StopAndJoin();
 
   // Wait until all the replicas are running before failing one arbitrarily.
-  const auto wait_until_running = [&]() {
-    AssertEventually([&]{
-      auto num_replicas_running = 0;
-      for (auto idx = 0; idx < cluster_->num_tablet_servers(); ++idx) {
-        MiniTabletServer* ts = cluster_->mini_tablet_server(idx);
-        scoped_refptr<TabletReplica> replica;
-        Status s = ts->server()->tablet_manager()->GetTabletReplica(tablet_id, &replica);
-        if (s.IsNotFound()) {
-          continue;
-        }
-        ASSERT_OK(s);
-        if (tablet::RUNNING == replica->state()) {
-          ++num_replicas_running;
-        }
-      }
-      ASSERT_EQ(kNumReplicas, num_replicas_running);
-    }, MonoDelta::FromSeconds(60));
-    NO_PENDING_FATALS();
-  };
-  NO_FATALS(wait_until_running());
+  ClusterVerifier v(cluster_.get());
+  NO_FATALS(v.CheckCluster());
 
   {
     // Inject an error into one of replicas. Shutting it down will leave it in
@@ -251,8 +239,7 @@ TEST_P(FailedTabletsAreReplacedITest, OneReplica) {
   }
 
   // Ensure the tablet eventually is replicated.
-  NO_FATALS(wait_until_running());
-  work.StopAndJoin();
+  NO_FATALS(v.CheckCluster());
 }
 INSTANTIATE_TEST_CASE_P(,
                         FailedTabletsAreReplacedITest,
@@ -360,6 +347,7 @@ TEST_F(TsTabletManagerITest, ReportOnReplicaHealthStatus) {
 
   // This test is specific to the 3-4-3 replica management scheme.
   FLAGS_raft_prepare_replacement_before_eviction = true;
+  FLAGS_catalog_manager_evict_excess_replicas = false;
   {
     InternalMiniClusterOptions opts;
     opts.num_tablet_servers = kNumReplicas;
@@ -407,11 +395,16 @@ TEST_F(TsTabletManagerITest, ReportOnReplicaHealthStatus) {
     string leader_uuid;
     for (const auto& replica : tablet_replicas) {
       RaftConsensus* consensus = CHECK_NOTNULL(replica->consensus());
-      ConsensusStatePB cs(consensus->ConsensusState(RaftConsensus::INCLUDE_HEALTH_REPORT));
+      ConsensusStatePB cs;
+      Status s = consensus->ConsensusState(&cs, INCLUDE_HEALTH_REPORT);
+      if (!s.ok()) {
+        ASSERT_TRUE(s.IsIllegalState()) << s.ToString(); // Replica is shut down.
+        continue;
+      }
       if (consensus->peer_uuid() == cs.leader_uuid()) {
         // Only the leader replica has the up-to-date health report.
         leader_uuid = cs.leader_uuid();
-        cstate.Swap(&cs);
+        cstate = std::move(cs);
         break;
       }
     }
@@ -511,7 +504,7 @@ TEST_F(TsTabletManagerITest, ReportOnReplicaHealthStatus) {
       const auto& replica_uuid = e.first;
       SCOPED_TRACE("replica UUID: " + replica_uuid);
       if (replica_uuid == failed_replica_uuid) {
-        ASSERT_EQ(HealthReportPB::FAILED, e.second.overall_health());
+        ASSERT_EQ(HealthReportPB::FAILED_UNRECOVERABLE, e.second.overall_health());
       } else {
         ASSERT_EQ(HealthReportPB::HEALTHY, e.second.overall_health());
       }
@@ -533,7 +526,7 @@ TEST_F(TsTabletManagerITest, ReportOnReplicaHealthStatus) {
       ASSERT_TRUE(peer.has_health_report());
       const HealthReportPB& report(peer.health_report());
       if (uuid == failed_replica_uuid) {
-        EXPECT_EQ(HealthReportPB::FAILED, report.overall_health());
+        EXPECT_EQ(HealthReportPB::FAILED_UNRECOVERABLE, report.overall_health());
       } else {
         EXPECT_EQ(HealthReportPB::HEALTHY, report.overall_health());
       }

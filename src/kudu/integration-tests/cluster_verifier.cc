@@ -29,7 +29,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_verifier.h"
 #include "kudu/integration-tests/log_verifier.h"
-#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_remote.h"
@@ -44,13 +43,11 @@ using std::vector;
 
 namespace kudu {
 
-using cluster::ExternalMiniCluster;
 using cluster::MiniCluster;
 using strings::Substitute;
 using tools::Ksck;
 using tools::KsckCluster;
-using tools::KsckMaster;
-using tools::RemoteKsckMaster;
+using tools::RemoteKsckCluster;
 
 ClusterVerifier::ClusterVerifier(MiniCluster* cluster)
     : cluster_(cluster),
@@ -77,7 +74,7 @@ void ClusterVerifier::CheckCluster() {
   Status s;
   double sleep_time = 0.1;
   while (MonoTime::Now() < deadline) {
-    s = DoKsck();
+    s = RunKsck();
     if (s.ok()) {
       break;
     }
@@ -89,40 +86,30 @@ void ClusterVerifier::CheckCluster() {
   }
   ASSERT_OK(s);
 
-  // TODO(todd): we should support LogVerifier on internal clusters!
-  if (ExternalMiniCluster* emc = dynamic_cast<ExternalMiniCluster*>(cluster_)) {
-    // Verify that the committed op indexes match up across the servers.
-    // We have to use "AssertEventually" here because many tests verify clusters
-    // while they are still running, and the verification can fail spuriously in
-    // the case that
-    LogVerifier lv(emc);
-    AssertEventually([&]() {
-        ASSERT_OK(lv.VerifyCommittedOpIdsMatch());
-      });
-  }
+  LogVerifier lv(cluster_);
+  // Verify that the committed op indexes match up across the servers.  We have
+  // to use "AssertEventually" here because many tests verify clusters while
+  // they are still running, and the verification can fail spuriously in the
+  // case that
+  AssertEventually([&]() {
+    ASSERT_OK(lv.VerifyCommittedOpIdsMatch());
+  });
 }
 
-Status ClusterVerifier::DoKsck() {
+Status ClusterVerifier::RunKsck() {
   vector<string> hp_strs;
   for (const auto& hp : cluster_->master_rpc_addrs()) {
     hp_strs.emplace_back(hp.ToString());
   }
-  std::shared_ptr<KsckMaster> master;
-  RETURN_NOT_OK(RemoteKsckMaster::Build(hp_strs, &master));
-  std::shared_ptr<KsckCluster> cluster(new KsckCluster(master));
+  std::shared_ptr<KsckCluster> cluster;
+  RETURN_NOT_OK(RemoteKsckCluster::Build(hp_strs, &cluster));
   std::shared_ptr<Ksck> ksck(new Ksck(cluster));
 
   // Some unit tests create or remove replicas of tablets, which
   // we shouldn't consider fatal.
   ksck->set_check_replica_count(false);
 
-  // This is required for everything below.
-  RETURN_NOT_OK(ksck->CheckMasterRunning());
-  RETURN_NOT_OK(ksck->FetchTableAndTabletInfo());
-  RETURN_NOT_OK(ksck->FetchInfoFromTabletServers());
-  RETURN_NOT_OK(ksck->CheckTablesConsistency());
-  RETURN_NOT_OK(ksck->ChecksumData(checksum_options_));
-  return Status::OK();
+  return ksck->RunAndPrintResults();
 }
 
 void ClusterVerifier::CheckRowCount(const std::string& table_name,

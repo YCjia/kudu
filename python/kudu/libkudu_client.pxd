@@ -62,6 +62,11 @@ cdef extern from "kudu/util/status.h" namespace "kudu" nogil:
         c_bool IsNotAuthorized()
         c_bool IsAborted()
 
+cdef extern from "kudu/util/int128.h" namespace "kudu":
+    # see https://gist.github.com/ricrogz/7f9c405450689866139c49476b959044
+    # This can be defined on the Python side even if it's not defined on the
+    # C++ side.
+    ctypedef int int128_t
 
 cdef extern from "kudu/util/monotime.h" namespace "kudu" nogil:
 
@@ -119,6 +124,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         KUDU_DOUBLE " kudu::client::KuduColumnSchema::DOUBLE"
         KUDU_BINARY " kudu::client::KuduColumnSchema::BINARY"
         KUDU_UNIXTIME_MICROS " kudu::client::KuduColumnSchema::UNIXTIME_MICROS"
+        KUDU_DECIMAL " kudu::client::KuduColumnSchema::DECIMAL"
 
     enum EncodingType" kudu::client::KuduColumnStorageAttributes::EncodingType":
         EncodingType_AUTO " kudu::client::KuduColumnStorageAttributes::AUTO_ENCODING"
@@ -142,6 +148,17 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         CompressionType compression
         string ToString()
 
+    cdef cppclass KuduColumnTypeAttributes:
+        KuduColumnTypeAttributes()
+        KuduColumnTypeAttributes(const KuduColumnTypeAttributes& other)
+        KuduColumnTypeAttributes(int8_t precision, int8_t scale)
+
+        int8_t precision()
+        int8_t scale()
+
+        c_bool Equals(KuduColumnTypeAttributes& other)
+        void CopyFrom(KuduColumnTypeAttributes& other)
+
     cdef cppclass KuduColumnSchema:
         KuduColumnSchema(const KuduColumnSchema& other)
         KuduColumnSchema(const string& name, DataType type)
@@ -152,6 +169,7 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
         string& name()
         c_bool is_nullable()
         DataType type()
+        KuduColumnTypeAttributes type_attributes()
 
         c_bool Equals(KuduColumnSchema& other)
         void CopyFrom(KuduColumnSchema& other)
@@ -182,6 +200,9 @@ cdef extern from "kudu/client/schema.h" namespace "kudu::client" nogil:
          KuduColumnSpec* NotNull()
          KuduColumnSpec* Nullable()
          KuduColumnSpec* Type(DataType type_)
+
+         KuduColumnSpec* Precision(int8_t precision);
+         KuduColumnSpec* Scale(int8_t scale);
 
          KuduColumnSpec* RenameTo(const string& new_name)
 
@@ -227,14 +248,18 @@ cdef extern from "kudu/client/scan_batch.h" namespace "kudu::client" nogil:
         Status GetUnixTimeMicros(int col_idx,
                             int64_t* micros_since_utc_epoch)
 
-        Status GetString(Slice& col_name, Slice* val)
-        Status GetString(int col_idx, Slice* val)
 
         Status GetFloat(Slice& col_name, float* val)
         Status GetFloat(int col_idx, float* val)
 
         Status GetDouble(Slice& col_name, double* val)
         Status GetDouble(int col_idx, double* val)
+
+        Status GetUnscaledDecimal(Slice& col_name, int128_t* val)
+        Status GetUnscaledDecimal(int col_idx, int128_t* val)
+
+        Status GetString(Slice& col_name, Slice* val)
+        Status GetString(int col_idx, Slice* val)
 
         Status GetBinary(const Slice& col_name, Slice* val)
         Status GetBinary(int col_idx, Slice* val)
@@ -306,6 +331,8 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
         Status SetDouble(Slice& col_name, double val)
         Status SetFloat(Slice& col_name, float val)
 
+        Status SetUnscaledDecimal(const Slice& col_name, int128_t val)
+
         # Integer setters
         Status SetBool(int col_idx, c_bool val)
 
@@ -316,6 +343,8 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
 
         Status SetDouble(int col_idx, double val)
         Status SetFloat(int col_idx, float val)
+
+        Status SetUnscaledDecimal(int col_idx, int128_t val)
 
         # Set, but does not copy string
         Status SetString(Slice& col_name, Slice& val)
@@ -369,6 +398,9 @@ cdef extern from "kudu/common/partial_row.h" namespace "kudu" nogil:
 
         Status GetFloat(Slice& col_name, float* val)
         Status GetFloat(int col_idx, float* val)
+
+        Status GetUnscaledDecimal(Slice& col_name, int128_t* val)
+        Status GetUnscaledDecimal(int col_idx, int128_t* val)
 
         # Gets the string but does not copy the value. Callers should
         # copy the resulting Slice if necessary.
@@ -451,6 +483,9 @@ cdef extern from "kudu/client/value.h" namespace "kudu::client" nogil:
         C_KuduValue* FromBool(c_bool val);
 
         @staticmethod
+        C_KuduValue* FromDecimal(int128_t val, int8_t scale);
+
+        @staticmethod
         C_KuduValue* CopyString(const Slice& s);
 
 
@@ -464,6 +499,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
     enum ReadMode" kudu::client::KuduScanner::ReadMode":
         ReadMode_Latest " kudu::client::KuduScanner::READ_LATEST"
         ReadMode_Snapshot " kudu::client::KuduScanner::READ_AT_SNAPSHOT"
+        ReadMode_ReadYourWrites " kudu::client::KuduScanner::READ_YOUR_WRITES"
 
     enum RangePartitionBound" kudu::client::KuduTableCreator::RangePartitionBound":
         PartitionType_Exclusive " kudu::client::KuduTableCreator::EXCLUSIVE_BOUND"
@@ -573,6 +609,8 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
                                               C_KuduValue* value);
         KuduPredicate* NewInListPredicate(const Slice& col_name,
                                           vector[C_KuduValue*]* values)
+        KuduPredicate* NewIsNotNullPredicate(const Slice& col_name)
+        KuduPredicate* NewIsNullPredicate(const Slice& col_name)
 
         KuduClient* client()
         # const PartitionSchema& partition_schema()
@@ -586,7 +624,11 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
 
         Status SetFlushMode(FlushMode m)
 
-        void SetMutationBufferSpace(size_t size)
+        Status SetMutationBufferSpace(size_t size)
+        Status SetMutationBufferFlushWatermark(double watermark_pct)
+        Status SetMutationBufferFlushInterval(unsigned int millis)
+        Status SetMutationBufferMaxNum(unsigned int max_num)
+
         void SetTimeoutMillis(int millis)
 
         void SetPriority(int priority)
@@ -645,6 +687,7 @@ cdef extern from "kudu/client/client.h" namespace "kudu::client" nogil:
         Status SetFaultTolerant()
         Status AddLowerBound(const KuduPartialRow& key)
         Status AddExclusiveUpperBound(const KuduPartialRow& key)
+        Status SetLimit(int64_t limit)
         Status KeepAlive()
         Status GetCurrentServer(KuduTabletServer** server)
 

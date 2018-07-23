@@ -75,7 +75,6 @@
 #include "kudu/util/test_util_prod.h"
 #include "kudu/util/trace.h"
 
-DECLARE_bool(block_manager_lock_dirs);
 DECLARE_bool(enable_data_block_fsync);
 DECLARE_string(block_manager_preflush_control);
 
@@ -1550,7 +1549,7 @@ Status LogWritableBlock::AppendMetadata() {
 class LogReadableBlock : public ReadableBlock {
  public:
   LogReadableBlock(LogBlockContainer* container,
-                   const scoped_refptr<LogBlock>& log_block);
+                   scoped_refptr<LogBlock> log_block);
 
   virtual ~LogReadableBlock();
 
@@ -1581,9 +1580,9 @@ class LogReadableBlock : public ReadableBlock {
 };
 
 LogReadableBlock::LogReadableBlock(LogBlockContainer* container,
-                                   const scoped_refptr<LogBlock>& log_block)
+                                   scoped_refptr<LogBlock> log_block)
   : container_(container),
-    log_block_(log_block),
+    log_block_(std::move(log_block)),
     closed_(false) {
   if (container_->metrics()) {
     container_->metrics()->generic_metrics.blocks_open_reading->Increment();
@@ -2039,8 +2038,8 @@ bool LogBlockManager::AddLogBlockUnlocked(scoped_refptr<LogBlock> lb) {
     return false;
   }
 
-  VLOG(2) << Substitute("Added block: offset $0, length $1",
-                        lb->offset(), lb->length());
+  VLOG(2) << Substitute("Added block: id $0, offset $1, length $2",
+                        lb->block_id().ToString(), lb->offset(), lb->length());
 
   // There may already be an entry in open_block_ids_ (e.g. we just finished
   // writing out a block).
@@ -2144,8 +2143,8 @@ Status LogBlockManager::RemoveLogBlockUnlocked(const BlockId& block_id,
   *lb = std::move(it->second);
   blocks_by_block_id_.erase(it);
 
-  VLOG(2) << Substitute("Removed block: offset $0, length $1",
-                        (*lb)->offset(), (*lb)->length());
+  VLOG(2) << Substitute("Removed block: id $0, offset $1, length $2",
+                        (*lb)->block_id().ToString(), (*lb)->offset(), (*lb)->length());
   return Status::OK();
 }
 

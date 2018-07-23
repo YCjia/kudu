@@ -17,17 +17,24 @@
 
 #include "kudu/util/test_util.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include <cstdlib>
 #include <cstring>
-#include <ostream>
 #include <limits>
-#include <memory>
 #include <map>
+#include <memory>
+#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef __APPLE__
+#include <fcntl.h>
+#include <sys/param.h> // for MAXPATHLEN
+#endif
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -41,6 +48,7 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/slice.h"
@@ -78,6 +86,7 @@ bool g_is_gtest = true;
 
 KuduTest::KuduTest()
   : env_(Env::Default()),
+    flag_saver_(new google::FlagSaver()),
     test_dir_(GetTestDataDirectory()) {
   std::map<const char*, const char*> flags_for_tests = {
     // Disabling fsync() speeds up tests dramatically, and it's safe to do as no
@@ -101,9 +110,16 @@ KuduTest::KuduTest()
     // only apply to certain tests.
     google::SetCommandLineOptionWithMode(e.first, e.second, google::SET_FLAGS_DEFAULT);
   }
+  // If the TEST_TMPDIR variable has been set, then glog will automatically use that
+  // as its default log directory. We would prefer that the default log directory
+  // instead be the test-case-specific subdirectory.
+  FLAGS_log_dir = GetTestDataDirectory();
 }
 
 KuduTest::~KuduTest() {
+  // Reset the flags first to prevent them from affecting test directory cleanup.
+  flag_saver_.reset();
+
   // Clean up the test directory in the destructor instead of a TearDown
   // method. This is better because it ensures that the child-class
   // dtor runs first -- so, if the child class is using a minicluster, etc,
@@ -126,7 +142,7 @@ void KuduTest::SetUp() {
   OverrideKrb5Environment();
 }
 
-string KuduTest::GetTestPath(const string& relative_path) {
+string KuduTest::GetTestPath(const string& relative_path) const {
   return JoinPathSegments(test_dir_, relative_path);
 }
 
@@ -206,8 +222,17 @@ string GetTestDataDirectory() {
   // - timestamp and pid: disambiguates with prior runs of the same test
   //
   // e.g. "env-test.TestEnv.TestReadFully.1409169025392361-23600"
-  dir += Substitute("/$0.$1.$2.$3-$4",
+  //
+  // If the test is sharded, the shard index is also included so that the test
+  // invoker can more easily identify all directories belonging to each shard.
+  string shard_index_infix;
+  const char* shard_index = getenv("GTEST_SHARD_INDEX");
+  if (shard_index && shard_index[0] != '\0') {
+    shard_index_infix = Substitute("$0.", shard_index);
+  }
+  dir += Substitute("/$0.$1$2.$3.$4-$5",
     StringReplace(google::ProgramInvocationShortName(), "/", "_", true),
+    shard_index_infix,
     StringReplace(test_info->test_case_name(), "/", "_", true),
     StringReplace(test_info->name(), "/", "_", true),
     kTestBeganAtMicros,
@@ -231,6 +256,12 @@ string GetTestDataDirectory() {
                                Substitute("$0/test_metadata", dir)));
   }
   return dir;
+}
+
+string GetTestExecutableDirectory() {
+  string exec;
+  CHECK_OK(Env::Default()->GetExecutablePath(&exec));
+  return DirName(exec);
 }
 
 void AssertEventually(const std::function<void(void)>& f,
@@ -292,14 +323,14 @@ void AssertEventually(const std::function<void(void)>& f,
   }
 }
 
-int CountOpenFds(Env* env) {
+int CountOpenFds(Env* env, const string& path_pattern) {
   static const char* kProcSelfFd =
 #if defined(__APPLE__)
     "/dev/fd";
 #else
     "/proc/self/fd";
 #endif // defined(__APPLE__)
-
+  faststring path_buf;
   vector<string> children;
   CHECK_OK(env->GetChildren(kProcSelfFd, &children));
   int num_fds = 0;
@@ -308,11 +339,42 @@ int CountOpenFds(Env* env) {
     if (c == "." || c == "..") {
       continue;
     }
+    int32_t fd;
+    CHECK(safe_strto32(c, &fd)) << "Unexpected file in fd list: " << c;
+#ifdef __APPLE__
+    path_buf.resize(MAXPATHLEN);
+    if (fcntl(fd, F_GETPATH, path_buf.data()) != 0) {
+      if (errno == EBADF) {
+        // The file was closed while we were looping. This is likely the
+        // actual file descriptor used for opening /proc/fd itself.
+        continue;
+      }
+      PLOG(FATAL) << "Unknown error in fcntl(F_GETPATH): " << fd;
+    }
+    char* buf_data = reinterpret_cast<char*>(path_buf.data());
+    path_buf.resize(strlen(buf_data));
+#else
+    path_buf.resize(PATH_MAX);
+    char* buf_data = reinterpret_cast<char*>(path_buf.data());
+    auto proc_file = JoinPathSegments(kProcSelfFd, c);
+    int path_len = readlink(proc_file.c_str(), buf_data, path_buf.size());
+    if (path_len < 0) {
+      if (errno == ENOENT) {
+        // The file was closed while we were looping. This is likely the
+        // actual file descriptor used for opening /proc/fd itself.
+        continue;
+      }
+      PLOG(FATAL) << "Unknown error in readlink: " << proc_file;
+    }
+    path_buf.resize(path_len);
+#endif
+    if (!MatchPattern(path_buf.ToString(), path_pattern)) {
+      continue;
+    }
     num_fds++;
   }
 
-  // Exclude the fd opened to iterate over kProcSelfFd.
-  return num_fds - 1;
+  return num_fds;
 }
 
 namespace {
@@ -357,9 +419,10 @@ Status WaitForBind(pid_t pid, uint16_t* port, const char* kind, MonoDelta timeou
   // The first line is the pid. We ignore it.
   // The second line is the file descriptor number. We ignore it.
   // The third line has the bind address and port.
+  // Subsequent lines show active connections.
   vector<string> lines = strings::Split(lsof_out, "\n");
   int32_t p = -1;
-  if (lines.size() != 3 ||
+  if (lines.size() < 3 ||
       lines[2].substr(0, 3) != "n*:" ||
       !safe_strto32(lines[2].substr(3), &p) ||
       p <= 0) {

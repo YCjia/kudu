@@ -16,10 +16,13 @@
 // under the License.
 package org.apache.kudu.client;
 
+import static org.apache.kudu.util.ClientTestUtil.countRowsInTable;
+import static org.apache.kudu.util.ClientTestUtil.scanTableToStrings;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -77,7 +80,7 @@ public class TestAlterTable extends BaseKuduTest {
       createOptions.addRangePartition(lower, upper);
     }
 
-    return BaseKuduTest.createTable(tableName, schema, createOptions);
+    return createTable(tableName, schema, createOptions);
   }
 
   /**
@@ -186,6 +189,7 @@ public class TestAlterTable extends BaseKuduTest {
       while (scanner.hasMoreRows()) {
         scanner.nextRows();
       }
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(
@@ -310,7 +314,7 @@ public class TestAlterTable extends BaseKuduTest {
                                     RangePartitionBound.EXCLUSIVE_BOUND,
                                     RangePartitionBound.INCLUSIVE_BOUND);
 
-    KuduTable table = BaseKuduTest.createTable(tableName, schema, createOptions);
+    KuduTable table = createTable(tableName, schema, createOptions);
 
     lower.addInt("c0", 199);
     upper.addInt("c0", 299);
@@ -353,6 +357,7 @@ public class TestAlterTable extends BaseKuduTest {
     upper.addInt("c0", 100);
     try {
       syncClient.alterTable(tableName, new AlterTableOptions().addRangePartition(lower, upper));
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(
@@ -365,6 +370,7 @@ public class TestAlterTable extends BaseKuduTest {
     upper.addInt("c0", 150);
     try {
       syncClient.alterTable(tableName, new AlterTableOptions().addRangePartition(lower, upper));
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(
@@ -377,6 +383,7 @@ public class TestAlterTable extends BaseKuduTest {
     upper.addInt("c0", 50);
     try {
       syncClient.alterTable(tableName, new AlterTableOptions().addRangePartition(lower, upper));
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(
@@ -395,6 +402,7 @@ public class TestAlterTable extends BaseKuduTest {
     options.addRangePartition(lower, upper);
     try {
       syncClient.alterTable(tableName, options);
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(
@@ -407,6 +415,7 @@ public class TestAlterTable extends BaseKuduTest {
       syncClient.alterTable(tableName,
                             new AlterTableOptions().dropRangePartition(schema.newPartialRow(),
                                                                        schema.newPartialRow()));
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage(), e.getStatus().getMessage().contains(
@@ -421,6 +430,7 @@ public class TestAlterTable extends BaseKuduTest {
     try {
       syncClient.alterTable(tableName, new AlterTableOptions().dropRangePartition(lower, upper)
                                                               .renameTable("foo"));
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(
@@ -454,6 +464,7 @@ public class TestAlterTable extends BaseKuduTest {
     options.dropRangePartition(lower, upper);
     try {
       syncClient.alterTable(tableName, options);
+      fail();
     } catch (KuduException e) {
       assertTrue(e.getStatus().isInvalidArgument());
       assertTrue(e.getStatus().getMessage().contains(

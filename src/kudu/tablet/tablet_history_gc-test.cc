@@ -38,7 +38,6 @@
 #include "kudu/common/schema.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -141,7 +140,7 @@ void TabletHistoryGcTest::UpdateOriginalRows(int64_t num_rowsets, int64_t rows_p
 
 void TabletHistoryGcTest::VerifyDebugDumpRowsMatch(const string& pattern) const {
   vector<string> rows;
-  ASSERT_OK(tablet()->DebugDump(&rows)); \
+  ASSERT_OK(tablet()->DebugDump(&rows));
   // Ignore the non-data (formattting) lines in the output.
   std::string base_pattern = R"(^Dumping|^-|^MRS|^RowSet)";
   if (!pattern.empty()) {

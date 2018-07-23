@@ -38,6 +38,7 @@
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/os-util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 
@@ -135,6 +136,12 @@ void KernelStackWatchdog::RunThread() {
       break;
     }
 
+    // Don't send signals while the debugger is running, since it makes it hard to
+    // use.
+    if (IsBeingDebugged()) {
+      continue;
+    }
+
     // Prevent threads from deleting their TLS objects between the snapshot loop and the sending of
     // signals. This makes it safe for us to access their TLS.
     //
@@ -211,15 +218,7 @@ void KernelStackWatchdog::CreateAndRegisterTLS() {
   auto* tls = new TLS();
   KernelStackWatchdog::GetInstance()->Register(tls);
   tls_ = tls;
-
-  // We manually install a thread-exit function here making use of the internal
-  // functionality of the thread-local module, rather than using Thread::CallAtExit().
-  // This is because we may use the stack watchdog in contexts such as the client
-  // where it's likely that threads aren't associated with a kudu::Thread instance.
-  auto* dtor_list = new threadlocal::internal::PerThreadDestructorList();
-  dtor_list->destructor = &ThreadExiting;
-  dtor_list->arg = nullptr;
-  kudu::threadlocal::internal::AddDestructor(dtor_list);
+  kudu::threadlocal::internal::AddDestructor(&ThreadExiting, nullptr);
 }
 
 KernelStackWatchdog::TLS::TLS() {

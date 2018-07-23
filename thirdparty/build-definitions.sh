@@ -64,7 +64,7 @@ restore_env() {
 #
 # 1. https://debbugs.gnu.org/db/10/10579.html
 fixup_libtool() {
-  if [[ ! "$EXTRA_CXXFLAGS" =~ "-stdlib=libc++" ]]; then
+  if [[ ! "$EXTRA_LDFLAGS" =~ "-stdlib=libc++" ]]; then
     echo "libtool does not need to be fixed up: not using libc++"
     return
   fi
@@ -136,10 +136,14 @@ build_libcxx() {
   cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
-    -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS $EXTRA_LDFLAGS" \
+    -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LDFLAGS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$EXTRA_LDFLAGS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS" \
     -DLLVM_PATH=$LLVM_SOURCE \
     -DLIBCXX_CXX_ABI=libcxxabi \
     -DLIBCXX_CXX_ABI_INCLUDE_PATHS=$LLVM_SOURCE/projects/libcxxabi/include \
+    -DLIBCXX_CXX_ABI_LIBRARY_PATH=$PREFIX/lib \
     -DLLVM_USE_SANITIZER=$SANITIZER_TYPE \
     $EXTRA_CMAKE_FLAGS \
     $LLVM_SOURCE/projects/libcxx
@@ -178,9 +182,108 @@ build_llvm() {
   TOOLS_ARGS="$TOOLS_ARGS -DLLVM_TOOL_LIBCXX_BUILD=OFF"
   TOOLS_ARGS="$TOOLS_ARGS -DLLVM_TOOL_LIBCXXABI_BUILD=OFF"
 
+
+  # Disable some builds we don't care about.
+  for arg in \
+      CLANG_ENABLE_ARCMT \
+      CLANG_TOOL_ARCMT_TEST_BUILD \
+      CLANG_TOOL_C_ARCMT_TEST_BUILD \
+      CLANG_TOOL_C_INDEX_TEST_BUILD \
+      CLANG_TOOL_CLANG_CHECK_BUILD \
+      CLANG_TOOL_CLANG_DIFF_BUILD \
+      CLANG_TOOL_CLANG_FORMAT_VS_BUILD \
+      CLANG_TOOL_CLANG_FUNC_MAPPING_BUILD \
+      CLANG_TOOL_CLANG_FUZZER_BUILD \
+      CLANG_TOOL_CLANG_IMPORT_TEST_BUILD \
+      CLANG_TOOL_CLANG_OFFLOAD_BUNDLER_BUILD \
+      CLANG_TOOL_CLANG_REFACTOR_BUILD \
+      CLANG_TOOL_CLANG_RENAME_BUILD \
+      CLANG_TOOL_DIAGTOOL_BUILD \
+      COMPILER_RT_BUILD_LIBFUZZER \
+      LLVM_INCLUDE_GO_TESTS \
+      LLVM_POLLY_BUILD \
+      LLVM_TOOL_BUGPOINT_BUILD \
+      LLVM_TOOL_BUGPOINT_PASSES_BUILD \
+      LLVM_TOOL_DSYMUTIL_BUILD \
+      LLVM_TOOL_LLI_BUILD \
+      LLVM_TOOL_LLVM_AS_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_BCANALYZER_BUILD \
+      LLVM_TOOL_LLVM_CAT_BUILD \
+      LLVM_TOOL_LLVM_CFI_VERIFY_BUILD \
+      LLVM_TOOL_LLVM_C_TEST_BUILD \
+      LLVM_TOOL_LLVM_CVTRES_BUILD \
+      LLVM_TOOL_LLVM_CXXDUMP_BUILD \
+      LLVM_TOOL_LLVM_CXXFILT_BUILD \
+      LLVM_TOOL_LLVM_DEMANGLE_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_DIFF_BUILD \
+      LLVM_TOOL_LLVM_DIS_BUILD \
+      LLVM_TOOL_LLVM_DWARFDUMP_BUILD \
+      LLVM_TOOL_LLVM_DWP_BUILD \
+      LLVM_TOOL_LLVM_EXTRACT_BUILD \
+      LLVM_TOOL_LLVM_GO_BUILD \
+      LLVM_TOOL_LLVM_ISEL_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_JITLISTENER_BUILD \
+      LLVM_TOOL_LLVM_MC_ASSEMBLE_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_MC_BUILD \
+      LLVM_TOOL_LLVM_MC_DISASSEMBLE_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_MCMARKUP_BUILD \
+      LLVM_TOOL_LLVM_MODEXTRACT_BUILD \
+      LLVM_TOOL_LLVM_MT_BUILD \
+      LLVM_TOOL_LLVM_NM_BUILD \
+      LLVM_TOOL_LLVM_OBJCOPY_BUILD \
+      LLVM_TOOL_LLVM_OBJDUMP_BUILD \
+      LLVM_TOOL_LLVM_OPT_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_OPT_REPORT_BUILD \
+      LLVM_TOOL_LLVM_PDBUTIL_BUILD \
+      LLVM_TOOL_LLVM_PROFDATA_BUILD \
+      LLVM_TOOL_LLVM_RC_BUILD \
+      LLVM_TOOL_LLVM_READOBJ_BUILD \
+      LLVM_TOOL_LLVM_RTDYLD_BUILD \
+      LLVM_TOOL_LLVM_SHLIB_BUILD \
+      LLVM_TOOL_LLVM_SIZE_BUILD \
+      LLVM_TOOL_LLVM_SPECIAL_CASE_LIST_FUZZER_BUILD \
+      LLVM_TOOL_LLVM_SPLIT_BUILD \
+      LLVM_TOOL_LLVM_STRESS_BUILD \
+      LLVM_TOOL_LLVM_STRINGS_BUILD \
+      LLVM_TOOL_MSBUILD_BUILD \
+      LLVM_TOOL_OBJ2YAML_BUILD \
+      LLVM_TOOL_OPT_BUILD \
+      LLVM_TOOL_OPT_VIEWER_BUILD \
+      LLVM_TOOL_VERIFY_USELISTORDER_BUILD \
+      LLVM_TOOL_XCODE_TOOLCHAIN_BUILD \
+      LLVM_TOOL_YAML2OBJ_BUILD \
+      ; do
+    TOOLS_ARGS="$TOOLS_ARGS -D${arg}=OFF"
+  done
+
+  CLANG_CXXFLAGS="$EXTRA_CXXFLAGS"
+  CLANG_LDFLAGS="$EXTRA_LDFLAGS"
   case $BUILD_TYPE in
     "normal")
       # Default build: core LLVM libraries, clang, compiler-rt, and all tools.
+
+      # Set the gcc prefix based on the gcc that's on the path. Otherwise,
+      # clang will auto-detect the newest devtoolset that is installed even
+      # if it's not the current one on the path. This results in link errors
+      # like:
+      #   /opt/rh/devtoolset-3/root/usr/bin/ld:
+      #     /opt/rh/devtoolset-6/root/usr/lib/gcc/x86_64-redhat-linux/6.2.1/crtbeginS.o:
+      #     unrecognized relocation (0x2a) in section `.text'
+      # ...as it tries to use the 'ld' from devtoolset-3 (on the path) to link libraries
+      # coming from devtoolset-6.
+      GCC_INSTALL_PREFIX=$(gcc -v 2>&1 | grep -o -- '--prefix=[^ ]*' | cut -f2 -d=)
+      if [ -n "$GCC_INSTALL_PREFIX" ]; then
+        TOOLS_ARGS="$TOOLS_ARGS -DGCC_INSTALL_PREFIX=$GCC_INSTALL_PREFIX"
+      fi
+
+      # Depend on zlib from the thirdparty tree. It's an optional dependency for
+      # LLVM, but a required [1] one for IWYU. When TSAN is enabled these flags
+      # are already set by build-thirdparty.sh in order to support the
+      # thirdparty libc++, so it's not necessary to set them again.
+      #
+      # 1. https://github.com/include-what-you-use/include-what-you-use/issues/539
+      CLANG_CXXFLAGS="$CLANG_CXXFLAGS -I$PREFIX/include"
+      CLANG_LDFLAGS="$CLANG_LDFLAGS -L$PREFIX/lib -Wl,-rpath,$PREFIX/lib"
       ;;
     "tsan")
       # Build just the core LLVM libraries, dependent on libc++.
@@ -190,6 +293,9 @@ build_llvm() {
 
       # Configure for TSAN.
       TOOLS_ARGS="$TOOLS_ARGS -DLLVM_USE_SANITIZER=Thread"
+      # Use the 'tblgen' from the non-TSAN build when building the TSAN
+      # build, since it runs much faster.
+      TOOLS_ARGS="$TOOLS_ARGS -DLLVM_TABLEGEN=$PREFIX_DEPS/bin/llvm-tblgen"
       ;;
     *)
       echo "Unknown LLVM build type: $BUILD_TYPE"
@@ -221,7 +327,10 @@ build_llvm() {
     -DLLVM_INCLUDE_UTILS=OFF \
     -DLLVM_TARGETS_TO_BUILD=X86 \
     -DLLVM_ENABLE_RTTI=ON \
-    -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS $EXTRA_LDFLAGS" \
+    -DCMAKE_CXX_FLAGS="$CLANG_CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$CLANG_LDFLAGS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$CLANG_LDFLAGS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$CLANG_LDFLAGS" \
     -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
     $TOOLS_ARGS \
     $EXTRA_CMAKE_FLAGS \
@@ -245,11 +354,14 @@ build_gflags() {
   mkdir -p $GFLAGS_BDIR
   pushd $GFLAGS_BDIR
   rm -rf CMakeCache.txt CMakeFiles/
-  CXXFLAGS="$EXTRA_CFLAGS $EXTRA_CXXFLAGS $EXTRA_LDFLAGS $EXTRA_LIBS" \
-    cmake \
+  cmake \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_POSITION_INDEPENDENT_CODE=On \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS" \
+    -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+    -DCMAKE_MODULE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+    -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
     -DBUILD_SHARED_LIBS=On \
     -DBUILD_STATIC_LIBS=On \
     -DREGISTER_INSTALL_PREFIX=Off \
@@ -312,7 +424,6 @@ build_gperftools() {
     LIBS="$EXTRA_LIBS" \
     $GPERFTOOLS_SOURCE/configure \
     --enable-frame-pointers \
-    --enable-heap-checker \
     --with-pic \
     --prefix=$PREFIX
   fixup_libtool
@@ -332,10 +443,13 @@ build_gmock() {
     mkdir -p $GMOCK_BDIR
     pushd $GMOCK_BDIR
     rm -rf CMakeCache.txt CMakeFiles/
-    CXXFLAGS="$EXTRA_CXXFLAGS $EXTRA_LDFLAGS $EXTRA_LIBS" \
-      cmake \
+    cmake \
       -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_POSITION_INDEPENDENT_CODE=On \
+      -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS" \
+      -DCMAKE_EXE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+      -DCMAKE_MODULE_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
+      -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS" \
       -DBUILD_SHARED_LIBS=$SHARED \
       $EXTRA_CMAKE_FLAGS \
       $GMOCK_SOURCE/googlemock
@@ -609,7 +723,7 @@ build_gcovr() {
 
 build_trace_viewer() {
   echo Installing trace-viewer into the www directory
-  cp -a $TRACE_VIEWER_SOURCE/* $TP_DIR/../www/
+  cp -a $TRACE_VIEWER_SOURCE/tracing.* $TP_DIR/../www/
 }
 
 build_nvml() {

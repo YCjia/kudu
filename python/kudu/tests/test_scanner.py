@@ -59,15 +59,21 @@ class TestScanner(TestScanBase):
         tuples = _read_predicates(preds)
         self.assertEqual(sorted(tuples), self.tuples[20:50])
 
+    def test_scan_limit(self):
+        # Set limits both below and above the max number of rows.
+        limits = [self.nrows - 1, self.nrows, self.nrows + 1]
+        for limit in limits:
+            scanner = self.table.scanner()
+            scanner.set_limit(limit)
+            tuples = scanner.read_all_tuples()
+            self.assertEqual(len(tuples), min(limit, self.nrows))
+
     def test_scan_rows_string_predicate_and_projection(self):
         scanner = self.table.scanner()
         scanner.set_projected_column_names(['key', 'string_val'])
-
         sv = self.table['string_val']
-
         scanner.add_predicates([sv >= 'hello_20',
                                 sv <= 'hello_22'])
-
         scanner.set_fault_tolerant()
         scanner.open()
 
@@ -92,6 +98,36 @@ class TestScanner(TestScanBase):
         tuples = scanner.read_all_tuples()
 
         self.assertEqual(tuples, [self.tuples[98]])
+
+    def test_scan_rows_is_not_null_predicate(self):
+        """
+        Test scanner with an IsNotNull predicate on string_val column
+        """
+        pred = self.table['string_val'].is_not_null()
+        scanner = self.table.scanner()
+        scanner.add_predicate(pred)
+        scanner.open()
+
+        tuples = scanner.read_all_tuples()
+
+        rows = [i for i in range(100) if i % 2 == 0]
+
+        self.assertEqual(sorted(tuples), [self.tuples[i] for i in rows])
+
+    def test_scan_rows_is_null_predicate(self):
+        """
+        Test scanner with an IsNull predicate on string_val column
+        """
+        pred = self.table['string_val'].is_null()
+        scanner = self.table.scanner()
+        scanner.add_predicate(pred)
+        scanner.open()
+
+        tuples = scanner.read_all_tuples()
+
+        rows = [i for i in range(100) if i % 2 != 0]
+
+        self.assertEqual(sorted(tuples), [self.tuples[i] for i in rows])
 
     def test_index_projection_with_schema(self):
         scanner = self.table.scanner()
@@ -182,8 +218,7 @@ class TestScanner(TestScanBase):
 
     def test_read_mode(self):
         """
-        Test setting the read mode and scanning against a
-        snapshot and latest
+        Test scanning in latest, snapshot and read_your_writes read modes.
         """
         # Delete row
         self.delete_insert_row_for_read_test()
@@ -196,7 +231,7 @@ class TestScanner(TestScanBase):
 
         self.assertEqual(sorted(self.tuples[1:]), sorted(scanner.read_all_tuples()))
 
-        #Check scanner results after delete
+        # Check scanner results after delete with latest mode
         timeout = time.time() + 10
         check_tuples = []
         while check_tuples != sorted(self.tuples):
@@ -210,6 +245,13 @@ class TestScanner(TestScanBase):
             check_tuples = sorted(scanner.read_all_tuples())
             # Avoid tight looping
             time.sleep(0.05)
+
+        # Check scanner results after delete with read_your_writes mode
+        scanner = self.table.scanner()
+        scanner.set_read_mode('read_your_writes')\
+            .open()
+
+        self.assertEqual(sorted(self.tuples), sorted(scanner.read_all_tuples()))
 
     def test_resource_metrics_and_cache_blocks(self):
         """
@@ -259,6 +301,11 @@ class TestScanner(TestScanBase):
         # Test a single precision float predicate
         # Does a row check count only
         self._test_float_pred()
+
+    def test_decimal_pred(self):
+        if kudu.CLIENT_SUPPORTS_DECIMAL:
+            # Test a decimal predicate
+            self._test_decimal_pred()
 
     def test_binary_pred(self):
         # Test a binary predicate

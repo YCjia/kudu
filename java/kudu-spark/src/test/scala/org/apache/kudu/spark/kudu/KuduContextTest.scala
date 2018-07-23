@@ -17,8 +17,10 @@
 package org.apache.kudu.spark.kudu
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, ObjectInputStream, ObjectOutputStream}
+import java.math.BigDecimal
 import java.sql.Timestamp
 
+import org.apache.kudu.util.TimestampUtil
 import org.apache.spark.sql.functions.decode
 import org.junit.runner.RunWith
 import org.scalatest.junit.JUnitRunner
@@ -50,7 +52,7 @@ class KuduContextTest extends FunSuite with TestContext with Matchers {
 
   test("Test KuduContext serialization") {
     val serialized = serialize(kuduContext)
-    KuduConnection.asyncCache.clear()
+    KuduClientCache.clearCacheForTests()
     val deserialized = deserialize(serialized).asInstanceOf[KuduContext]
     assert(deserialized.authnCredentials != null)
     // Make a nonsense call just to make sure the re-hydrated client works.
@@ -58,9 +60,10 @@ class KuduContextTest extends FunSuite with TestContext with Matchers {
   }
 
   test("Test basic kuduRDD") {
-    val rows = insertRows(rowCount)
+    val rows = insertRows(table, rowCount)
     val scanList = kuduContext.kuduRDD(ss.sparkContext, "test", Seq("key", "c1_i", "c2_s", "c3_double",
-        "c4_long", "c5_bool", "c6_short", "c7_float", "c8_binary", "c9_unixtime_micros", "c10_byte"))
+        "c4_long", "c5_bool", "c6_short", "c7_float", "c8_binary", "c9_unixtime_micros", "c10_byte",
+        "c11_decimal32", "c12_decimal64", "c13_decimal128"))
       .map(r => r.toSeq).collect()
     scanList.foreach(r => {
       val index = r.apply(0).asInstanceOf[Int]
@@ -75,13 +78,16 @@ class KuduContextTest extends FunSuite with TestContext with Matchers {
       val binaryBytes = s"bytes ${rows.apply(index)._2}".getBytes().toSeq
       assert(r.apply(8).asInstanceOf[Array[Byte]].toSeq == binaryBytes)
       assert(r.apply(9).asInstanceOf[Timestamp] ==
-        KuduRelation.microsToTimestamp(rows.apply(index)._4))
+        TimestampUtil.microsToTimestamp(rows.apply(index)._4))
       assert(r.apply(10).asInstanceOf[Byte] == rows.apply(index)._2.toByte)
+      assert(r.apply(11).asInstanceOf[BigDecimal] == BigDecimal.valueOf(rows.apply(index)._2))
+      assert(r.apply(12).asInstanceOf[BigDecimal] == BigDecimal.valueOf(rows.apply(index)._2))
+      assert(r.apply(13).asInstanceOf[BigDecimal] == BigDecimal.valueOf(rows.apply(index)._2))
     })
   }
 
   test("Test kudu-spark DataFrame") {
-    insertRows(rowCount)
+    insertRows(table, rowCount)
     val sqlContext = ss.sqlContext
     val dataDF = sqlContext.read.options(Map("kudu.master" -> miniCluster.getMasterAddresses,
       "kudu.table" -> "test")).kudu

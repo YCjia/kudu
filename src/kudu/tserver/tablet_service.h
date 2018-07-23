@@ -62,6 +62,7 @@ class RunLeaderElectionRequestPB;
 class RunLeaderElectionResponsePB;
 class StartTabletCopyRequestPB;
 class StartTabletCopyResponsePB;
+class TimeManager;
 class UnsafeChangeConfigRequestPB;
 class UnsafeChangeConfigResponsePB;
 class VoteRequestPB;
@@ -73,6 +74,7 @@ class RpcContext;
 } // namespace rpc
 
 namespace tablet {
+class Tablet;
 class TabletReplica;
 } // namespace tablet
 
@@ -147,9 +149,21 @@ class TabletServiceImpl : public TabletServerServiceIf {
   Status HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                               const rpc::RpcContext* rpc_context,
                               const Schema& projection,
-                              tablet::TabletReplica* tablet_replica,
+                              tablet::Tablet* tablet,
+                              consensus::TimeManager* time_manager,
                               gscoped_ptr<RowwiseIterator>* iter,
                               Timestamp* snap_timestamp);
+
+  // Validates the given timestamp is not so far in the future that
+  // it exceeds the maximum allowed clock synchronization error time,
+  // as such a timestamp is invalid.
+  Status ValidateTimestamp(const Timestamp& snap_timestamp);
+
+  // Pick a timestamp according to the scan mode, and verify that the
+  // timestamp is after the tablet's ancient history mark.
+  Status PickAndVerifyTimestamp(const NewScanRequestPB& scan_pb,
+                                tablet::Tablet* tablet,
+                                Timestamp* snap_timestamp);
 
   TabletServer* server_;
 };

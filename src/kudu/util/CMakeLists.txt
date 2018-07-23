@@ -128,9 +128,11 @@ set(UTIL_SRCS
   cow_object.cc
   crc.cc
   debug-util.cc
+  decimal_util.cc
   debug/trace_event_impl.cc
   debug/trace_event_impl_constants.cc
   debug/trace_event_synthetic_delay.cc
+  debug/unwind_safeness.cc
   easy_json.cc
   env.cc env_posix.cc env_util.cc
   errno.cc
@@ -145,7 +147,6 @@ set(UTIL_SRCS
   hdr_histogram.cc
   hexdump.cc
   init.cc
-  int128.cc
   jsonreader.cc
   jsonwriter.cc
   kernel_stack_watchdog.cc
@@ -198,6 +199,7 @@ set(UTIL_SRCS
   user.cc
   url-coding.cc
   version_info.cc
+  version_util.cc
   website_util.cc
   zlib.cc
 )
@@ -207,7 +209,7 @@ set(UTIL_SRCS
 # optimized regardless of the default optimization options.
 set_source_files_properties(memory/overwrite.cc PROPERTIES COMPILE_FLAGS "-O3")
 
-if(NOT APPLE)
+if(HAVE_LIB_VMEM)
   set(UTIL_SRCS
     ${UTIL_SRCS}
     nvm_cache.cc)
@@ -231,7 +233,12 @@ if(NOT APPLE)
     ${UTIL_LIBS}
     breakpad_client
     dl
-    rt
+    rt)
+endif()
+
+if(HAVE_LIB_VMEM)
+  set(UTIL_LIBS
+    ${UTIL_LIBS}
     vmem)
 endif()
 
@@ -278,7 +285,7 @@ target_link_libraries(kudu_test_util
   gmock
   kudu_util)
 
-if(NOT APPLE)
+if(HAVE_LIB_VMEM)
   target_link_libraries(kudu_test_util
     vmem)
 endif()
@@ -329,16 +336,19 @@ target_link_libraries(protoc-gen-insertions gutil protobuf protoc ${KUDU_BASE_LI
 #######################################
 
 set(KUDU_TEST_LINK_LIBS kudu_util gutil ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(async_util-test)
 ADD_KUDU_TEST(atomic-test)
 ADD_KUDU_TEST(bit-util-test)
 ADD_KUDU_TEST(bitmap-test)
 ADD_KUDU_TEST(blocking_queue-test)
 ADD_KUDU_TEST(bloom_filter-test)
+ADD_KUDU_TEST(cache-bench RUN_SERIAL true)
 ADD_KUDU_TEST(cache-test)
 ADD_KUDU_TEST(callback_bind-test)
 ADD_KUDU_TEST(countdown_latch-test)
 ADD_KUDU_TEST(crc-test RUN_SERIAL true) # has a benchmark
 ADD_KUDU_TEST(debug-util-test)
+ADD_KUDU_TEST(decimal_util-test)
 ADD_KUDU_TEST(easy_json-test)
 ADD_KUDU_TEST(env-test LABELS no_tsan)
 ADD_KUDU_TEST(env_util-test)
@@ -370,6 +380,7 @@ ADD_KUDU_TEST(mt-metrics-test RUN_SERIAL true)
 ADD_KUDU_TEST(mt-threadlocal-test RUN_SERIAL true)
 ADD_KUDU_TEST(net/dns_resolver-test)
 ADD_KUDU_TEST(net/net_util-test)
+ADD_KUDU_TEST(net/socket-test)
 ADD_KUDU_TEST(object_pool-test)
 ADD_KUDU_TEST(oid_generator-test)
 ADD_KUDU_TEST(once-test)
@@ -380,25 +391,26 @@ ADD_KUDU_TEST(random-test)
 ADD_KUDU_TEST(random_util-test)
 ADD_KUDU_TEST(rle-test)
 ADD_KUDU_TEST(rolling_log-test)
-ADD_KUDU_TEST(rw_mutex-test)
+ADD_KUDU_TEST(rw_mutex-test RUN_SERIAL true)
 ADD_KUDU_TEST(rw_semaphore-test)
-ADD_KUDU_TEST(rwc_lock-test)
+ADD_KUDU_TEST(rwc_lock-test RUN_SERIAL true)
 ADD_KUDU_TEST(safe_math-test)
 ADD_KUDU_TEST(scoped_cleanup-test)
 ADD_KUDU_TEST(slice-test)
 ADD_KUDU_TEST(sorted_disjoint_interval_list-test)
 ADD_KUDU_TEST(spinlock_profiling-test)
-ADD_KUDU_TEST(stack_watchdog-test)
+ADD_KUDU_TEST(stack_watchdog-test PROCESSORS 2)
 ADD_KUDU_TEST(status-test)
 ADD_KUDU_TEST(string_case-test)
-ADD_KUDU_TEST(striped64-test)
+ADD_KUDU_TEST(striped64-test RUN_SERIAL true)
 ADD_KUDU_TEST(subprocess-test)
 ADD_KUDU_TEST(thread-test)
 ADD_KUDU_TEST(threadpool-test)
 ADD_KUDU_TEST(throttler-test)
-ADD_KUDU_TEST(trace-test)
+ADD_KUDU_TEST(trace-test PROCESSORS 4)
 ADD_KUDU_TEST(url-coding-test)
 ADD_KUDU_TEST(user-test)
+ADD_KUDU_TEST(version_util-test)
 
 if (NOT APPLE)
   ADD_KUDU_TEST(minidump-test)

@@ -17,7 +17,6 @@
 #ifndef KUDU_UTIL_LOGGING_H
 #define KUDU_UTIL_LOGGING_H
 
-#include <cstdint>
 #include <iosfwd>
 #include <string>
 
@@ -156,7 +155,7 @@ class ScopedDisableRedaction {
 
 #define KLOG_EVERY_N_SECS_THROTTLER(severity, n_secs, throttler, tag) \
   int VARNAME_LINENUM(num_suppressed) = 0;                            \
-  if (throttler.ShouldLog(n_secs, tag, &VARNAME_LINENUM(num_suppressed)))  \
+  if ((throttler).ShouldLog(n_secs, tag, &VARNAME_LINENUM(num_suppressed)))  \
     google::LogMessage( \
       __FILE__, __LINE__, google::GLOG_ ## severity, VARNAME_LINENUM(num_suppressed), \
       &google::LogMessage::SendToLog).stream()
@@ -293,6 +292,9 @@ void UnregisterLoggingCallback();
 // file corresponding to this severity
 void GetFullLogFilename(google::LogSeverity severity, std::string* filename);
 
+// Format a timestamp in the same format as used by GLog.
+std::string FormatTimestampForLog(MicrosecondsInt64 micros_since_epoch);
+
 // Shuts down the google logging library. Call before exit to ensure that log files are
 // flushed.
 void ShutdownLoggingSafe();
@@ -330,7 +332,7 @@ class LogThrottler {
       return true;
     }
 
-    if (ts - last_ts_ < n_secs * 1e6) {
+    if (ts - last_ts_ < n_secs * 1000000) {
       *num_suppressed = base::subtle::NoBarrier_AtomicIncrement(&num_suppressed_, 1);
       return false;
     }
@@ -340,7 +342,7 @@ class LogThrottler {
   }
  private:
   Atomic32 num_suppressed_;
-  uint64_t last_ts_;
+  MicrosecondsInt64 last_ts_;
   const char* last_tag_;
 };
 } // namespace logging

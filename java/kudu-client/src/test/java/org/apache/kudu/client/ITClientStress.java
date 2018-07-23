@@ -16,6 +16,8 @@
 // under the License.
 package org.apache.kudu.client;
 
+import static org.apache.kudu.util.ClientTestUtil.createFourTabletsTableWithNineRows;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -37,6 +39,7 @@ import org.apache.kudu.util.CapturingLogAppender;
 
 public class ITClientStress extends BaseKuduTest {
 
+  @SuppressWarnings("FutureReturnValueIgnored")
   private void runTasks(int numThreads, int secondsToRun,
       Supplier<Callable<Void>> taskFactory) throws InterruptedException, IOException {
     // Capture any exception thrown by the tasks.
@@ -72,9 +75,9 @@ public class ITClientStress extends BaseKuduTest {
     } finally {
       pool.shutdown();
       assertTrue(pool.awaitTermination(10, TimeUnit.SECONDS));
-      if (thrown.get() != null) {
-        throw new AssertionError(thrown.get());
-      }
+    }
+    if (thrown.get() != null) {
+      throw new AssertionError(thrown.get());
     }
     assertFalse("log contained NPE",
         cla.getAppendedText().contains("NullPointerException"));
@@ -94,7 +97,7 @@ public class ITClientStress extends BaseKuduTest {
     final String TABLE_NAME = "testManyClients";
     final int SECONDS_TO_RUN = 10;
     final int NUM_THREADS = 80;
-    createFourTabletsTableWithNineRows(TABLE_NAME);
+    createFourTabletsTableWithNineRows(client, TABLE_NAME, DEFAULT_SLEEP);
 
     runTasks(NUM_THREADS, SECONDS_TO_RUN, new Supplier<Callable<Void>>() {
       @Override
@@ -128,42 +131,36 @@ public class ITClientStress extends BaseKuduTest {
     final KuduTable table = createTable(TABLE_NAME, basicSchema,
         getBasicCreateTableOptions());
     final AtomicInteger numUpserted = new AtomicInteger(0);
-    try (final KuduClient client =
-        new KuduClient.KuduClientBuilder(masterAddresses)
-        .defaultAdminOperationTimeoutMs(DEFAULT_SLEEP)
-        .build()) {
-
-      runTasks(NUM_THREADS, SECONDS_TO_RUN, new Supplier<Callable<Void>>() {
-        @Override
-        public Callable<Void> get() {
-          return new Callable<Void>() {
-            @Override
-            public Void call() throws Exception {
-              KuduSession s = client.newSession();
-              s.setFlushMode(FlushMode.AUTO_FLUSH_SYNC);
-              try {
-                for (int i = 0; i < 100; i++) {
-                  Upsert u = table.newUpsert();
-                  u.getRow().addInt(0, i);
-                  u.getRow().addInt(1, 12345);
-                  u.getRow().addInt(2, 3);
-                  u.getRow().setNull(3);
-                  u.getRow().addBoolean(4, false);
-                  OperationResponse apply = s.apply(u);
-                  if (apply.hasRowError()) {
-                    throw new AssertionError(apply.getRowError().toString());
-                  }
-                  numUpserted.incrementAndGet();
+    runTasks(NUM_THREADS, SECONDS_TO_RUN, new Supplier<Callable<Void>>() {
+      @Override
+      public Callable<Void> get() {
+        return new Callable<Void>() {
+          @Override
+          public Void call() throws Exception {
+            KuduSession s = syncClient.newSession();
+            s.setFlushMode(FlushMode.AUTO_FLUSH_SYNC);
+            try {
+              for (int i = 0; i < 100; i++) {
+                Upsert u = table.newUpsert();
+                u.getRow().addInt(0, i);
+                u.getRow().addInt(1, 12345);
+                u.getRow().addInt(2, 3);
+                u.getRow().setNull(3);
+                u.getRow().addBoolean(4, false);
+                OperationResponse apply = s.apply(u);
+                if (apply.hasRowError()) {
+                  throw new AssertionError(apply.getRowError().toString());
                 }
-              } finally {
-                s.close();
+                numUpserted.incrementAndGet();
               }
-              return null;
+            } finally {
+              s.close();
             }
-          };
-        }
-      });
-    }
+            return null;
+          }
+        };
+      }
+    });
     LOG.info("Upserted {} rows", numUpserted.get());
   }
 }

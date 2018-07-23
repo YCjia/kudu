@@ -196,6 +196,7 @@ public abstract class AbstractKuduScannerBuilder
   /**
    * Sets a limit on the number of rows that will be returned by the scanner. There's no limit
    * by default.
+   *
    * @param limit a positive long
    * @return this instance
    */

@@ -18,7 +18,7 @@
 // This file contains common tasks and configuration for checking the quality of the code.
 
 apply plugin: "checkstyle" // Ensures Java code follows the defined coding style.
-apply plugin: "findbugs"   // Performs static code analysis to look for bugs in Java code.
+apply plugin: "com.github.spotbugs"   // Performs static code analysis to look for bugs in Java code.
 apply plugin: "pmd"        // Performs static code analysis to look for common code smells in Java code.
 apply plugin: "com.github.ben-manes.versions" // Provides a task to determine which dependencies have updates.
 apply plugin: "ru.vyarus.animalsniffer" // Ensures Java code uses APIs from a particular version of Java.
@@ -38,23 +38,23 @@ task checkstyle(dependsOn: [checkstyleMain, checkstyleTest, checkstyleIntegratio
   description = "Run Checkstyle analysis."
 }
 
-findbugs {
-  toolVersion = versions.findbugs
+spotbugs {
+  toolVersion = versions.spotBugs
   ignoreFailures = true
   effort = "max"
 }
 
-tasks.withType(FindBugs) {
+tasks.withType(com.github.spotbugs.SpotBugsTask) {
   reports {
     xml.enabled false
     html.enabled true
   }
 }
 
-// Create an aggregate findbugs task.
-// This simplifies running findbugs on all the code by only needing one task instead of multiple in your command.
-task findbugs(dependsOn: [findbugsMain, findbugsTest, findbugsIntegrationTest], group: "Verification") {
-  description = "Run FindBugs analysis."
+// Create an aggregate spotbugs task.
+// This simplifies running spotbugs on all the code by only needing one task instead of multiple in your command.
+task spotbugs(dependsOn: [spotbugsMain, spotbugsTest, spotbugsIntegrationTest], group: "Verification") {
+  description = "Run SpotBugs analysis."
 }
 
 pmd {
@@ -68,12 +68,32 @@ task pmd(dependsOn: [pmdMain, pmdTest, pmdIntegrationTest], group: "Verification
   description = "Run PMD analysis."
 }
 
+
+// Disable error-prone if we are compiling with Java 10+ util support is added.
+// See https://github.com/google/error-prone/issues/860
+if (!JavaVersion.current().isJava10Compatible()) {
+  // Enable error-prone.
+  // Running with '-Derrorprone-fix=...' can instruct error-prone to automatically fix issues.
+  apply plugin: "net.ltgt.errorprone"
+  // Performs static code analysis to look for bugs in Java code.
+  tasks.withType(JavaCompile) {
+    options.compilerArgs += ['-XepExcludedPaths:.*/build/generated.*/.*',
+                             '-XepAllErrorsAsWarnings']
+    def fix = propertyWithDefault("errorprone-fix", "")
+    if (!fix.isEmpty()) {
+      options.compilerArgs += ['-XepPatchChecks:' + fix, '-XepPatchLocation:IN_PLACE']
+    }
+  }
+// Set a specific version of Error Prone
+  dependencies {
+    errorprone libs.errorProne
+  }
+}
+
 // Define a Java API signature for use by animal-sniffer. It'll enforce that all
 // Java API usage adheres to this signature.
-//
-// When changing this, also change javaCompatibility defined in gradle.properties.
 dependencies {
-  signature 'org.codehaus.mojo.signature:java17:1.0@signature'
+  signature "org.codehaus.mojo.signature:java1$javaCompatibility:1.0@signature"
 }
 
 // Create an aggregate animal-sniffer task.

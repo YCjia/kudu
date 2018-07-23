@@ -43,6 +43,7 @@
 #include "kudu/consensus/log.h"
 #include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/log_index.h"
 #include "kudu/consensus/log_reader.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/metadata.pb.h"
@@ -61,7 +62,6 @@
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/walltime.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -91,10 +91,6 @@
 #include "kudu/util/stopwatch.h"
 
 DECLARE_int32(group_commit_queue_size_bytes);
-
-DEFINE_bool(skip_remove_old_recovery_dir, false,
-            "Skip removing WAL recovery dir after startup. (useful for debugging)");
-TAG_FLAG(skip_remove_old_recovery_dir, hidden);
 
 DEFINE_double(fault_crash_during_log_replay, 0.0,
               "Fraction of the time when the tablet will crash immediately "
@@ -127,6 +123,7 @@ using consensus::WRITE_OP;
 using log::Log;
 using log::LogAnchorRegistry;
 using log::LogEntryPB;
+using log::LogIndex;
 using log::LogOptions;
 using log::LogReader;
 using log::ReadableLogSegment;
@@ -195,14 +192,14 @@ class FlushedStoresSnapshot {
 // we need to set it before replay or we won't be able to re-rebuild.
 class TabletBootstrap {
  public:
-  TabletBootstrap(const scoped_refptr<TabletMetadata>& tablet_meta,
+  TabletBootstrap(scoped_refptr<TabletMetadata> tablet_meta,
                   RaftConfigPB committed_raft_config,
-                  const scoped_refptr<Clock>& clock,
+                  scoped_refptr<Clock> clock,
                   shared_ptr<MemTracker> mem_tracker,
-                  const scoped_refptr<ResultTracker>& result_tracker,
+                  scoped_refptr<ResultTracker> result_tracker,
                   MetricRegistry* metric_registry,
-                  const scoped_refptr<TabletReplica>& tablet_replica,
-                  const scoped_refptr<LogAnchorRegistry>& log_anchor_registry);
+                  scoped_refptr<TabletReplica> tablet_replica,
+                  scoped_refptr<LogAnchorRegistry> log_anchor_registry);
 
   // Plays the log segments, rebuilding the portion of the Tablet's soft
   // state that is present in the log (additional soft state may be present
@@ -357,10 +354,6 @@ class TabletBootstrap {
   // with it.
   Status UpdateClock(uint64_t timestamp);
 
-  // Removes the recovery directory and all files contained therein.
-  // Intended to be invoked after log replay successfully completes.
-  Status RemoveRecoveryDir();
-
   // Return a log prefix string in the standard "T xxx P yyy" format.
   string LogPrefix() const;
 
@@ -437,21 +430,27 @@ void TabletBootstrap::SetStatusMessage(const string& status) {
   if (tablet_replica_) tablet_replica_->SetStatusMessage(status);
 }
 
-Status BootstrapTablet(const scoped_refptr<TabletMetadata>& tablet_meta,
+Status BootstrapTablet(scoped_refptr<TabletMetadata> tablet_meta,
                        RaftConfigPB committed_raft_config,
-                       const scoped_refptr<Clock>& clock,
-                       const shared_ptr<MemTracker>& mem_tracker,
-                       const scoped_refptr<ResultTracker>& result_tracker,
+                       scoped_refptr<Clock> clock,
+                       shared_ptr<MemTracker> mem_tracker,
+                       scoped_refptr<ResultTracker> result_tracker,
                        MetricRegistry* metric_registry,
-                       const scoped_refptr<TabletReplica>& tablet_replica,
+                       scoped_refptr<TabletReplica> tablet_replica,
                        shared_ptr<tablet::Tablet>* rebuilt_tablet,
                        scoped_refptr<log::Log>* rebuilt_log,
-                       const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry,
+                       scoped_refptr<log::LogAnchorRegistry> log_anchor_registry,
                        ConsensusBootstrapInfo* consensus_info) {
   TRACE_EVENT1("tablet", "BootstrapTablet",
                "tablet_id", tablet_meta->tablet_id());
-  TabletBootstrap bootstrap(tablet_meta, std::move(committed_raft_config), clock, mem_tracker,
-                            result_tracker, metric_registry, tablet_replica, log_anchor_registry);
+  TabletBootstrap bootstrap(std::move(tablet_meta),
+                            std::move(committed_raft_config),
+                            std::move(clock),
+                            std::move(mem_tracker),
+                            std::move(result_tracker),
+                            metric_registry,
+                            std::move(tablet_replica),
+                            std::move(log_anchor_registry));
   RETURN_NOT_OK(bootstrap.Bootstrap(rebuilt_tablet, rebuilt_log, consensus_info));
   // This is necessary since OpenNewLog() initially disables sync.
   RETURN_NOT_OK((*rebuilt_log)->ReEnableSyncIfRequired());
@@ -477,21 +476,21 @@ static string DebugInfo(const string& tablet_id,
 }
 
 TabletBootstrap::TabletBootstrap(
-    const scoped_refptr<TabletMetadata>& tablet_meta,
+    scoped_refptr<TabletMetadata> tablet_meta,
     RaftConfigPB committed_raft_config,
-    const scoped_refptr<Clock>& clock, shared_ptr<MemTracker> mem_tracker,
-    const scoped_refptr<ResultTracker>& result_tracker,
+    scoped_refptr<Clock> clock, shared_ptr<MemTracker> mem_tracker,
+    scoped_refptr<ResultTracker> result_tracker,
     MetricRegistry* metric_registry,
-    const scoped_refptr<TabletReplica>& tablet_replica,
-    const scoped_refptr<LogAnchorRegistry>& log_anchor_registry)
-    : tablet_meta_(tablet_meta),
+    scoped_refptr<TabletReplica> tablet_replica,
+    scoped_refptr<LogAnchorRegistry> log_anchor_registry)
+    : tablet_meta_(std::move(tablet_meta)),
       committed_raft_config_(std::move(committed_raft_config)),
-      clock_(clock),
+      clock_(std::move(clock)),
       mem_tracker_(std::move(mem_tracker)),
-      result_tracker_(result_tracker),
+      result_tracker_(std::move(result_tracker)),
       metric_registry_(metric_registry),
-      tablet_replica_(tablet_replica),
-      log_anchor_registry_(log_anchor_registry) {}
+      tablet_replica_(std::move(tablet_replica)),
+      log_anchor_registry_(std::move(log_anchor_registry)) {}
 
 Status TabletBootstrap::Bootstrap(shared_ptr<Tablet>* rebuilt_tablet,
                                   scoped_refptr<Log>* rebuilt_log,
@@ -596,7 +595,8 @@ Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
 
   RETURN_NOT_OK_PREPEND(PlaySegments(consensus_info), "Failed log replay. Reason");
 
-  RETURN_NOT_OK(RemoveRecoveryDir());
+  RETURN_NOT_OK(Log::RemoveRecoveryDirIfExists(tablet_->metadata()->fs_manager(),
+                                               tablet_->metadata()->tablet_id()))
   RETURN_NOT_OK(FinishBootstrap("Bootstrap complete.", rebuilt_log, rebuilt_tablet));
 
   return Status::OK();
@@ -646,7 +646,7 @@ Status TabletBootstrap::PrepareRecoveryDir(bool* needs_recovery) {
     // Since we have a recovery directory, clear out the log_dir by recursively
     // deleting it and creating a new one so that we don't end up with remnants
     // of old WAL segments or indexes after replay.
-    if (fs_manager->env()->FileExists(log_dir)) {
+    if (fs_manager->Exists(log_dir)) {
       LOG_WITH_PREFIX(INFO) << "Deleting old log files from previous recovery attempt in "
                             << log_dir;
       RETURN_NOT_OK_PREPEND(fs_manager->env()->DeleteRecursively(log_dir),
@@ -696,41 +696,19 @@ Status TabletBootstrap::PrepareRecoveryDir(bool* needs_recovery) {
 }
 
 Status TabletBootstrap::OpenLogReaderInRecoveryDir() {
+  const string& tablet_id = tablet_->tablet_id();
+  FsManager* fs_manager = tablet_meta_->fs_manager();
   VLOG_WITH_PREFIX(1) << "Opening log reader in log recovery dir "
-                      << tablet_meta_->fs_manager()->GetTabletWalRecoveryDir(tablet_->tablet_id());
+                      << fs_manager->GetTabletWalRecoveryDir(tablet_id);
   // Open the reader.
-  RETURN_NOT_OK_PREPEND(LogReader::OpenFromRecoveryDir(tablet_->metadata()->fs_manager(),
-                                                       tablet_->metadata()->tablet_id(),
-                                                       tablet_->GetMetricEntity().get(),
-                                                       &log_reader_),
+  // Since we're recovering, we don't want to have any log index -- since it
+  // isn't fsynced() during writing, its contents are useless to us.
+  scoped_refptr<LogIndex> log_index(nullptr);
+  const string recovery_dir = fs_manager->GetTabletWalRecoveryDir(tablet_id);
+  RETURN_NOT_OK_PREPEND(LogReader::Open(fs_manager->env(), recovery_dir, log_index, tablet_id,
+                                        tablet_->GetMetricEntity().get(),
+                                        &log_reader_),
                         "Could not open LogReader. Reason");
-  return Status::OK();
-}
-
-Status TabletBootstrap::RemoveRecoveryDir() {
-  FsManager* fs_manager = tablet_->metadata()->fs_manager();
-  string recovery_path = fs_manager->GetTabletWalRecoveryDir(tablet_->metadata()->tablet_id());
-  CHECK(fs_manager->Exists(recovery_path))
-      << "Tablet WAL recovery dir " << recovery_path << " does not exist.";
-
-  VLOG_WITH_PREFIX(1) << "Preparing to delete log recovery files and directory " << recovery_path;
-
-  string tmp_path = Substitute("$0-$1", recovery_path, GetCurrentTimeMicros());
-  VLOG_WITH_PREFIX(1) << "Renaming log recovery dir from "  << recovery_path
-                        << " to " << tmp_path;
-  RETURN_NOT_OK_PREPEND(fs_manager->env()->RenameFile(recovery_path, tmp_path),
-                        Substitute("Could not rename old recovery dir from: $0 to: $1",
-                                   recovery_path, tmp_path));
-
-  if (FLAGS_skip_remove_old_recovery_dir) {
-    LOG_WITH_PREFIX(INFO) << "--skip_remove_old_recovery_dir enabled. NOT deleting " << tmp_path;
-    return Status::OK();
-  }
-  VLOG_WITH_PREFIX(1) << "Deleting all files from renamed log recovery directory " << tmp_path;
-  RETURN_NOT_OK_PREPEND(fs_manager->env()->DeleteRecursively(tmp_path),
-                        "Could not remove renamed recovery dir " + tmp_path);
-  VLOG_WITH_PREFIX(1) << "Completed deletion of old log recovery files and directory "
-                        << tmp_path;
   return Status::OK();
 }
 
@@ -1059,7 +1037,7 @@ Status TabletBootstrap::HandleEntryPair(LogEntryPB* replicate_entry, LogEntryPB*
 #define RETURN_NOT_OK_REPLAY(ReplayMethodName, replicate, commit)       \
   RETURN_NOT_OK_PREPEND(ReplayMethodName(replicate, commit),            \
                         Substitute(error_fmt, OperationType_Name(op_type), \
-                                   SecureShortDebugString(*replicate),   \
+                                   SecureShortDebugString(*(replicate)), \
                                    SecureShortDebugString(commit)))
 
   ReplicateMsg* replicate = replicate_entry->mutable_replicate();

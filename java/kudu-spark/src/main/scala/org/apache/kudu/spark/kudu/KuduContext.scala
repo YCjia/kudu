@@ -18,26 +18,24 @@
 package org.apache.kudu.spark.kudu
 
 import java.security.{AccessController, PrivilegedAction}
-import java.util
+
 import javax.security.auth.Subject
 import javax.security.auth.login.{AppConfigurationEntry, Configuration, LoginContext}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
-
 import org.apache.hadoop.util.ShutdownHookManager
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
-import org.apache.spark.sql.types.{DataType, DataTypes, StructType}
+import org.apache.spark.sql.types.{DataType, DataTypes, DecimalType, StructType}
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.util.AccumulatorV2
-import org.apache.yetus.audience.InterfaceStability
+import org.apache.yetus.audience.{InterfaceAudience, InterfaceStability}
 import org.slf4j.{Logger, LoggerFactory}
-
 import org.apache.kudu.client.SessionConfiguration.FlushMode
 import org.apache.kudu.client._
-import org.apache.kudu.spark.kudu
-import org.apache.kudu.{ColumnSchema, Schema, Type}
+import org.apache.kudu.spark.kudu.SparkUtil._
+import org.apache.kudu.{Schema, Type}
 
 /**
   * KuduContext is a serializable container for Kudu client connections.
@@ -48,7 +46,10 @@ import org.apache.kudu.{ColumnSchema, Schema, Type}
   */
 @InterfaceStability.Unstable
 class KuduContext(val kuduMaster: String,
-                  sc: SparkContext) extends Serializable {
+                  sc: SparkContext,
+                  val socketReadTimeoutMs: Option[Long]) extends Serializable {
+
+  def this(kuduMaster: String, sc: SparkContext) = this(kuduMaster, sc, None)
 
   /**
     * TimestampAccumulator accumulates the maximum value of client's
@@ -88,8 +89,6 @@ class KuduContext(val kuduMaster: String,
   val timestampAccumulator = new TimestampAccumulator()
   sc.register(timestampAccumulator)
 
-  import kudu.KuduContext._
-
   @Deprecated()
   def this(kuduMaster: String) {
     this(kuduMaster, new SparkContext())
@@ -98,7 +97,7 @@ class KuduContext(val kuduMaster: String,
   @transient lazy val syncClient: KuduClient = asyncClient.syncClient()
 
   @transient lazy val asyncClient: AsyncKuduClient = {
-    val c = KuduConnection.getAsyncClient(kuduMaster)
+    val c = KuduClientCache.getAsyncClient(kuduMaster, socketReadTimeoutMs)
     if (authnCredentials != null) {
       c.importAuthenticationCredentials(authnCredentials)
     }
@@ -107,7 +106,7 @@ class KuduContext(val kuduMaster: String,
 
   // Visible for testing.
   private[kudu] val authnCredentials : Array[Byte] = {
-    Subject.doAs(getSubject(sc), new PrivilegedAction[Array[Byte]] {
+    Subject.doAs(KuduContext.getSubject(sc), new PrivilegedAction[Array[Byte]] {
       override def run(): Array[Byte] = syncClient.exportAuthenticationCredentials()
     })
   }
@@ -127,7 +126,8 @@ class KuduContext(val kuduMaster: String,
     // TODO: provide an elegant way to pass various options (faultTolerantScan,
     // TODO: localityScan, etc) to KuduRDD
     new KuduRDD(this, 1024*1024*20, columnProjection.toArray, Array(),
-                syncClient.openTable(tableName), false, ReplicaSelection.LEADER_ONLY, sc)
+                syncClient.openTable(tableName), false, ReplicaSelection.LEADER_ONLY,
+                None, None, sc)
   }
 
   /**
@@ -153,38 +153,44 @@ class KuduContext(val kuduMaster: String,
     * @param schema struct schema of table
     * @param keys primary keys of the table
     * @param options replication and partitioning options for the table
+    * @return the KuduTable that was created
     */
   def createTable(tableName: String,
                   schema: StructType,
                   keys: Seq[String],
                   options: CreateTableOptions): KuduTable = {
-    val kuduCols = new util.ArrayList[ColumnSchema]()
-    // add the key columns first, in the order specified
-    for (key <- keys) {
-      val f = schema.fields(schema.fieldIndex(key))
-      kuduCols.add(new ColumnSchema.ColumnSchemaBuilder(f.name, kuduType(f.dataType)).key(true).build())
-    }
-    // now add the non-key columns
-    for (f <- schema.fields.filter(field=> !keys.contains(field.name))) {
-      kuduCols.add(new ColumnSchema.ColumnSchemaBuilder(f.name, kuduType(f.dataType)).nullable(f.nullable).key(false).build())
-    }
+    val kuduSchema = createSchema(schema, keys)
+    createTable(tableName, kuduSchema, options)
+  }
 
-    syncClient.createTable(tableName, new Schema(kuduCols), options)
+  /**
+    * Creates a kudu table for the given schema. Partitioning can be specified through options.
+    *
+    * @param tableName table to create
+    * @param schema schema of table
+    * @param options replication and partitioning options for the table
+    * @return the KuduTable that was created
+    */
+  def createTable(tableName: String,
+                  schema: Schema,
+                  options: CreateTableOptions): KuduTable = {
+    syncClient.createTable(tableName, schema, options)
+  }
+
+  /**
+    * Creates a kudu schema for the given struct schema.
+    *
+    * @param schema struct schema of table
+    * @param keys primary keys of the table
+    * @return the Kudu schema
+    */
+  def createSchema(schema: StructType, keys: Seq[String]): Schema = {
+    kuduSchema(schema, keys)
   }
 
   /** Map Spark SQL type to Kudu type */
-  def kuduType(dt: DataType) : Type = dt match {
-    case DataTypes.BinaryType => Type.BINARY
-    case DataTypes.BooleanType => Type.BOOL
-    case DataTypes.StringType => Type.STRING
-    case DataTypes.TimestampType => Type.UNIXTIME_MICROS
-    case DataTypes.ByteType => Type.INT8
-    case DataTypes.ShortType => Type.INT16
-    case DataTypes.IntegerType => Type.INT32
-    case DataTypes.LongType => Type.INT64
-    case DataTypes.FloatType => Type.FLOAT
-    case DataTypes.DoubleType => Type.DOUBLE
-    case _ => throw new IllegalArgumentException(s"No support for Spark SQL type $dt")
+  def kuduType(dt: DataType) : Type = {
+    sparkTypeToKuduType(dt)
   }
 
   /**
@@ -192,20 +198,32 @@ class KuduContext(val kuduMaster: String,
     *
     * @param data the data to insert
     * @param tableName the Kudu table to insert into
+    * @param writeOptions the Kudu write options
     */
-  def insertRows(data: DataFrame, tableName: String): Unit = {
-    writeRows(data, tableName, Insert)
+  def insertRows(data: DataFrame,
+                 tableName: String,
+                 writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    writeRows(data, tableName, Insert, writeOptions)
   }
 
   /**
     * Inserts the rows of a [[DataFrame]] into a Kudu table, ignoring any new
     * rows that have a primary key conflict with existing rows.
     *
+    * This function call is equivalent to the following, which is preferred:
+    * {{{
+    * insertRows(data, tableName, new KuduWriteOptions(ignoreDuplicateRowErrors = true))
+    * }}}
+    *
     * @param data the data to insert into Kudu
     * @param tableName the Kudu table to insert into
     */
-  def insertIgnoreRows(data: DataFrame, tableName: String): Unit = {
-    writeRows(data, tableName, InsertIgnore)
+  @deprecated("Use KuduContext.insertRows(data, tableName, new KuduWriteOptions(ignoreDuplicateRowErrors = true))")
+  def insertIgnoreRows(data: DataFrame,
+                       tableName: String): Unit = {
+    val writeOptions = new KuduWriteOptions
+    writeOptions.ignoreDuplicateRowErrors = true
+    writeRows(data, tableName, Insert, writeOptions)
   }
 
   /**
@@ -213,9 +231,12 @@ class KuduContext(val kuduMaster: String,
     *
     * @param data the data to upsert into Kudu
     * @param tableName the Kudu table to upsert into
+    * @param writeOptions the Kudu write options
     */
-  def upsertRows(data: DataFrame, tableName: String): Unit = {
-    writeRows(data, tableName, Upsert)
+  def upsertRows(data: DataFrame,
+                 tableName: String,
+                 writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    writeRows(data, tableName, Upsert, writeOptions)
   }
 
   /**
@@ -223,9 +244,12 @@ class KuduContext(val kuduMaster: String,
     *
     * @param data the data to update into Kudu
     * @param tableName the Kudu table to update
+    * @param writeOptions the Kudu write options
     */
-  def updateRows(data: DataFrame, tableName: String): Unit = {
-    writeRows(data, tableName, Update)
+  def updateRows(data: DataFrame,
+                 tableName: String,
+                 writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    writeRows(data, tableName, Update, writeOptions)
   }
 
   /**
@@ -234,18 +258,24 @@ class KuduContext(val kuduMaster: String,
     * @param data the data to delete from Kudu
     *             note that only the key columns should be specified for deletes
     * @param tableName The Kudu tabe to delete from
+    * @param writeOptions the Kudu write options
     */
-  def deleteRows(data: DataFrame, tableName: String): Unit = {
-    writeRows(data, tableName, Delete)
+  def deleteRows(data: DataFrame,
+                 tableName: String,
+                 writeOptions: KuduWriteOptions = new KuduWriteOptions): Unit = {
+    writeRows(data, tableName, Delete, writeOptions)
   }
 
-  private[kudu] def writeRows(data: DataFrame, tableName: String, operation: OperationType) {
+  private[kudu] def writeRows(data: DataFrame,
+                              tableName: String,
+                              operation: OperationType,
+                              writeOptions: KuduWriteOptions = new KuduWriteOptions) {
     val schema = data.schema
     // Get the client's last propagated timestamp on the driver.
     val lastPropagatedTimestamp = syncClient.getLastPropagatedTimestamp
     data.foreachPartition(iterator => {
       val pendingErrors = writePartitionRows(iterator, schema, tableName, operation,
-                                             lastPropagatedTimestamp)
+                                             lastPropagatedTimestamp, writeOptions)
       val errorCount = pendingErrors.getRowErrors.length
       if (errorCount > 0) {
         val errors = pendingErrors.getRowErrors.take(5).map(_.getErrorStatus).mkString
@@ -259,7 +289,8 @@ class KuduContext(val kuduMaster: String,
                                  schema: StructType,
                                  tableName: String,
                                  operationType: OperationType,
-                                 lastPropagatedTimestamp: Long): RowErrorsAndOverflowStatus = {
+                                 lastPropagatedTimestamp: Long,
+                                 writeOptions: KuduWriteOptions) : RowErrorsAndOverflowStatus = {
     // Since each executor has its own KuduClient, update executor's propagated timestamp
     // based on the last one on the driver.
     syncClient.updateLastPropagatedTimestamp(lastPropagatedTimestamp)
@@ -269,25 +300,32 @@ class KuduContext(val kuduMaster: String,
     })
     val session: KuduSession = syncClient.newSession
     session.setFlushMode(FlushMode.AUTO_FLUSH_BACKGROUND)
-    session.setIgnoreAllDuplicateRows(operationType.ignoreDuplicateRowErrors)
+    session.setIgnoreAllDuplicateRows(writeOptions.ignoreDuplicateRowErrors)
     try {
       for (row <- rows) {
         val operation = operationType.operation(table)
         for ((sparkIdx, kuduIdx) <- indices) {
           if (row.isNullAt(sparkIdx)) {
-            operation.getRow.setNull(kuduIdx)
-          } else schema.fields(sparkIdx).dataType match {
-            case DataTypes.StringType => operation.getRow.addString(kuduIdx, row.getString(sparkIdx))
-            case DataTypes.BinaryType => operation.getRow.addBinary(kuduIdx, row.getAs[Array[Byte]](sparkIdx))
-            case DataTypes.BooleanType => operation.getRow.addBoolean(kuduIdx, row.getBoolean(sparkIdx))
-            case DataTypes.ByteType => operation.getRow.addByte(kuduIdx, row.getByte(sparkIdx))
-            case DataTypes.ShortType => operation.getRow.addShort(kuduIdx, row.getShort(sparkIdx))
-            case DataTypes.IntegerType => operation.getRow.addInt(kuduIdx, row.getInt(sparkIdx))
-            case DataTypes.LongType => operation.getRow.addLong(kuduIdx, row.getLong(sparkIdx))
-            case DataTypes.FloatType => operation.getRow.addFloat(kuduIdx, row.getFloat(sparkIdx))
-            case DataTypes.DoubleType => operation.getRow.addDouble(kuduIdx, row.getDouble(sparkIdx))
-            case DataTypes.TimestampType => operation.getRow.addLong(kuduIdx, KuduRelation.timestampToMicros(row.getTimestamp(sparkIdx)))
-            case t => throw new IllegalArgumentException(s"No support for Spark SQL type $t")
+            if (table.getSchema.getColumnByIndex(kuduIdx).isKey) {
+              val key_name = table.getSchema.getColumnByIndex(kuduIdx).getName
+              throw new IllegalArgumentException(s"Can't set primary key column '$key_name' to null")
+            }
+            if (!writeOptions.ignoreNull) operation.getRow.setNull(kuduIdx)
+          } else {
+            schema.fields(sparkIdx).dataType match {
+              case DataTypes.StringType => operation.getRow.addString(kuduIdx, row.getString(sparkIdx))
+              case DataTypes.BinaryType => operation.getRow.addBinary(kuduIdx, row.getAs[Array[Byte]](sparkIdx))
+              case DataTypes.BooleanType => operation.getRow.addBoolean(kuduIdx, row.getBoolean(sparkIdx))
+              case DataTypes.ByteType => operation.getRow.addByte(kuduIdx, row.getByte(sparkIdx))
+              case DataTypes.ShortType => operation.getRow.addShort(kuduIdx, row.getShort(sparkIdx))
+              case DataTypes.IntegerType => operation.getRow.addInt(kuduIdx, row.getInt(sparkIdx))
+              case DataTypes.LongType => operation.getRow.addLong(kuduIdx, row.getLong(sparkIdx))
+              case DataTypes.FloatType => operation.getRow.addFloat(kuduIdx, row.getFloat(sparkIdx))
+              case DataTypes.DoubleType => operation.getRow.addDouble(kuduIdx, row.getDouble(sparkIdx))
+              case DataTypes.TimestampType => operation.getRow.addTimestamp(kuduIdx, row.getTimestamp(sparkIdx))
+              case DecimalType() => operation.getRow.addDecimal(kuduIdx, row.getDecimal(sparkIdx))
+              case t => throw new IllegalArgumentException(s"No support for Spark SQL type $t")
+            }
           }
         }
         session.apply(operation)
@@ -352,8 +390,8 @@ private object KuduContext {
   }
 }
 
-private object KuduConnection {
-  private[kudu] val asyncCache = new mutable.HashMap[String, AsyncKuduClient]()
+private object KuduClientCache {
+  private case class CacheKey(kuduMaster: String, socketReadTimeoutMs: Option[Long])
 
   /**
     * Set to
@@ -364,17 +402,29 @@ private object KuduConnection {
     */
   private val ShutdownHookPriority = 100
 
-  def getAsyncClient(kuduMaster: String): AsyncKuduClient = {
-    asyncCache.synchronized {
-      if (!asyncCache.contains(kuduMaster)) {
-        val asyncClient = new AsyncKuduClient.AsyncKuduClientBuilder(kuduMaster).build()
+  private val clientCache = new mutable.HashMap[CacheKey, AsyncKuduClient]()
+
+  // Visible for testing.
+  private[kudu] def clearCacheForTests() = clientCache.clear()
+
+  def getAsyncClient(kuduMaster: String, socketReadTimeoutMs: Option[Long]): AsyncKuduClient = {
+    val cacheKey = CacheKey(kuduMaster, socketReadTimeoutMs)
+    clientCache.synchronized {
+      if (!clientCache.contains(cacheKey)) {
+        val builder = new AsyncKuduClient.AsyncKuduClientBuilder(kuduMaster)
+        socketReadTimeoutMs match {
+          case Some(timeout) => builder.defaultSocketReadTimeoutMs(timeout)
+          case None =>
+        }
+
+        val asyncClient = builder.build()
         ShutdownHookManager.get().addShutdownHook(
           new Runnable {
             override def run(): Unit = asyncClient.close()
           }, ShutdownHookPriority)
-        asyncCache.put(kuduMaster, asyncClient)
+        clientCache.put(cacheKey, asyncClient)
       }
-      return asyncCache(kuduMaster)
+      return clientCache(cacheKey)
     }
   }
 }

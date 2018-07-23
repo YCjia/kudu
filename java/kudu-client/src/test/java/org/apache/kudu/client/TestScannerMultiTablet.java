@@ -17,6 +17,7 @@
 package org.apache.kudu.client;
 
 import static org.apache.kudu.Type.STRING;
+import static org.apache.kudu.util.ClientTestUtil.countRowsInScan;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
@@ -27,7 +28,9 @@ import java.util.ArrayList;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.stumbleupon.async.Deferred;
-import org.junit.BeforeClass;
+
+import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.kudu.client.Client.ScanTokenPB;
@@ -41,16 +44,20 @@ public class TestScannerMultiTablet extends BaseKuduTest {
       TestScannerMultiTablet.class.getName()+"-"+System.currentTimeMillis();
 
   private static Schema schema = getSchema();
-  private static KuduTable table;
 
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
-    BaseKuduTest.setUpBeforeClass();
+  /**
+   * The timestamp after inserting the rows into the test table during setUp().
+   */
+  private static long beforeWriteTimestamp;
+  private KuduTable table;
+
+  @Before
+  public void setUp() throws Exception {
     // create a 4-tablets table for scanning
     CreateTableOptions builder =
         new CreateTableOptions().setRangePartitionColumns(ImmutableList.of("key1", "key2"));
 
-    for (int i = 1; i < 4; i++){
+    for (int i = 1; i < 4; i++) {
       PartialRow splitRow = schema.newPartialRow();
       splitRow.addString("key1", "" + i);
       splitRow.addString("key2", "");
@@ -59,8 +66,7 @@ public class TestScannerMultiTablet extends BaseKuduTest {
 
     createTable(TABLE_NAME, schema, builder);
 
-    table = openTable(TABLE_NAME);
-
+    KuduTable insertTable = openTable(TABLE_NAME);
     AsyncKuduSession session = client.newSession();
     session.setFlushMode(AsyncKuduSession.FlushMode.AUTO_FLUSH_SYNC);
 
@@ -72,7 +78,7 @@ public class TestScannerMultiTablet extends BaseKuduTest {
     String[] keys = new String[] {"1", "2", "3"};
     for (String key1 : keys) {
       for (String key2 : keys) {
-        Insert insert = table.newInsert();
+        Insert insert = insertTable.newInsert();
         PartialRow row = insert.getRow();
         row.addString(0, key1);
         row.addString(1, key2);
@@ -81,6 +87,15 @@ public class TestScannerMultiTablet extends BaseKuduTest {
         d.join(DEFAULT_SLEEP);
       }
     }
+
+    beforeWriteTimestamp = client.getLastPropagatedTimestamp();
+
+    // Reset the clients in order to clear the propagated timestamp, which may
+    // have been set if other test cases ran before this one. This ensures
+    // that all tests set their own state.
+    resetClients();
+    // Reopen the table using the reset client.
+    table = openTable(TABLE_NAME);
   }
 
   // Test various combinations of start/end row keys.
@@ -121,8 +136,13 @@ public class TestScannerMultiTablet extends BaseKuduTest {
   // Test mixing start/end row keys with predicates.
   @Test(timeout = 100000)
   public void testKeysAndPredicates() throws Exception {
+    // Value that doesn't exist, predicates has primary column
+    ColumnRangePredicate predicate = new ColumnRangePredicate(schema.getColumnByIndex(1));
+    predicate.setUpperBound("1");
+    assertEquals(0, countRowsInScan(getScanner("1", "2", "1", "3", predicate)));
+
     // First row from the 2nd tablet.
-    ColumnRangePredicate predicate = new ColumnRangePredicate(schema.getColumnByIndex(2));
+    predicate = new ColumnRangePredicate(schema.getColumnByIndex(2));
     predicate.setLowerBound("1");
     predicate.setUpperBound("1");
     assertEquals(1, countRowsInScan(getScanner("1", "", "2", "", predicate)));
@@ -240,11 +260,90 @@ public class TestScannerMultiTablet extends BaseKuduTest {
     assertEquals(9, rowCount);
   }
 
+  // Regression test for KUDU-2415.
+  // Scanning a never-written-to tablet from a fresh client with no propagated
+  // timestamp in "read-your-writes' mode should not fail.
+  @Test(timeout = 100000)
+  @Ignore("TODO(KUDU-2415)") // not fixed yet!
+  public void testReadYourWritesFreshClientFreshTable() throws Exception {
+    // NOTE: this test fails because the first tablet in the table
+    // is empty and has never been written to.
+
+    // Perform scan in READ_YOUR_WRITES mode. Before the scan, verify that the
+    // propagated timestamp is unset, since this is a fresh client.
+    AsyncKuduScanner scanner = client.newScannerBuilder(table)
+                                     .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
+                                     .build();
+    KuduScanner syncScanner = new KuduScanner(scanner);
+    assertEquals(scanner.getReadMode(), syncScanner.getReadMode());
+    assertEquals(AsyncKuduClient.NO_TIMESTAMP, client.getLastPropagatedTimestamp());
+    assertEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
+
+    assertEquals(9, countRowsInScan(syncScanner));
+  }
+
+  // Test multi tablets scan in READ_YOUR_WRITES mode for both AUTO_FLUSH_SYNC
+  // (single operation) and MANUAL_FLUSH (batches) flush modes to ensure
+  // client-local read-your-writes.
+  @Test(timeout = 100000)
+  public void testReadYourWrites() throws Exception {
+    long preTs = beforeWriteTimestamp;
+
+    // Update the propagated timestamp to ensure we see the rows written
+    // in the constructor.
+    syncClient.updateLastPropagatedTimestamp(preTs);
+
+    // Perform scan in READ_YOUR_WRITES mode. Before the scan, verify that the
+    // scanner timestamp is not yet set. It will get set only once the scan
+    // is opened.
+    AsyncKuduScanner scanner = client.newScannerBuilder(table)
+                                     .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
+                                     .build();
+    KuduScanner syncScanner = new KuduScanner(scanner);
+    assertEquals(scanner.getReadMode(), syncScanner.getReadMode());
+    assertEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
+
+    assertEquals(9, countRowsInScan(syncScanner));
+
+    // After the scan, verify that the chosen snapshot timestamp is
+    // returned from the server and it is larger than the previous
+    // propagated timestamp.
+    assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, scanner.getSnapshotTimestamp());
+    assertTrue(preTs < scanner.getSnapshotTimestamp());
+    syncScanner.close();
+
+    // Perform write in MANUAL_FLUSH (batch) mode.
+    KuduSession session = syncClient.newSession();
+    session.setFlushMode(KuduSession.FlushMode.MANUAL_FLUSH);
+    String[] keys = new String[] {"11", "22", "33"};
+    for (int i = 0; i < keys.length; i++) {
+      Insert insert = table.newInsert();
+      PartialRow row = insert.getRow();
+      row.addString(schema.getColumnByIndex(0).getName(), keys[i]);
+      row.addString(schema.getColumnByIndex(1).getName(), keys[i]);
+      session.apply(insert);
+    }
+    session.flush();
+    session.close();
+
+    scanner = client.newScannerBuilder(table)
+                    .readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES)
+                    .build();
+    syncScanner = new KuduScanner(scanner);
+    assertTrue(preTs < client.getLastPropagatedTimestamp());
+    preTs = client.getLastPropagatedTimestamp();
+
+    assertEquals(12, countRowsInScan(syncScanner));
+
+    // After the scan, verify that the chosen snapshot timestamp is
+    // returned from the server and it is larger than the previous
+    // propagated timestamp.
+    assertTrue(preTs < scanner.getSnapshotTimestamp());
+    syncScanner.close();
+  }
+
   @Test(timeout = 100000)
   public void testScanPropagatesLatestTimestamp() throws Exception {
-    // Reset the clients in order to clear the propagated timestamp, which may
-    // have been set if other test cases ran before this one.
-    resetClients();
     AsyncKuduScanner scanner = client.newScannerBuilder(table).build();
 
     // Initially, the client does not have the timestamp set.
@@ -283,8 +382,6 @@ public class TestScannerMultiTablet extends BaseKuduTest {
 
   @Test(timeout = 100000)
   public void testScanTokenPropagatesTimestamp() throws Exception {
-    resetClients();
-
     // Initially, the client does not have the timestamp set.
     assertEquals(AsyncKuduClient.NO_TIMESTAMP, client.getLastPropagatedTimestamp());
     assertEquals(KuduClient.NO_TIMESTAMP, syncClient.getLastPropagatedTimestamp());
@@ -307,6 +404,19 @@ public class TestScannerMultiTablet extends BaseKuduTest {
     assertEquals(tsPrev, client.getLastPropagatedTimestamp());
     KuduScanToken.deserializeIntoScanner(serializedToken, syncClient);
     assertEquals(tsPropagated, client.getLastPropagatedTimestamp());
+  }
+
+  @Test(timeout = 100000)
+  public void testScanTokenReadMode() throws Exception {
+    ScanTokenPB.Builder pbBuilder = ScanTokenPB.newBuilder();
+    pbBuilder.setTableName(table.getName());
+    pbBuilder.setReadMode(Common.ReadMode.READ_YOUR_WRITES);
+    Client.ScanTokenPB scanTokenPB = pbBuilder.build();
+    final byte[] serializedToken = KuduScanToken.serialize(scanTokenPB);
+
+    // Deserialize scan tokens and make sure the read mode is updated accordingly.
+    KuduScanner scanner = KuduScanToken.deserializeIntoScanner(serializedToken, syncClient);
+    assertEquals(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES, scanner.getReadMode());
   }
 
   private AsyncKuduScanner getScanner(String lowerBoundKeyOne,

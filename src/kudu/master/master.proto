@@ -75,9 +75,12 @@ message MasterErrorPB {
     // The number of replicas requested is illegal (eg non-positive).
     ILLEGAL_REPLICATION_FACTOR = 11;
 
-    // The caller detected an application-level incompatibility with the callee.
-    // This might be caused by a misconfiguration, incompatible features, etc.
-    INCOMPATIBILITY = 12;
+    // The callee detected that its replica management scheme is incompatible
+    // with the caller's scheme.
+    INCOMPATIBLE_REPLICA_MANAGEMENT = 12;
+
+    // An operation involving the Hive Metastore failed.
+    HIVE_METASTORE_ERROR = 13;
   }
 
   // The error code.
@@ -199,6 +202,12 @@ message SysCertAuthorityEntryPB {
 message SysTskEntryPB {
   // TokenSigningPrivateKeyPB message representing a TSK.
   required security.TokenSigningPrivateKeyPB tsk = 1;
+}
+
+// The on-disk entry in the sys.catalog table ("metadata" column) to represent
+// the latest processed Hive Metastore notification log event ID.
+message SysNotificationLogEventIdPB {
+  optional int64 latest_notification_log_event_id = 1;
 }
 
 ////////////////////////////////////////////////////////////
@@ -555,6 +564,10 @@ message AlterTableRequestPB {
   // The table schema to use when decoding the range bound row operations. Only
   // necessary when partitions are being added or dropped.
   optional SchemaPB schema = 4;
+
+  // Whether to apply the alteration to external catalogs, such as the Hive Metastore,
+  // which the Kudu master has been configured to integrate with.
+  optional bool alter_external_catalogs = 5 [default = true];
 }
 
 message AlterTableResponsePB {
@@ -702,6 +715,20 @@ message ListMastersResponsePB {
   optional MasterErrorPB error = 3;
 }
 
+// ReplaceTabletRequest/Response: replace a tablet with a new, empty one.
+// The replaced tablet is deleted.
+message ReplaceTabletRequestPB {
+  optional bytes tablet_id = 1;
+}
+
+message ReplaceTabletResponsePB {
+  // Set if there is an error replacing the tablet.
+  optional MasterErrorPB error = 1;
+
+  // The tablet id of the replacement tablet.
+  optional bytes replacement_tablet_id = 2;
+}
+
 enum MasterFeatures {
   UNKNOWN_FEATURE = 0;
   // The master supports creating tables with non-covering range partitions.
@@ -710,6 +737,11 @@ enum MasterFeatures {
   ADD_DROP_RANGE_PARTITIONS = 2;
   // The master supports the 'ConnectToMaster' RPC.
   CONNECT_TO_MASTER = 3;
+  // The catalog manager supports different replica management schemes
+  // (see "kudu/consensus/replica_management.proto"). At least, both the
+  // EVICT_FIRST (a.k.a. 3-2-3) and the PREPARE_REPLACEMENT_BEFORE_EVICTION
+  // (a.k.a. 3-4-3) schemes.
+  REPLICA_MANAGEMENT = 4;
 }
 
 service MasterService {
@@ -773,6 +805,9 @@ service MasterService {
   }
   rpc Ping(PingRequestPB) returns (PingResponsePB) {
     option (kudu.rpc.authz_method) = "AuthorizeClientOrService";
+  }
+  rpc ReplaceTablet(ReplaceTabletRequestPB) returns (ReplaceTabletResponsePB) {
+    option (kudu.rpc.authz_method) = "AuthorizeSuperUser";
   }
 
   // Master->Master RPCs

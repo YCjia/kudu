@@ -193,18 +193,19 @@ install(FILES
 # Headers: util
 install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/../util/kudu_export.h
+  ../util/int128.h
   ../util/monotime.h
   ../util/slice.h
   ../util/status.h
   DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/kudu/util)
 
-# Client sample code.
+# Client example code.
 #
 # Can't use CMAKE_INSTALL_DOCDIR because we don't ever call project().
 install(FILES
-  samples/CMakeLists.txt
-  samples/sample.cc
-  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/kuduClient/samples)
+  ../../../examples/cpp/CMakeLists.txt
+  ../../../examples/cpp/example.cc
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/kuduClient/examples)
 
 # Exported cmake file for just the library's targets.
 #
@@ -251,16 +252,16 @@ if (NOT APPLE AND NOT "${KUDU_GENERATE_COVERAGE}")
   ADD_KUDU_TEST(client_symbol-test.sh LABELS no_dist_test)
 endif()
 
-# The samples are never built with ASAN/TSAN.
+# The examples are never built with ASAN/TSAN.
 if(NOT "${KUDU_USE_ASAN}" AND NOT "${KUDU_USE_TSAN}")
-  ADD_KUDU_TEST(client_samples-test.sh RUN_SERIAL true LABELS no_dist_test)
+  ADD_KUDU_TEST(client_examples-test.sh RUN_SERIAL true LABELS no_dist_test)
 endif()
 set(KUDU_TEST_LINK_LIBS
   itest_util
   kudu_client
   mini_cluster
   ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(client-test)
+ADD_KUDU_TEST(client-test NUM_SHARDS 8 PROCESSORS 2)
 ADD_KUDU_TEST(client-unittest)
 ADD_KUDU_TEST(predicate-test)
-ADD_KUDU_TEST(scan_token-test)
+ADD_KUDU_TEST(scan_token-test PROCESSORS 2)

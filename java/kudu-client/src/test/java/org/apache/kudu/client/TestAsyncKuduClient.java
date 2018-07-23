@@ -16,6 +16,10 @@
 // under the License.
 package org.apache.kudu.client;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static org.apache.kudu.util.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.util.ClientTestUtil.createBasicSchemaInsert;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
@@ -25,11 +29,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
-import com.google.common.base.Charsets;
 import com.google.common.base.Stopwatch;
 import com.google.protobuf.ByteString;
 import com.stumbleupon.async.Deferred;
-import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.kudu.ColumnSchema;
@@ -40,10 +42,6 @@ import org.apache.kudu.consensus.Metadata;
 import org.apache.kudu.master.Master;
 
 public class TestAsyncKuduClient extends BaseKuduTest {
-  @BeforeClass
-  public static void setUpBeforeClass() throws Exception {
-    BaseKuduTest.setUpBeforeClass();
-  }
 
   @Test(timeout = 100000)
   public void testDisconnect() throws Exception {
@@ -140,8 +138,8 @@ public class TestAsyncKuduClient extends BaseKuduTest {
     Master.TabletLocationsPB.Builder tabletPb = Master.TabletLocationsPB.newBuilder();
     for (int i = 0; i < 3; i++) {
       Common.PartitionPB.Builder partition = Common.PartitionPB.newBuilder();
-      partition.setPartitionKeyStart(ByteString.copyFrom("a" + i, Charsets.UTF_8.name()));
-      partition.setPartitionKeyEnd(ByteString.copyFrom("b" + i, Charsets.UTF_8.name()));
+      partition.setPartitionKeyStart(ByteString.copyFrom("a" + i, UTF_8.name()));
+      partition.setPartitionKeyEnd(ByteString.copyFrom("b" + i, UTF_8.name()));
       tabletPb.setPartition(partition);
       tabletPb.setTabletId(ByteString.copyFromUtf8("some id " + i));
       tabletPb.addReplicas(TestUtils.getFakeTabletReplicaPB(
@@ -152,7 +150,7 @@ public class TestAsyncKuduClient extends BaseKuduTest {
     // Test that a tablet full of unreachable replicas won't make us retry.
     try {
       KuduTable badTable = new KuduTable(client, "Invalid table name",
-          "Invalid table ID", null, null);
+          "Invalid table ID", null, null, 3);
       client.discoverTablets(badTable, null, requestBatchSize, tabletLocations, 1000);
       fail("This should have failed quickly");
     } catch (NonRecoverableException ex) {
@@ -245,6 +243,7 @@ public class TestAsyncKuduClient extends BaseKuduTest {
       client.createTable("testCreateTableOutOfOrderPrimaryKeys-" + System.currentTimeMillis(),
           schema,
           getBasicCreateTableOptions()).join();
+      fail();
     } catch (NonRecoverableException nre) {
       assertTrue(nre.getMessage().startsWith("Got out-of-order key column"));
     }

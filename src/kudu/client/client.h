@@ -37,6 +37,7 @@
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #ifdef KUDU_HEADERS_NO_STUBS
 #include <gtest/gtest_prod.h>
+
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
 #else
@@ -50,17 +51,25 @@ namespace kudu {
 
 class ClientStressTest_TestUniqueClientIds_Test;
 class KuduPartialRow;
+class MasterHmsTest_TestAlterTable_Test;
 class MonoDelta;
 class PartitionSchema;
 class SecurityUnknownTskTest;
 
+namespace client {
+class KuduClient;
+}
+
 namespace tools {
 class LeaderMasterProxy;
+
+Status AlterKuduTableOnly(client::KuduClient* kudu_client,
+                          const std::string& name,
+                          const std::string& new_name);
 } // namespace tools
 
 namespace client {
 
-class KuduClient;
 class KuduDelete;
 class KuduInsert;
 class KuduLoggingCallback;
@@ -245,6 +254,17 @@ class KUDU_EXPORT KuduClientBuilder {
   ///   @c KuduClient#exportAuthenticationCredentials in the Java client.
   /// @return Reference to the updated object.
   KuduClientBuilder& import_authentication_credentials(std::string authn_creds);
+
+  /// @brief Set the number of reactors for the RPC messenger.
+  ///
+  /// The reactor threads are used for sending and receiving. If not provided,
+  /// the underlying messenger is created with the default number of reactor
+  /// threads.
+  ///
+  /// @param [in] num_reactors
+  ///   Number of reactors to set.
+  /// @return Reference to the updated object.
+  KuduClientBuilder& num_reactors(int num_reactors);
 
   /// Create a client object.
   ///
@@ -527,6 +547,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
   friend class internal::WriteRpc;
+  friend class ConnectToClusterBaseTest;
   friend class ClientTest;
   friend class KuduClientBuilder;
   friend class KuduPartitionerBuilder;
@@ -1168,10 +1189,23 @@ class KUDU_EXPORT KuduTableAlterer {
 
  private:
   class KUDU_NO_EXPORT Data;
+
   friend class KuduClient;
+
+  friend Status tools::AlterKuduTableOnly(
+      client::KuduClient* kudu_client,
+      const std::string& name,
+      const std::string& new_name);
+
+  FRIEND_TEST(kudu::MasterHmsTest, TestAlterTable);
 
   KuduTableAlterer(KuduClient* client,
                    const std::string& name);
+
+  // Whether to apply the alteration to external catalogs, such as the Hive
+  // Metastore, which the Kudu master has been configured to integrate with.
+  // This method returns a raw pointer to this alterer object.
+  KuduTableAlterer* alter_external_catalogs(bool alter_external_catalogs);
 
   // Owned.
   Data* data_;
@@ -1734,7 +1768,19 @@ class KUDU_EXPORT KuduScanner {
     ///   by which writes are sometimes not externally consistent even when
     ///   action was taken to make them so. In these cases Isolation may
     ///   degenerate to mode "Read Committed". See KUDU-430.
-    READ_AT_SNAPSHOT
+    READ_AT_SNAPSHOT,
+
+    /// When @c READ_YOUR_WRITES is specified, the client will perform a read
+    /// such that it follows all previously known writes and reads from this client.
+    /// Specifically this mode:
+    ///  (1) ensures read-your-writes and read-your-reads session guarantees,
+    ///  (2) minimizes latency caused by waiting for outstanding write
+    ///      transactions to complete.
+    ///
+    /// Reads in this mode are not repeatable: two READ_YOUR_WRITES reads, even if
+    /// they provide the same propagated timestamp bound, can execute at different
+    /// timestamps and thus return different results.
+    READ_YOUR_WRITES
   };
 
   /// Whether the rows should be returned in order.
@@ -2076,6 +2122,13 @@ class KUDU_EXPORT KuduScanner {
   Status SetRowFormatFlags(uint64_t flags);
   ///@}
 
+  /// Set the maximum number of rows the scanner should return.
+  ///
+  /// @param [in] rows
+  ///   Limit on the number of rows to return.
+  /// @return Operation result status.
+  Status SetLimit(int64_t limit) WARN_UNUSED_RESULT;
+
   /// @return String representation of this scan.
   ///
   /// @internal
@@ -2352,6 +2405,7 @@ class KUDU_EXPORT KuduPartitioner {
   Status PartitionRow(const KuduPartialRow& row, int* partition);
  private:
   class KUDU_NO_EXPORT Data;
+
   friend class KuduPartitionerBuilder;
 
   explicit KuduPartitioner(Data* data);

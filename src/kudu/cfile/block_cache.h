@@ -48,6 +48,10 @@ class BlockCacheHandle;
 // Provides a singleton and LRU cache for CFile blocks.
 class BlockCache {
  public:
+  // Parse the gflag which configures the block cache. FATALs if the flag is
+  // invalid.
+  static CacheType GetConfiguredCacheTypeOrDie();
+
   // BlockId refers to the unique identifier for a Kudu block, that is, for an
   // entire CFile. This is different than the block cache's notion of a block,
   // which is just a portion of a CFile.
@@ -81,7 +85,7 @@ class BlockCache {
     PendingEntry(Cache* cache, Cache::PendingHandle* handle)
         : cache_(cache), handle_(handle) {
     }
-    PendingEntry(PendingEntry&& other) : PendingEntry() {
+    PendingEntry(PendingEntry&& other) noexcept : PendingEntry() {
       *this = std::move(other);
     }
 
@@ -89,7 +93,7 @@ class BlockCache {
       reset();
     }
 
-    PendingEntry& operator=(PendingEntry&& other);
+    PendingEntry& operator=(PendingEntry&& other) noexcept;
     PendingEntry& operator=(const PendingEntry& other) = delete;
 
     // Free the pending entry back to the block cache.
@@ -224,7 +228,7 @@ class BlockCacheHandle {
 
 
 inline BlockCache::PendingEntry& BlockCache::PendingEntry::operator=(
-    BlockCache::PendingEntry&& other) {
+    BlockCache::PendingEntry&& other) noexcept {
   reset();
   cache_ = other.cache_;
   handle_ = other.handle_;

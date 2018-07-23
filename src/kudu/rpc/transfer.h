@@ -21,6 +21,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits.h>
 #include <string>
 
 #include <boost/intrusive/list_hook.hpp>
@@ -33,7 +34,7 @@
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
-DECLARE_int32(rpc_max_message_size);
+DECLARE_int64(rpc_max_message_size);
 
 namespace kudu {
 
@@ -47,7 +48,8 @@ class TransferLimits {
  public:
   enum {
     kMaxSidecars = 10,
-    kMaxPayloadSlices = kMaxSidecars + 2 // (header + msg)
+    kMaxPayloadSlices = kMaxSidecars + 2, // (header + msg)
+    kMaxTotalSidecarBytes = INT_MAX
   };
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(TransferLimits);
@@ -89,8 +91,8 @@ class InboundTransfer {
 
   faststring buf_;
 
-  int32_t total_length_;
-  int32_t cur_offset_;
+  uint32_t total_length_;
+  uint32_t cur_offset_;
 
   DISALLOW_COPY_AND_ASSIGN(InboundTransfer);
 };
@@ -182,6 +184,11 @@ class OutboundTransfer : public boost::intrusive::list_base_hook<> {
   // In the case of outbound calls, the associated call ID.
   // In the case of call responses, kInvalidCallId
   int32_t call_id_;
+
+  // True if SendBuffer() has been called at least once. This can be true even if
+  // no bytes were sent successfully. This is needed as SSL_write() is stateful.
+  // Please see KUDU-2334 for details.
+  bool started_;
 
   bool aborted_;
 

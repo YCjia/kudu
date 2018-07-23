@@ -54,8 +54,8 @@
 #include "kudu/gutil/strings/util.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/cluster_verifier.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/log_verifier.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/raft_consensus-itest-base.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/master/master.pb.h"
@@ -70,8 +70,12 @@
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/env.h"
+#include "kudu/util/env_util.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/scoped_cleanup.h"
@@ -91,15 +95,21 @@ DECLARE_int32(rpc_timeout);
 
 METRIC_DECLARE_entity(tablet);
 METRIC_DECLARE_counter(transaction_memory_pressure_rejections);
+METRIC_DECLARE_gauge_int64(time_since_last_leader_heartbeat);
+METRIC_DECLARE_gauge_int64(failed_elections_since_stable_leader);
 
 using kudu::client::KuduInsert;
 using kudu::client::KuduSession;
 using kudu::client::KuduTable;
 using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalDaemonOptions;
 using kudu::cluster::ExternalTabletServer;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::consensus::ConsensusRequestPB;
 using kudu::consensus::ConsensusResponsePB;
 using kudu::consensus::ConsensusServiceProxy;
+using kudu::consensus::EXCLUDE_HEALTH_REPORT;
 using kudu::consensus::MajoritySize;
 using kudu::consensus::MakeOpId;
 using kudu::consensus::OpId;
@@ -125,6 +135,7 @@ using kudu::itest::WaitUntilTabletInState;
 using kudu::itest::WriteSimpleTestRow;
 using kudu::master::TabletLocationsPB;
 using kudu::master::VOTER_REPLICA;
+using kudu::env_util::ListFilesInDir;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::RpcController;
@@ -523,7 +534,7 @@ void RaftConsensusITest::CreateClusterForCrashyNodesTests() {
   // log area.
   ts_flags.emplace_back("--log_preallocate_segments=false");
 
-  CreateCluster("raft_consensus-itest-crashy-nodes-cluster", ts_flags, {});
+  NO_FATALS(CreateCluster("raft_consensus-itest-crashy-nodes-cluster", ts_flags, {}));
 }
 
 void RaftConsensusITest::DoTestCrashyNodes(TestWorkload* workload, int max_rows_to_insert) {
@@ -896,7 +907,7 @@ TEST_F(RaftConsensusITest, TestFollowerFallsBehindLeaderGC) {
 // For example, KUDU-783 reproduces from this test approximately 5% of the
 // time on a slow-test debug build.
 TEST_F(RaftConsensusITest, InsertUniqueKeysWithCrashyNodes) {
-  CreateClusterForCrashyNodesTests();
+  NO_FATALS(CreateClusterForCrashyNodesTests());
 
   TestWorkload workload(cluster_.get());
   workload.set_write_batch_size(1);
@@ -909,7 +920,7 @@ TEST_F(RaftConsensusITest, InsertUniqueKeysWithCrashyNodes) {
 // locking, may cause deadlocks and other anomalies that cannot be observed when
 // keys are unique.
 TEST_F(RaftConsensusITest, InsertDuplicateKeysWithCrashyNodes) {
-  CreateClusterForCrashyNodesTests();
+  NO_FATALS(CreateClusterForCrashyNodesTests());
 
   TestWorkload workload(cluster_.get());
   workload.set_write_pattern(TestWorkload::INSERT_WITH_MANY_DUP_KEYS);
@@ -1056,10 +1067,11 @@ TEST_F(RaftConsensusITest, TestLMPMismatchOnRestartedReplica) {
 
   // The COMMIT messages end up in the WAL asynchronously, so loop reading the
   // tablet server's WAL until it shows up.
+  int replica_idx = cluster_->tablet_server_index_by_uuid(replica_ets->uuid());
   ASSERT_EVENTUALLY([&]() {
       LogVerifier lv(cluster_.get());
       OpId commit;
-      ASSERT_OK(lv.ScanForHighestCommittedOpIdInLog(replica_ets, tablet_id_, &commit));
+      ASSERT_OK(lv.ScanForHighestCommittedOpIdInLog(replica_idx, tablet_id_, &commit));
       ASSERT_EQ("2.2", OpIdToString(commit));
     });
 
@@ -1790,6 +1802,10 @@ TEST_F(RaftConsensusITest, TestEarlyCommitDespiteMemoryPressure) {
     // When using tcmalloc, we set it to 30MB, since we can get accurate process memory
     // usage statistics. Otherwise, set to only 4MB, since we'll only be throttling based
     // on our tracked memory.
+    // Since part of the point of the test is to have memory pressure, don't
+    // insist the block cache capacity is small compared to the memory pressure
+    // threshold.
+    "--force_block_cache_capacity",
 #ifdef TCMALLOC_ENABLED
     "--memory_limit_hard_bytes=30000000",
 #else
@@ -2494,7 +2510,8 @@ TEST_P(RaftConsensusParamReplicationModesITest, Test_KUDU_1735) {
     ASSERT_EVENTUALLY([&] {
       for (auto* srv : { leader_tserver, evicted_tserver }) {
         consensus::ConsensusStatePB cstate;
-        ASSERT_OK(itest::GetConsensusState(srv, tablet_id_, kTimeout, &cstate));
+        ASSERT_OK(itest::GetConsensusState(srv, tablet_id_, kTimeout, EXCLUDE_HEALTH_REPORT,
+                                           &cstate));
         ASSERT_TRUE(cstate.has_pending_config());
       }
     });
@@ -2627,6 +2644,174 @@ TEST_F(RaftConsensusITest, TestCorruptReplicaMetadata) {
                                    kTimeout));
 }
 
+int64_t GetFailedElectionsSinceStableLeader(const ExternalTabletServer* ets,
+                                            const std::string& tablet_id) {
+  int64_t ret;
+  CHECK_OK(GetInt64Metric(
+        ets->bound_http_hostport(),
+        &METRIC_ENTITY_tablet,
+        tablet_id.c_str(),
+        &METRIC_failed_elections_since_stable_leader,
+        "value",
+        &ret));
+  return ret;
+}
+
+int64_t GetTimeSinceLastLeaderHeartbeat(const ExternalTabletServer* ets,
+                                        const std::string& tablet_id) {
+  int64_t ret;
+  CHECK_OK(GetInt64Metric(
+        ets->bound_http_hostport(),
+        &METRIC_ENTITY_tablet,
+        tablet_id.c_str(),
+        &METRIC_time_since_last_leader_heartbeat,
+        "value",
+        &ret));
+  return ret;
+}
+
+// Test for election-related metrics with the leader failure detection disabled.
+// This avoids inadvertent leader elections that might race with the tests
+// of the metric's behavior.
+TEST_F(RaftConsensusITest, TestElectionMetricsFailureDetectionDisabled) {
+  constexpr auto kNumReplicas = 3;
+  constexpr auto kNumTservers = 3;
+  const vector<string> kTsFlags = {
+    // Make leader elections faster so we can test
+    // failed_elections_since_stable_leader faster.
+    "--raft_heartbeat_interval_ms=100",
+
+    // For stability reasons, this scenario uses the 'manual election' mode
+    // and assumes no leader change before restarting tablet servers later on.
+    "--enable_leader_failure_detection=false",
+  };
+  const vector<string> kMasterFlags = {
+    // Corresponding flag for the tserver's '--enable_leader_failure_detection'.
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false",
+  };
+  const auto kTimeout = MonoDelta::FromSeconds(30);
+
+  FLAGS_num_replicas = kNumReplicas;
+  FLAGS_num_tablet_servers = kNumTservers;
+  NO_FATALS(BuildAndStart(kTsFlags, kMasterFlags));
+
+  vector<TServerDetails*> tservers;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+
+  const auto* leader = tablet_servers_.begin()->second;
+  const auto& leader_uuid = leader->uuid();
+  ASSERT_EVENTUALLY([&]() {
+    const auto kLeaderTimeout = MonoDelta::FromSeconds(10);
+    ASSERT_OK(StartElection(leader, tablet_id_, kLeaderTimeout));
+    TServerDetails* elected_leader;
+    ASSERT_OK(WaitForLeaderWithCommittedOp(
+        tablet_id_, kLeaderTimeout, &elected_leader));
+    ASSERT_EQ(leader->uuid(), elected_leader->uuid());
+  });
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_, tablet_id_, 1));
+
+  auto* leader_srv = cluster_->tablet_server_by_uuid(leader_uuid);
+  auto* follower_srv = cluster_->tablet_server(
+      (cluster_->tablet_server_index_by_uuid(leader_uuid) + 1) % kNumTservers);
+
+  // Leader should always report 0 since last leader heartbeat.
+  EXPECT_EQ(0, GetTimeSinceLastLeaderHeartbeat(leader_srv, tablet_id_));
+  EXPECT_EQ(0, GetFailedElectionsSinceStableLeader(leader_srv, tablet_id_));
+
+  // Let's shut down all tablet servers except our chosen follower to make sure
+  // we don't have a leader.
+  for (auto i = 0; i < kNumTservers; ++i) {
+    if (cluster_->tablet_server(i) != follower_srv) {
+      cluster_->tablet_server(i)->Shutdown();
+    }
+  }
+
+  // Get two measurements with 500 ms sleep between them and see if the
+  // difference between them is at least 500ms.
+  const int64_t time_before_wait = GetTimeSinceLastLeaderHeartbeat(follower_srv,
+                                                                   tablet_id_);
+  SleepFor(MonoDelta::FromMilliseconds(500));
+  const int64_t time_after_wait = GetTimeSinceLastLeaderHeartbeat(follower_srv,
+                                                                  tablet_id_);
+  ASSERT_TRUE(time_after_wait >= time_before_wait + 500)
+      << "time_before_wait: " << time_before_wait << "; "
+      << "time_after_wait: " << time_after_wait;
+
+  // The follower doesn't start elections on itself because of
+  // --enable_leader_failure_detection=false flag, so the metric should read 0.
+  ASSERT_EQ(0, GetFailedElectionsSinceStableLeader(follower_srv, tablet_id_));
+}
+
+// Test for election-related metrics with the leader failure detection enabled.
+TEST_F(RaftConsensusITest, TestElectionMetricsFailureDetectionEnabled) {
+  constexpr auto kNumReplicas = 3;
+  constexpr auto kNumTservers = 3;
+  const vector<string> kTsFlags = {
+    // Make leader elections faster so we can test
+    // failed_elections_since_stable_leader faster.
+    "--raft_heartbeat_interval_ms=100",
+
+    // For the stability of the test, make leader election less likely in case
+    // of intermittent network failures and latency spikes. Otherwise, in case
+    // of on-going re-elections the metric value would not stabilize for a long
+    // time.
+    "--leader_failure_max_missed_heartbeat_periods=20",
+  };
+  const auto kTimeout = MonoDelta::FromSeconds(30);
+
+  FLAGS_num_replicas = kNumReplicas;
+  FLAGS_num_tablet_servers = kNumTservers;
+  NO_FATALS(BuildAndStart(kTsFlags));
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_, tablet_id_, 1));
+
+  // Verify failed_elections_since_stable_leader is reset to 0 in the majority
+  // of all replicas after the cluster is in stable state, i.e. the leader
+  // is elected and functional.
+  ASSERT_EVENTUALLY([&]() {
+    for (auto i = 0; i < kNumTservers; ++i) {
+      ASSERT_EQ(0, GetFailedElectionsSinceStableLeader(
+          cluster_->tablet_server(i), tablet_id_));
+    }
+  });
+
+  auto* srv_ts = tablet_servers_.begin()->second;
+  auto* srv_ext = cluster_->tablet_server_by_uuid(srv_ts->uuid());
+  for (auto i = 0; i < kNumTservers; ++i) {
+    auto* s = cluster_->tablet_server(i);
+    if (s == srv_ext) {
+      continue;
+    }
+    s->Shutdown();
+  }
+
+  // If the server which is left alive hosts the leader replica for the tablet,
+  // make it step down. Otherwise, it's a no-op.
+  ignore_result(LeaderStepDown(srv_ts, tablet_id_, kTimeout));
+
+  // Verify failed_elections_since_stable_leader is advanced eventually.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_GT(GetFailedElectionsSinceStableLeader(srv_ext, tablet_id_), 0);
+  });
+
+  // Restart the rest of tablet servers.
+  for (auto i = 0; i < kNumTservers; ++i) {
+    auto* s = cluster_->tablet_server(i);
+    if (s == srv_ext) {
+      continue;
+    }
+    ASSERT_OK(s->Restart());
+  }
+  ASSERT_OK(WaitForServersToAgree(kTimeout, tablet_servers_, tablet_id_, 1));
+
+  // Verify failed_elections_since_stable_leader is reset to 0 eventually.
+  ASSERT_EVENTUALLY([&]() {
+    for (auto i = 0; i < kNumTservers; ++i) {
+      ASSERT_EQ(0, GetFailedElectionsSinceStableLeader(
+          cluster_->tablet_server(i), tablet_id_));
+    }
+  });
+}
+
 // Test that an IOError when writing to the write-ahead log is a fatal error.
 // First, we test that failed replicates are fatal. Then, we test that failed
 // commits are fatal.
@@ -2739,5 +2924,76 @@ TEST_F(RaftConsensusITest, TestLogIOErrorIsFatal) {
   ASSERT_OK(ext_tservers[0]->WaitForFatal(MonoDelta::FromSeconds(10)));
 }
 
+// KUDU-1613: Test that when we reset and restart a tablet server, with a new
+// uuid but with the same host and port, replicas that were hosted by the
+// previous incarnation are correctly detected as failed and eventually
+// re-replicated.
+TEST_P(RaftConsensusParamReplicationModesITest, TestRestartWithDifferentUUID) {
+  // Start a cluster and insert data.
+  const bool kPrepareReplacementBeforeEviction = GetParam();
+  ExternalMiniClusterOptions opts;
+  opts.num_tablet_servers = kPrepareReplacementBeforeEviction ? 4 : 3;
+  opts.extra_tserver_flags = {
+    // Set a low timeout. If we can't re-replicate in a reasonable amount of
+    // time, it means we're not evicting at all.
+    "--follower_unavailable_considered_failed_sec=10",
+    Substitute("--raft_prepare_replacement_before_eviction=$0",
+               kPrepareReplacementBeforeEviction),
+  };
+  opts.extra_master_flags = {
+    Substitute("--raft_prepare_replacement_before_eviction=$0",
+               kPrepareReplacementBeforeEviction),
+  };
+  cluster_.reset(new ExternalMiniCluster(std::move(opts)));
+  ASSERT_OK(cluster_->Start());
+
+  // Write some data. In writing many tablets, we're making it more likely that
+  // all tablet servers will have some tablets on them.
+  TestWorkload writes(cluster_.get());
+  writes.set_num_tablets(5);
+  writes.set_timeout_allowed(true);
+  writes.Setup();
+  writes.Start();
+  const auto wait_for_some_inserts = [&] {
+    const auto rows_init = writes.rows_inserted();
+    ASSERT_EVENTUALLY([&] {
+      ASSERT_GT(writes.rows_inserted() - rows_init, 1000);
+    });
+  };
+  wait_for_some_inserts();
+
+  // Completely shut down one of the tablet servers, keeping its ports so we
+  // can take over with another tablet server.
+  ExternalTabletServer* ts = cluster_->tablet_server(0);
+  vector<HostPort> master_hostports;
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    master_hostports.push_back(cluster_->master(i)->bound_rpc_hostport());
+  }
+  ExternalDaemonOptions ts_opts = ts->opts();
+  LOG(INFO) << Substitute("Storing port $0 for use by new tablet server",
+                          ts->bound_rpc_hostport().ToString());
+  ts_opts.rpc_bind_address = ts->bound_rpc_hostport();
+  ts->Shutdown();
+
+  // With one server down, we should be able to accept writes.
+  wait_for_some_inserts();
+  writes.StopAndJoin();
+
+  // Start up a new server with a new UUID bound to the old RPC port.
+  ts_opts.wal_dir = Substitute("$0-new", ts_opts.wal_dir);
+  ts_opts.data_dirs = { Substitute("$0-new", ts_opts.data_dirs[0]) };
+  ASSERT_OK(env_->CreateDir(ts_opts.wal_dir));
+  ASSERT_OK(env_->CreateDir(ts_opts.data_dirs[0]));
+  scoped_refptr<ExternalTabletServer> new_ts =
+    new ExternalTabletServer(ts_opts, master_hostports);
+  ASSERT_OK(new_ts->Start());
+
+  // Eventually the new server should be copied to.
+  ASSERT_EVENTUALLY([&] {
+    vector<string> files_in_wal_dir;
+    ASSERT_OK(ListFilesInDir(env_, JoinPathSegments(ts_opts.wal_dir, "wals"), &files_in_wal_dir));
+    ASSERT_FALSE(files_in_wal_dir.empty());
+  });
+}
 }  // namespace tserver
 }  // namespace kudu

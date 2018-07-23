@@ -39,11 +39,9 @@ depends upon your operation system kernel version and local filesystem implement
  - RHEL or CentOS 6.4 or later, patched to kernel version of 2.6.32-358 or later.
   Unpatched RHEL or CentOS 6.4 does not include a kernel with support for hole punching.
   - Ubuntu 14.04 includes version 3.13 of the Linux kernel, which supports hole punching.
-  - Newer versions of the EXT4 or XFS file systems support hole punching, but EXT3 does
-  not. Older versions of XFS that do not support hole punching return a `EOPNOTSUPP`
-  (operation not supported) error. Older versions of either EXT4 or XFS that do
-  not support hole punching cause Kudu to emit an error message such as the following
-  and to fail to start:
+  - Newer versions of the ext4 and xfs filesystems support hole punching. Older versions
+  that do not support hole punching will cause Kudu to emit an error message such as the
+  following and to fail to start:
 +
 ----
 Error during hole punch test. The log block manager requires a
@@ -53,6 +51,15 @@ punching (at the cost of some efficiency and scalability), reconfigure
 Kudu with --block_manager=file. Refer to the Kudu documentation for more
 details. Raw error message follows.
 ----
+
+[NOTE]
+ext4 mountpoints may actually be backed by ext2 or ext3 formatted devices, which do not
+support hole punching. The hole punching test will fail when run on such filesystems. There
+are several different ways to determine whether an ext4 mountpoint is backed by an ext2,
+ext3, or ext4 formatted device; see link:https://unix.stackexchange.com/q/60723[this Stack
+Exchange post] for details.
+
+link:administration.html#change_dir_config[Changing Directory Configurations] documentation.
 
 Without hole punching support, the log block manager is unsafe to use. It won't
 ever delete blocks, and will consume ever more space on disk.
@@ -65,6 +72,22 @@ manager.
 
 WARNING: The file block manager is known to scale and perform poorly, and should
 only be used for small-scale evaluation and development.
+
+[[disk_issues]]
+=== Already present: FS layout already exists
+
+When Kudu starts, it checks each configured data directory, expecting either for all to be
+initialized or for all to be empty. If a server fails to start with a log message like
+
+----
+Check failed: _s.ok() Bad status: Already present: FS layout already exists; not overwriting existing layout: FSManager roots already exist: /data0/kudu/data
+----
+
+then this precondition has failed. This could be because Kudu was configured with non-empty data
+directories on first startup, or because a previously-running, healthy Kudu process was restarted
+and at least one data directory was deleted or is somehow corrupted, perhaps because of a disk
+error. If in the latter situation, consult the
+link:administration.html#change_dir_config[Changing Directory Configurations] documentation.
 
 [[ntp]]
 === NTP Clock Synchronization
@@ -94,8 +117,8 @@ or
 Sep 17, 8:32:31.135 PM FATAL tablet_server_main.cc:38 Check failed: _s.ok() Bad status: Service unavailable: Cannot initialize clock: Cannot initialize HybridClock. Clock synchronized but error was too high (11711000 us).
 ----
 
-TIP: If NTP is installed the user can monitor the synchronization status by running
-`ntptime`. The relevant value is what is reported for `maximum error`.
+==== Installing NTP
+
 
 To install NTP, use the appropriate command for your operating system:
 [cols="1,1", options="header"]
@@ -113,14 +136,209 @@ If NTP is installed but not running, start it using one of these commands:
 | RHEL/CentOS | `sudo /etc/init.d/ntpd restart`
 |===
 
-TIP: NTP requires a network connection and may take a few minutes to synchronize the clock.
-In some cases a spotty network connection may make NTP report the clock as unsynchronized.
+====  Monitoring NTP Status
+
+When NTP is installed, you can monitor the synchronization status by running
+`ntptime`. For example, a healthy system may report:
+
+----
+ntp_gettime() returns code 0 (OK)
+  time de24c0cf.8d5da274  Tue, Feb  6 2018 16:03:27.552, (.552210980),
+  maximum error 224455 us, estimated error 383 us, TAI offset 0
+ntp_adjtime() returns code 0 (OK)
+  modes 0x0 (),
+  offset 1279.543 us, frequency 2.500 ppm, interval 1 s,
+  maximum error 224455 us, estimated error 383 us,
+  status 0x2001 (PLL,NANO),
+  time constant 10, precision 0.001 us, tolerance 500 ppm,
+----
+
+In particular, note the following most important pieces of output:
+
+- `maximum error 22455 us`: this value is well under the 10-second maximum error required
+  by Kudu.
+- `status 0x2001 (PLL,NANO)`: this indicates a healthy synchronization status.
+
+In contrast, a system without NTP properly configured and running will output
+something like the following:
+
+----
+ntp_gettime() returns code 5 (ERROR)
+  time de24c240.0c006000  Tue, Feb  6 2018 16:09:36.046, (.046881),
+  maximum error 16000000 us, estimated error 16000000 us, TAI offset 0
+ntp_adjtime() returns code 5 (ERROR)
+  modes 0x0 (),
+  offset 0.000 us, frequency 2.500 ppm, interval 1 s,
+  maximum error 16000000 us, estimated error 16000000 us,
+  status 0x40 (UNSYNC),
+  time constant 10, precision 1.000 us, tolerance 500 ppm,
+----
+
+Note the `UNSYNC` status and the 16-second maximum error.
+
+If more detailed information is needed, the `ntpq` or `ntpdc` tools
+can be used to dump further information about which network time servers
+are currently acting as sources:
+
+----
+$ ntpq -nc lpeers
+     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+-108.59.2.24     130.133.1.10     2 u   13   64    1   71.743    0.373   0.016
++192.96.202.120  129.6.15.28      2 u   12   64    1   72.583   -0.426   0.028
+-69.10.161.7     204.26.59.157    3 u   11   64    1   15.741    2.641   0.021
+-173.255.206.154 45.56.123.24     3 u   10   64    1   43.502    0.199   0.029
+-69.195.159.158  128.138.140.44   2 u    9   64    1   53.885   -0.016   0.013
+*216.218.254.202 .CDMA.           1 u    6   64    1    1.475   -0.400   0.012
++129.250.35.250  249.224.99.213   2 u    7   64    1    1.342   -0.640   0.018
+ 45.76.244.193   216.239.35.4     2 u    6   64    1   17.380   -0.754   0.051
+ 69.89.207.199   212.215.1.157    2 u    5   64    1   57.796   -3.411   0.059
+ 171.66.97.126   .GPSs.           1 u    4   64    1    1.024   -0.374   0.018
+ 66.228.42.59    211.172.242.174  3 u    3   64    1   72.409    0.895   0.964
+ 91.189.89.198   17.253.34.125    2 u    2   64    1  135.195   -0.329   0.171
+ 162.210.111.4   216.218.254.202  2 u    1   64    1   28.570    0.693   0.306
+ 199.102.46.80   .GPS.            1 u    2   64    1   55.652   -0.039   0.019
+ 91.189.89.199   17.253.34.125    2 u    1   64    1  135.265   -0.413   0.037
+$ ntpq -nc opeers
+     remote           local      st t when poll reach   delay   offset    disp
+==============================================================================
+-108.59.2.24     10.17.100.238    2 u   17   64    1   71.743    0.373 187.573
++192.96.202.120  10.17.100.238    2 u   16   64    1   72.583   -0.426 187.594
+-69.10.161.7     10.17.100.238    3 u   15   64    1   15.741    2.641 187.569
+-173.255.206.154 10.17.100.238    3 u   14   64    1   43.502    0.199 187.580
+-69.195.159.158  10.17.100.238    2 u   13   64    1   53.885   -0.016 187.561
+*216.218.254.202 10.17.100.238    1 u   10   64    1    1.475   -0.400 187.543
++129.250.35.250  10.17.100.238    2 u   11   64    1    1.342   -0.640 187.588
+ 45.76.244.193   10.17.100.238    2 u   10   64    1   17.380   -0.754 187.596
+ 69.89.207.199   10.17.100.238    2 u    9   64    1   57.796   -3.411 187.541
+ 171.66.97.126   10.17.100.238    1 u    8   64    1    1.024   -0.374 187.578
+ 66.228.42.59    10.17.100.238    3 u    7   64    1   72.409    0.895 187.589
+ 91.189.89.198   10.17.100.238    2 u    6   64    1  135.195   -0.329 187.584
+ 162.210.111.4   10.17.100.238    2 u    5   64    1   28.570    0.693 187.606
+ 199.102.46.80   10.17.100.238    1 u    4   64    1   55.652   -0.039 187.587
+ 91.189.89.199   10.17.100.238    2 u    3   64    1  135.265   -0.413 187.621
+----
+
+TIP: Both `opeers` and `lpeers` may be helpful as `lpeers` lists refid and
+jitter, while `lpeers` lists dispersion.
+
+
+[NOTE]
+****
+.Using `chrony` for time synchronization
+
+Some operating systems offer `chrony` as an alternative to `ntpd` for network time
+synchronization. Kudu has been tested most thoroughly using `ntpd` and use of
+`chrony` is considered experimental.
+
+In order to use `chrony` for synchronization, `chrony.conf` must be configured
+with the `rtcsync` option.
+****
+
+==== NTP Configuration Best Practices
+
+In order to provide stable time synchronization with low maximum error, follow
+these best NTP configuration best practices.
+
+*Always configure at least four time sources for NTP.* In addition to providing
+redundancy in case one or more time sources becomes unavailable, The NTP protocol is
+designed to increase its accuracy with a diversity of sources. Even if your organization
+provides one or more local time servers, configuring additional remote servers is highly
+recommended for a robust setup.
+
+*Pick servers in your server's local geography.* For example, if your servers are located
+in Europe, pick servers from the European NTP pool. If your servers are running in a public
+cloud environment, consult the cloud provider's documentation for a recommended NTP setup.
+Many cloud providers offer highly accurate clock synchronization as a service.
+
+*Use the `iburst` option for faster synchronization at startup*. The `iburst` option
+instructs `ntpd` to send an initial "burst" of time queries at startup. This typically
+results in a faster time synchronization when a machine restarts.
+
+An example NTP server list may appear as follows:
+
+----
+# Use my organization's internal NTP servers.
+server ntp1.myorg.internal iburst
+server ntp2.myorg.internal iburst
+# Provide several public pool servers for
+# redundancy and robustness.
+server 0.pool.ntp.org iburst
+server 1.pool.ntp.org iburst
+server 2.pool.ntp.org iburst
+server 3.pool.ntp.org iburst
+----
+
+TIP: After configuring NTP, use the `ntpq` tool described above to verify that `ntpd` was
+able to connect to a variety of peers. If no public peers appear, it is possiblbe that
+the NTP protocol is being blocked by a firewall or other network connectivity issue.
+
+==== Troubleshooting NTP Stability Problems
+
+As of Kudu 1.6.0, Kudu daemons are able to continue to operate during a brief loss of
+NTP synchronization. If NTP synchronization is lost for several hours, however, daemons
+may crash. If a daemon crashes due to NTP synchronization issues, consult the `ERROR` log
+for a dump of related information which may help to diagnose the issue.
+
+TIP: Kudu 1.5.0 and earlier versions were less resilient to brief NTP outages. In
+addition, they contained a link:https://issues.apache.org/jira/browse/KUDU-2209[bug]
+which could cause Kudu to incorrectly measure the maximum error, resulting in
+crashes. If you experience crashes related to clock synchronization on these
+earlier versions of Kudu and it appears that the system's NTP configuration is correct,
+consider upgrading to Kudu 1.6.0 or later.
+
+TIP: NTP requires a network connection and may take a few minutes to synchronize the clock
+at startup. In some cases a spotty network connection may make NTP report the clock as unsynchronized.
 A common, though temporary, workaround for this is to restart NTP with one of the commands above.
 
-If the clock is being reported as synchronized by NTP, but the maximum error is too high,
-the user can increase the threshold to a higher value by setting the above
-mentioned flag. For example to increase the possible maximum error to
-20 seconds the flag should be set like: `--max_clock_sync_error_usec=20000000`
+[[disk_space_usage]]
+== Disk Space Usage
+
+When using the log block manager (the default on Linux), Kudu uses
+link:https://en.wikipedia.org/wiki/Sparse_file[sparse files] to store data. A
+sparse file has a different apparent size than the actual amount of disk space
+it uses. This means that some tools may inaccurately report the disk space
+used by Kudu. For example, the size listed by `ls -l` does not accurately
+reflect the disk space used by Kudu data files:
+
+[source,bash]
+----
+$ ls -lh /data/kudu/tserver/data
+total 117M
+-rw------- 1 kudu kudu 160M Mar 26 19:37 0b9807b8b17d48a6a7d5b16bf4ac4e6d.data
+-rw------- 1 kudu kudu 4.4K Mar 26 19:37 0b9807b8b17d48a6a7d5b16bf4ac4e6d.metadata
+-rw------- 1 kudu kudu  32M Mar 26 19:37 2f26eeacc7e04b65a009e2c9a2a8bd20.data
+-rw------- 1 kudu kudu 4.3K Mar 26 19:37 2f26eeacc7e04b65a009e2c9a2a8bd20.metadata
+-rw------- 1 kudu kudu 672M Mar 26 19:37 30a2dd2cd3554d8a9613f588a8d136ff.data
+-rw------- 1 kudu kudu 4.4K Mar 26 19:37 30a2dd2cd3554d8a9613f588a8d136ff.metadata
+-rw------- 1 kudu kudu  32M Mar 26 19:37 7434c83c5ec74ae6af5974e4909cbf82.data
+-rw------- 1 kudu kudu 4.3K Mar 26 19:37 7434c83c5ec74ae6af5974e4909cbf82.metadata
+-rw------- 1 kudu kudu 672M Mar 26 19:37 772d070347a04f9f8ad2ad3241440090.data
+-rw------- 1 kudu kudu 4.4K Mar 26 19:37 772d070347a04f9f8ad2ad3241440090.metadata
+-rw------- 1 kudu kudu 160M Mar 26 19:37 86e50a95531f46b6a79e671e6f5f4151.data
+-rw------- 1 kudu kudu 4.4K Mar 26 19:37 86e50a95531f46b6a79e671e6f5f4151.metadata
+-rw------- 1 kudu kudu  687 Mar 26 19:26 block_manager_instance
+----
+
+Notice that the total size reported is 117MiB, while the first file's size is
+listed as 160MiB. Adding the `-s` option to `ls` will cause `ls` to output the
+file's disk space usage.
+
+The `du` and `df` utilities report the actual disk space usage by default.
+
+[source,bash]
+----
+$ du -h /data/kudu/tserver/data
+118M   /data/kudu/tserver/data
+----
+
+The apparent size can be shown with the `--apparent-size` flag to `du`.
+
+[source,bash]
+----
+$ du -h --apparent-size /data/kudu/tserver/data
+1.7G  /data/kudu/tserver/data
+----
 
 [[crash_reporting]]
 == Reporting Kudu Crashes
@@ -288,7 +506,7 @@ User stack:
 ----
 
 These traces can be useful for diagnosing root-cause latency issues when they are caused by systems
-below Kudu, such as disk controllers or file systems.
+below Kudu, such as disk controllers or filesystems.
 
 [[memory_limits]]
 === Memory Limits
@@ -314,21 +532,61 @@ are several ways to relieve the memory pressure on Kudu:
   Generally, the recommended ratio of maintenance manager threads to data directories is 1:3.
 - Reduce the volume of writes flowing to Kudu on the application side.
 
-[[disk_issues]]
-=== Disk Issues
+Finally, check the value of `--block_cache_capacity_mb`. This setting determines
+the maximum size of Kudu's block cache. While a higher value can help with read
+and write performance, setting it too high (as a percentage of `--memory_limit_hard_bytes`)
+is harmful. Do not raise `--block_cache_capacity_mb` above `--memory_pressure_percentage`
+(default 60%) of `--memory_limit_hard_bytes`, as this will cause Kudu to flush
+aggressively even if write throughput is low. Keeping the block cache capacity
+below 50% of the memory pressure percentage times the hard limit is recommended.
+With the defaults, this means the `--block_cache_capacity_mb` should not exceed
+30% of `--memory_limit_hard_bytes`.
 
-When Kudu starts, it checks each configured data directory, expecting either for all to be
-initialized or for all to be empty. If a server fails to start with a log message like
+[[heap_sampling]]
+=== Heap Sampling
+
+For advanced debugging of memory usage, administrators may enable heap sampling on Kudu daemons.
+This allows Kudu developers to associate memory usage with the specific lines of code and data
+structures responsible. When reporting a bug related to memory usage or an apparent memory leak,
+heap profiling can give quantitative data to pinpoint the issue.
+
+WARNING: Heap sampling is an advanced troubleshooting technique and may cause performance
+degradation or instability of the Kudu service. Currently it is not recommended to enable this
+in a production environment unless specifically requested by the Kudu development team.
+
+To enable heap sampling on a Kudu daemon, pass the flag `--heap-sample-every-n-bytes=524588`.
+If heap sampling is enabled, the current sampled heap occupancy can be retrieved over HTTP
+by visiting `http://tablet-server.example.com:8050/pprof/heap` or
+`http://master.example.com:8051/pprof/heap`. The output is a machine-readable dump of the
+stack traces with their associated heap usage.
+
+Rather than visiting the heap profile page directly in a web browser, it is typically
+more useful to use the `pprof` tool that is distributed as part of the `gperftools`
+open source project. For example, a developer with a local build tree can use the
+following command to collect the sampled heap usage and output an SVG diagram:
 
 ----
-Check failed: _s.ok() Bad status: Already present: Could not create new FS layout: FSManager root is not empty: /data0/kudu/data
+thirdparty/installed/uninstrumented/bin/pprof -svg  'http://localhost:8051/pprof/heap' > /tmp/heap.svg
 ----
 
-then this precondition has failed. This could be because Kudu was configured with non-empty data
-directories on first startup, or because a previously-running, healthy Kudu process was restarted
-and at least one data directory was deleted or is somehow corrupted, perhaps because of a disk
-error. If in the latter situation, consult the
-link:administration.html#change_dir_config[Changing Directory Configurations] documentation.
+The resulting SVG may be visualized in a web browser or sent to the Kudu community to help
+troubleshoot memory occupancy issues.
+
+TIP: Heap samples contain only summary information about allocations and do not contain any
+_data_ from the heap. It is safe to share heap samples in public without fear of exposing
+confidential or sensitive data.
+
+[[slow_dns_nscd]]
+=== Slow DNS Lookups and `nscd`
+
+If the logs contain messages about slow name resolution like
+
+----
+W0926 11:19:01.339553 27231 net_util.cc:129] Time spent resolving address for kudu-tserver.example.com: real 4.647s    user 0.000s     sys 0.000s
+----
+
+then it may help to run `nscd` (the name service cache daemon). Consult your
+operating system's documentation for how to install and enable `nscd`.
 
 == Issues using Kudu
 
@@ -339,3 +597,36 @@ Users will encounter this exception when trying to use a Kudu table via Hive. Th
 is not a case of a missing jar, but simply that Impala stores Kudu metadata in
 Hive in a format that's unreadable to other tools, including Hive itself and Spark.
 There is no workaround for Hive users. Spark users need to create temporary tables.
+
+[[too_many_threads]]
+=== Runtime error: Could not create thread: Resource temporarily unavailable (error 11)
+
+Users will encounter this error when Kudu is unable to create more threads,
+usually on versions of Kudu older than 1.7. It happens on tablet servers, and
+is a sign that the tablet server hosts too many tablet replicas. To fix the
+issue, users can raise the `nproc` ulimit as detailed in the documentation for
+their operating system or distribution. However, the better solution is to
+reduce the number of replicas on the tablet server. This may involve rethinking
+the table's partitioning schema. For the recommended limits on number of
+replicas per tablet server, see the known issues and scaling limitations
+documentation for the appropriate Kudu release. The
+link:http://kudu.apache.org/releases/[releases page] has links to documentation
+for previous versions of Kudu; for the latest release, see the
+link:known_issues.html[known issues page].
+
+[[tombstoned_or_stopped_tablets]]
+=== Tombstoned or STOPPED tablet replicas
+
+Users may notice some replicas on a tablet server are in a STOPPED state, and
+remain on the server indefinitely. These replicas are tombstones. A tombstone
+indicates that the tablet server once held a bona fide replica of its tablet.
+For example, if a tablet server goes down and its replicas are re-replicated
+elsewhere, if the tablet server rejoins the cluster its replicas will become
+tombstones. A tombstone will remain until the table it belongs to is deleted, or
+a new replica of the same tablet is placed on the tablet server. A count of
+tombstoned replicas and details of each one are available on the /tablets page
+of the tablet server web UI.
+
+The Raft consensus algorithm that Kudu uses for replication requires tombstones
+for correctness in certain rare situations. They consume minimal resources and
+hold no data. They must not be deleted.

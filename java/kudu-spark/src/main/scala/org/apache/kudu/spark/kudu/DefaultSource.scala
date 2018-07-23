@@ -17,21 +17,20 @@
 
 package org.apache.kudu.spark.kudu
 
+import java.math.BigDecimal
 import java.net.InetAddress
 import java.sql.Timestamp
 
 import scala.collection.JavaConverters._
 import scala.util.Try
-
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Row, SQLContext, SaveMode}
 import org.apache.yetus.audience.InterfaceStability
-
 import org.apache.kudu.client.KuduPredicate.ComparisonOp
 import org.apache.kudu.client._
-import org.apache.kudu.{ColumnSchema, Type}
+import org.apache.kudu.spark.kudu.SparkUtil._
 
 /**
   * Data source for integration with Spark's [[DataFrame]] API.
@@ -50,8 +49,20 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
   val OPERATION = "kudu.operation"
   val FAULT_TOLERANT_SCANNER = "kudu.faultTolerantScan"
   val SCAN_LOCALITY = "kudu.scanLocality"
+  val IGNORE_NULL = "kudu.ignoreNull"
+  val IGNORE_DUPLICATE_ROW_ERRORS = "kudu.ignoreDuplicateRowErrors"
+  val SCAN_REQUEST_TIMEOUT_MS = "kudu.scanRequestTimeoutMs"
+  val SOCKET_READ_TIMEOUT_MS = "kudu.socketReadTimeoutMs"
 
   def defaultMasterAddrs: String = InetAddress.getLocalHost.getCanonicalHostName
+
+  def getScanRequestTimeoutMs(parameters: Map[String, String]): Option[Long] = {
+    parameters.get(SCAN_REQUEST_TIMEOUT_MS).map(_.toLong)
+  }
+
+  def getSocketReadTimeoutMs(parameters: Map[String, String]): Option[Long] = {
+    parameters.get(SOCKET_READ_TIMEOUT_MS).map(_.toLong)
+  }
 
   /**
     * Construct a BaseRelation using the provided context and parameters.
@@ -61,8 +72,7 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     * @return           a BaseRelation Object
     */
   override def createRelation(sqlContext: SQLContext,
-                              parameters: Map[String, String]):
-  BaseRelation = {
+                              parameters: Map[String, String]): BaseRelation = {
     val tableName = parameters.getOrElse(TABLE_KEY,
       throw new IllegalArgumentException(
         s"Kudu table name must be specified in create options using key '$TABLE_KEY'"))
@@ -70,10 +80,15 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     val operationType = getOperationType(parameters.getOrElse(OPERATION, "upsert"))
     val faultTolerantScanner = Try(parameters.getOrElse(FAULT_TOLERANT_SCANNER, "false").toBoolean)
       .getOrElse(false)
-    val scanLocality = getScanLocalityType(parameters.getOrElse(SCAN_LOCALITY, "leader_only"))
+    val scanLocality = getScanLocalityType(parameters.getOrElse(SCAN_LOCALITY, "closest_replica"))
+    val ignoreDuplicateRowErrors = Try(parameters(IGNORE_DUPLICATE_ROW_ERRORS).toBoolean).getOrElse(false) ||
+      Try(parameters(OPERATION) == "insert-ignore").getOrElse(false)
+    val ignoreNull = Try(parameters.getOrElse(IGNORE_NULL, "false").toBoolean).getOrElse(false)
+    val writeOptions = new KuduWriteOptions(ignoreDuplicateRowErrors, ignoreNull)
 
     new KuduRelation(tableName, kuduMaster, faultTolerantScanner,
-      scanLocality, operationType, None)(sqlContext)
+      scanLocality, getScanRequestTimeoutMs(parameters), getSocketReadTimeoutMs(parameters),
+      operationType, None, writeOptions)(sqlContext)
   }
 
   /**
@@ -82,7 +97,7 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     * @param sqlContext
     * @param mode Only Append mode is supported. It will upsert or insert data
     *             to an existing table, depending on the upsert parameter
-    * @param parameters Necessary parameters for kudu.table and kudu.master
+    * @param parameters Necessary parameters for kudu.table, kudu.master, etc..
     * @param data Dataframe to save into kudu
     * @return returns populated base relation
     */
@@ -106,16 +121,17 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     val operationType = getOperationType(parameters.getOrElse(OPERATION, "upsert"))
     val faultTolerantScanner = Try(parameters.getOrElse(FAULT_TOLERANT_SCANNER, "false").toBoolean)
       .getOrElse(false)
-    val scanLocality = getScanLocalityType(parameters.getOrElse(SCAN_LOCALITY, "leader_only"))
+    val scanLocality = getScanLocalityType(parameters.getOrElse(SCAN_LOCALITY, "closest_replica"))
 
     new KuduRelation(tableName, kuduMaster, faultTolerantScanner,
-      scanLocality, operationType, Some(schema))(sqlContext)
+      scanLocality, getScanRequestTimeoutMs(parameters), getSocketReadTimeoutMs(parameters),
+      operationType, Some(schema))(sqlContext)
   }
 
   private def getOperationType(opParam: String): OperationType = {
     opParam.toLowerCase match {
       case "insert" => Insert
-      case "insert-ignore" => InsertIgnore
+      case "insert-ignore" => Insert
       case "upsert" => Upsert
       case "update" => Update
       case "delete" => Delete
@@ -141,8 +157,10 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
   *                             otherwise, use non fault tolerant one
   * @param scanLocality If true scan locality is enabled, so that the scan will
   *                     take place at the closest replica.
+  * @param scanRequestTimeoutMs Maximum time allowed per scan request, in milliseconds
   * @param operationType The default operation type to perform when writing to the relation
   * @param userSchema A schema used to select columns for the relation
+  * @param writeOptions Kudu write options
   * @param sqlContext SparkSQL context
   */
 @InterfaceStability.Unstable
@@ -150,20 +168,23 @@ class KuduRelation(private val tableName: String,
                    private val masterAddrs: String,
                    private val faultTolerantScanner: Boolean,
                    private val scanLocality: ReplicaSelection,
+                   private[kudu] val scanRequestTimeoutMs: Option[Long],
+                   private[kudu] val socketReadTimeoutMs: Option[Long],
                    private val operationType: OperationType,
-                   private val userSchema: Option[StructType])(
+                   private val userSchema: Option[StructType],
+                   private val writeOptions: KuduWriteOptions = new KuduWriteOptions)(
                    val sqlContext: SQLContext)
   extends BaseRelation
     with PrunedFilteredScan
     with InsertableRelation {
 
-  import KuduRelation._
+  private val context: KuduContext = new KuduContext(masterAddrs, sqlContext.sparkContext,
+                                                     socketReadTimeoutMs)
 
-  private val context: KuduContext = new KuduContext(masterAddrs, sqlContext.sparkContext)
   private val table: KuduTable = context.syncClient.openTable(tableName)
 
   override def unhandledFilters(filters: Array[Filter]): Array[Filter] =
-    filters.filterNot(supportsFilter)
+    filters.filterNot(KuduRelation.supportsFilter)
 
   /**
     * Generates a SparkSQL schema object so SparkSQL knows what is being
@@ -172,19 +193,7 @@ class KuduRelation(private val tableName: String,
     * @return schema generated from the Kudu table's schema
     */
   override def schema: StructType = {
-    userSchema match {
-      case Some(x) =>
-        StructType(x.fields.map(uf => table.getSchema.getColumn(uf.name))
-          .map(kuduColumnToSparkField))
-      case None =>
-        StructType(table.getSchema.getColumns.asScala.map(kuduColumnToSparkField).toArray)
-    }
-  }
-
-  def kuduColumnToSparkField: (ColumnSchema) => StructField = {
-    columnSchema =>
-      val sparkType = kuduTypeToSparkType(columnSchema.getType)
-      new StructField(columnSchema.getName, sparkType, columnSchema.isNullable)
+    sparkSchema(table.getSchema, userSchema.map(_.fieldNames))
   }
 
   /**
@@ -197,7 +206,8 @@ class KuduRelation(private val tableName: String,
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
     val predicates = filters.flatMap(filterToPredicate)
     new KuduRDD(context, 1024 * 1024 * 20, requiredColumns, predicates,
-                table, faultTolerantScanner, scanLocality, sqlContext.sparkContext)
+                table, faultTolerantScanner, scanLocality, scanRequestTimeoutMs,
+                socketReadTimeoutMs, sqlContext.sparkContext)
   }
 
   /**
@@ -266,11 +276,12 @@ class KuduRelation(private val tableName: String,
       case value: Short => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: Int => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: Long => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
-      case value: Timestamp => KuduPredicate.newComparisonPredicate(columnSchema, operator, timestampToMicros(value))
+      case value: Timestamp => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: Float => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: Double => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: String => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: Array[Byte] => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
+      case value: BigDecimal => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
     }
   }
 
@@ -318,30 +329,11 @@ class KuduRelation(private val tableName: String,
     if (overwrite) {
       throw new UnsupportedOperationException("overwrite is not yet supported")
     }
-    context.writeRows(data, tableName, operationType)
+    context.writeRows(data, tableName, operationType, writeOptions)
   }
 }
 
 private[spark] object KuduRelation {
-  /**
-    * Converts a Kudu [[Type]] to a Spark SQL [[DataType]].
-    *
-    * @param t the Kudu type
-    * @return the corresponding Spark SQL type
-    */
-  private def kuduTypeToSparkType(t: Type): DataType = t match {
-    case Type.BOOL => BooleanType
-    case Type.INT8 => ByteType
-    case Type.INT16 => ShortType
-    case Type.INT32 => IntegerType
-    case Type.INT64 => LongType
-    case Type.UNIXTIME_MICROS => TimestampType
-    case Type.FLOAT => FloatType
-    case Type.DOUBLE => DoubleType
-    case Type.STRING => StringType
-    case Type.BINARY => BinaryType
-  }
-
   /**
     * Returns `true` if the filter is able to be pushed down to Kudu.
     *
@@ -359,42 +351,5 @@ private[spark] object KuduRelation {
        | IsNotNull(_) => true
     case And(left, right) => supportsFilter(left) && supportsFilter(right)
     case _ => false
-  }
-
-  /**
-    * Converts a [[Timestamp]] to microseconds since the Unix epoch (1970-01-01T00:00:00Z).
-    *
-    * @param timestamp the timestamp to convert to microseconds
-    * @return the microseconds since the Unix epoch
-    */
-  def timestampToMicros(timestamp: Timestamp): Long = {
-    // Number of whole milliseconds since the Unix epoch, in microseconds.
-    val millis = timestamp.getTime * 1000
-    // Sub millisecond time since the Unix epoch, in microseconds.
-    val micros = (timestamp.getNanos % 1000000) / 1000
-    if (micros >= 0) {
-      millis + micros
-    } else {
-      millis + 1000000 + micros
-    }
-  }
-
-  /**
-    * Converts a microsecond offset from the Unix epoch (1970-01-01T00:00:00Z) to a [[Timestamp]].
-    *
-    * @param micros the offset in microseconds since the Unix epoch
-    * @return the corresponding timestamp
-    */
-  def microsToTimestamp(micros: Long): Timestamp = {
-    var millis = micros / 1000
-    var nanos = (micros % 1000000) * 1000
-    if (nanos < 0) {
-      millis -= 1
-      nanos += 1000000000
-    }
-
-    val timestamp = new Timestamp(millis)
-    timestamp.setNanos(nanos.asInstanceOf[Int])
-    timestamp
   }
 }

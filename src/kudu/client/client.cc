@@ -67,7 +67,6 @@
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -78,6 +77,7 @@
 #include "kudu/rpc/request_tracker.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/sasl_common.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
@@ -112,14 +112,14 @@ using kudu::master::ListTabletServersRequestPB;
 using kudu::master::ListTabletServersResponsePB;
 using kudu::master::ListTabletServersResponsePB_Entry;
 using kudu::master::MasterServiceProxy;
+using kudu::master::TSInfoPB;
 using kudu::master::TableIdentifierPB;
 using kudu::master::TabletLocationsPB;
-using kudu::master::TSInfoPB;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using kudu::rpc::UserCredentials;
 using kudu::tserver::ScanResponsePB;
-using std::pair;
 using std::set;
 using std::string;
 using std::unique_ptr;
@@ -136,7 +136,7 @@ MAKE_ENUM_LIMITS(kudu::client::KuduSession::ExternalConsistencyMode,
 
 MAKE_ENUM_LIMITS(kudu::client::KuduScanner::ReadMode,
                  kudu::client::KuduScanner::READ_LATEST,
-                 kudu::client::KuduScanner::READ_AT_SNAPSHOT);
+                 kudu::client::KuduScanner::READ_YOUR_WRITES);
 
 MAKE_ENUM_LIMITS(kudu::client::KuduScanner::OrderMode,
                  kudu::client::KuduScanner::UNORDERED,
@@ -152,23 +152,27 @@ class ResourceMetrics;
 using internal::MetaCache;
 using sp::shared_ptr;
 
-static const char* kProgName = "kudu_client";
 const char* kVerboseEnvVar = "KUDU_CLIENT_VERBOSE";
+
+#if defined(kudu_client_exported_EXPORTS)
+static const char* kProgName = "kudu_client";
 
 // We need to reroute all logging to stderr when the client library is
 // loaded. GoogleOnceInit() can do that, but there are multiple entry
 // points into the client code, and it'd need to be called in each one.
 // So instead, let's use a constructor function.
 //
-// Should this be restricted to just the exported client build? Probably
-// not, as any application using the library probably wants stderr logging
-// more than file logging.
+// This is restricted to the exported client builds only. In case of linking
+// with non-exported kudu client library, logging must be initialized
+// from the main() function of the corresponding binary: usually, that's done
+// by calling InitGoogleLoggingSafe(argv[0]).
 __attribute__((constructor))
 static void InitializeBasicLogging() {
   InitGoogleLoggingSafeBasic(kProgName);
 
   SetVerboseLevelFromEnvVar();
 }
+#endif
 
 // Set Client logging verbose level from environment variable.
 void SetVerboseLevelFromEnvVar() {
@@ -284,9 +288,15 @@ KuduClientBuilder& KuduClientBuilder::import_authentication_credentials(string a
   return *this;
 }
 
+KuduClientBuilder& KuduClientBuilder::num_reactors(int num_reactors) {
+  data_->num_reactors_ = num_reactors;
+  return *this;
+}
+
 namespace {
-Status ImportAuthnCredsToMessenger(const string& authn_creds,
-                                   Messenger* messenger) {
+Status ImportAuthnCreds(const string& authn_creds,
+                        Messenger* messenger,
+                        UserCredentials* user_credentials) {
   AuthenticationCredentialsPB pb;
   if (!pb.ParseFromString(authn_creds)) {
     return Status::InvalidArgument("invalid authentication data");
@@ -299,6 +309,9 @@ Status ImportAuthnCredsToMessenger(const string& authn_creds,
       return Status::InvalidArgument("invalid authentication token");
     }
     messenger->set_authn_token(tok);
+  }
+  if (pb.has_real_user()) {
+    user_credentials->set_real_user(pb.real_user());
   }
   for (const string& cert_der : pb.ca_cert_ders()) {
     security::Cert cert;
@@ -316,16 +329,26 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
 
   // Init messenger.
   MessengerBuilder builder("client");
+  if (data_->num_reactors_) {
+    builder.set_num_reactors(data_->num_reactors_.get());
+  }
   std::shared_ptr<Messenger> messenger;
   RETURN_NOT_OK(builder.Build(&messenger));
+  UserCredentials user_credentials;
 
   // Parse and import the provided authn data, if any.
   if (!data_->authn_creds_.empty()) {
-    RETURN_NOT_OK(ImportAuthnCredsToMessenger(data_->authn_creds_, messenger.get()));
+    RETURN_NOT_OK(ImportAuthnCreds(data_->authn_creds_, messenger.get(), &user_credentials));
+  }
+  if (!user_credentials.has_real_user()) {
+    // If there are no authentication credentials, then set the real user to the
+    // currently logged-in user.
+    RETURN_NOT_OK(user_credentials.SetLoggedInRealUser());
   }
 
   shared_ptr<KuduClient> c(new KuduClient);
   c->data_->messenger_ = std::move(messenger);
+  c->data_->user_credentials_ = std::move(user_credentials);
   c->data_->master_server_addrs_ = data_->master_server_addrs_;
   c->data_->default_admin_operation_timeout_ = data_->default_admin_operation_timeout_;
   c->data_->default_rpc_timeout_ = data_->default_rpc_timeout_;
@@ -377,8 +400,8 @@ Status KuduClient::DeleteTable(const string& table_name) {
   return data_->DeleteTable(this, table_name, deadline);
 }
 
-KuduTableAlterer* KuduClient::NewTableAlterer(const string& name) {
-  return new KuduTableAlterer(this, name);
+KuduTableAlterer* KuduClient::NewTableAlterer(const string& table_name) {
+  return new KuduTableAlterer(this, table_name);
 }
 
 Status KuduClient::IsAlterTableInProgress(const string& table_name,
@@ -526,6 +549,9 @@ Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
   if (resp.has_error()) {
     return StatusFromPB(resp.error().status());
   }
+  if (resp.tablet_locations_size() == 0) {
+    return Status::NotFound(Substitute("$0: tablet not found", tablet_id));
+  }
   if (resp.tablet_locations_size() != 1) {
     return Status::IllegalState(Substitute(
         "Expected only one tablet, but received $0",
@@ -593,6 +619,7 @@ Status KuduClient::ExportAuthenticationCredentials(string* authn_creds) const {
   if (tok) {
     pb.mutable_authn_token()->CopyFrom(*tok);
   }
+  pb.set_real_user(data_->user_credentials_.real_user());
 
   vector<string> cert_ders;
   RETURN_NOT_OK_PREPEND(data_->messenger_->tls_context().DumpTrustedCerts(&cert_ders),
@@ -900,7 +927,7 @@ bool KuduError::was_possibly_successful() const {
 
 KuduError::KuduError(KuduWriteOperation* failed_op,
                      const Status& status)
-  : data_(new KuduError::Data(gscoped_ptr<KuduWriteOperation>(failed_op),
+  : data_(new KuduError::Data(unique_ptr<KuduWriteOperation>(failed_op),
                               status)) {
 }
 
@@ -1117,6 +1144,12 @@ KuduTableAlterer* KuduTableAlterer::wait(bool wait) {
   return this;
 }
 
+KuduTableAlterer* KuduTableAlterer::alter_external_catalogs(
+    bool alter_external_catalogs) {
+  data_->alter_external_catalogs_ = alter_external_catalogs;
+  return this;
+}
+
 Status KuduTableAlterer::Alter() {
   AlterTableRequestPB req;
   AlterTableResponsePB resp;
@@ -1319,6 +1352,13 @@ Status KuduScanner::SetRowFormatFlags(uint64_t flags) {
   return data_->mutable_configuration()->SetRowFormatFlags(flags);
 }
 
+Status KuduScanner::SetLimit(int64_t limit) {
+  if (data_->open_) {
+    return Status::IllegalState("Limit must be set before Open()");
+  }
+  return data_->mutable_configuration()->SetLimit(limit);
+}
+
 const ResourceMetrics& KuduScanner::GetResourceMetrics() const {
   return data_->resource_metrics_;
 }
@@ -1363,6 +1403,20 @@ Status KuduScanner::Open() {
     data_->open_ = true;
     data_->short_circuit_ = true;
     return Status::OK();
+  }
+
+  // For READ_YOUR_WRITES scan mode, get the latest observed timestamp and store it
+  // to scan config. Always use this one as propagation timestamp for the duration
+  // of the scan to avoid unnecessarily wait.
+  if (data_->configuration().read_mode() == READ_YOUR_WRITES) {
+    const uint64_t lo_ts = data_->table_->client()->data_->GetLatestObservedTimestamp();
+    data_->mutable_configuration()->SetScanLowerBoundTimestampRaw(lo_ts);
+  }
+
+  if (data_->configuration().read_mode() != READ_AT_SNAPSHOT &&
+      data_->configuration().has_snapshot_timestamp()) {
+    return Status::InvalidArgument("Snapshot timestamp should only be configured "
+                                   "for READ_AT_SNAPSHOT scan mode.");
   }
 
   VLOG(2) << "Beginning " << data_->DebugString();
@@ -1447,7 +1501,8 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
                                data_->configuration().projection(),
                                data_->configuration().client_projection(),
                                data_->configuration().row_format_flags(),
-                               make_gscoped_ptr(data_->last_response_.release_data()));
+                               unique_ptr<RowwiseRowBlockPB>(
+                                   data_->last_response_.release_data()));
   }
 
   if (data_->last_response_.has_more_results()) {
@@ -1471,14 +1526,16 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
                                    data_->configuration().projection(),
                                    data_->configuration().client_projection(),
                                    data_->configuration().row_format_flags(),
-                                   make_gscoped_ptr(data_->last_response_.release_data()));
+                                   unique_ptr<RowwiseRowBlockPB>(
+                                       data_->last_response_.release_data()));
       }
 
       data_->scan_attempts_++;
 
       // Error handling.
       set<string> blacklist;
-      Status s = data_->HandleError(result, batch_deadline, &blacklist);
+      bool needs_reopen = false;
+      Status s = data_->HandleError(result, batch_deadline, &blacklist, &needs_reopen);
       if (!s.ok()) {
         LOG(WARNING) << "Scan at tablet server " << data_->ts_->ToString() << " of tablet "
                      << data_->DebugString() << " failed: " << result.status.ToString();
@@ -1491,7 +1548,7 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
         return data_->ReopenCurrentTablet(batch_deadline, &blacklist);
       }
 
-      if (blacklist.empty()) {
+      if (blacklist.empty() && !needs_reopen) {
         // If we didn't blacklist the current server, we can just retry again.
         continue;
       }

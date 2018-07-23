@@ -146,6 +146,7 @@ Status WaitUntilAllReplicasHaveOp(const int64_t log_index,
 Status GetConsensusState(const TServerDetails* replica,
                          const std::string& tablet_id,
                          const MonoDelta& timeout,
+                         consensus::IncludeHealthReport report_health,
                          consensus::ConsensusStatePB* consensus_state);
 
 // Wait until there is no longer a pending config on the specified server.
@@ -206,7 +207,7 @@ Status WaitForReplicasReportedToMaster(
     bool* has_leader,
     master::TabletLocationsPB* tablet_locations);
 
-// Wait until the last commited OpId has index exactly 'opid_index'.
+// Wait until the last committed OpId has index exactly 'opid_index'.
 Status WaitUntilCommittedOpIdIndexIs(int64_t opid_index,
                                      TServerDetails* replica,
                                      const std::string& tablet_id,
@@ -359,7 +360,7 @@ Status WaitForNumTabletsOnTS(
     TServerDetails* ts,
     int count,
     const MonoDelta& timeout,
-    std::vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB>* tablets,
+    std::vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB>* tablets = nullptr,
     boost::optional<tablet::TabletStatePB> state = boost::none);
 
 // Check if the tablet is in the specified state.

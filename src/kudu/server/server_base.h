@@ -52,6 +52,7 @@ namespace rpc {
 class ResultTracker;
 class RpcContext;
 class ServiceIf;
+class ServicePool;
 } // namespace rpc
 
 namespace security {
@@ -60,6 +61,7 @@ class TokenVerifier;
 } // namespace security
 
 namespace server {
+class DiagnosticsLog;
 class ServerStatusPB;
 
 // Base class for tablet server and master.
@@ -194,13 +196,16 @@ class ServerBase {
   void MetricsLoggingThread();
   std::string FooterHtml() const;
 
+  // Callback from the RPC system when a service queue has overflowed.
+  void ServiceQueueOverflowed(rpc::ServicePool* service);
+
   // Start thread to remove excess glog and minidump files.
   Status StartExcessLogFileDeleterThread();
   void ExcessLogFileDeleterThread();
 
   ServerBaseOptions options_;
 
-  scoped_refptr<Thread> metrics_logging_thread_;
+  std::unique_ptr<DiagnosticsLog> diag_log_;
   scoped_refptr<Thread> excess_log_deleter_thread_;
   CountDownLatch stop_background_threads_latch_;
 

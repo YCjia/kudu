@@ -41,10 +41,14 @@ To upgrade Kudu from a previous version, see <<upgrade>>.
 
 == Prerequisites and Requirements
 .Hardware
-- One or more hosts to run Kudu masters. It is recommended to have either one master
-(no fault tolerance), three masters (can tolerate one failure), or five masters (two failures).
-- One or more hosts to run Kudu tablet servers. When using replication, a minimum of
-three tablet servers is necessary.
+- One or more hosts to run Kudu masters. It is recommended to have either one master (no fault
+tolerance), or three masters (can tolerate one failure). The number of masters must be odd.
+- One or more hosts to run Kudu tablet servers. When using replication, a minimum of three tablet
+servers is necessary.
+
+WARNING: A deployment with an even number of masters provides the same level of fault tolerance as a
+deployment with one fewer master. For example, both four-master and three-master deployments can
+only tolerate a single failure; two-master deployments cannot tolerate any failures.
 
 .Operating System Requirements
 Linux::
@@ -56,7 +60,7 @@ Linux::
     - ntp.
     - xfs or ext4 formatted drives.
 macOS::
-    - OS X 10.10 Yosemite, OS X 10.11 El Capitan, or macOS Sierra.
+    - OS X 10.10 Yosemite, OS X 10.11 El Capitan, macOS Sierra, or macOS High Sierra.
     - Prebuilt macOS packages are not provided.
 Windows::
     - Microsoft Windows is unsupported.
@@ -455,7 +459,7 @@ make -j4
 ----
 $ sudo zypper install autoconf automake curl cyrus-sasl-devel \
   cyrus-sasl-gssapi flex gcc gcc-c++ gdb git java-1_8_0-openjdk-devel \
-  krb5-devel libtool lsb-release make ntp openssl-devel patch \
+  krb5-devel krb5-server libtool lsb-release make ntp openssl-devel patch \
   pkg-config python rsync unzip vim
 ----
 
@@ -529,18 +533,24 @@ The link:https://developer.apple.com/xcode/[Xcode] package is necessary for
 compiling Kudu. Some of the instructions below use link:http://brew.sh/[Homebrew]
 to install dependencies, but manual dependency installation is possible.
 
+After installing Xcode, don't forget to accept the license and install command-line
+tools, if it's not done yet:
+----
+$ sudo xcodebuild -license
+$ sudo xcode-select --install
+----
+
 [WARNING]
 .macOS Known Issues
 ====
 Kudu support for macOS is experimental, and should only be used for development.
-See link:https://issues.cloudera.org/browse/KUDU-1219[macOS Limitations & Known Issues]
+See link:https://issues.apache.org/browse/KUDU-1219[macOS Limitations & Known Issues]
 for more information.
 ====
 
 . Install the prerequisite libraries, if they are not installed.
 +
 ----
-$ brew tap homebrew/dupes
 $ brew install autoconf automake cmake git krb5 libtool openssl pkg-config pstree
 ----
 

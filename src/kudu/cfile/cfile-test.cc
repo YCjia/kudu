@@ -64,6 +64,8 @@
 #include "kudu/util/cache.h"
 #include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/env.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/int128_util.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/metrics.h"
@@ -393,7 +395,7 @@ class TestCFileBothCacheTypes : public TestCFile,
                                 public ::testing::WithParamInterface<CacheType> {
  public:
   void SetUp() OVERRIDE {
-#if defined(__linux__)
+#if defined(HAVE_LIB_VMEM)
     // The NVM cache can run using any directory as its path -- it doesn't have
     // a lot of practical use outside of an actual NVM device, but for testing
     // purposes, we'll point it at our test dir, unless otherwise specified.
@@ -406,7 +408,7 @@ class TestCFileBothCacheTypes : public TestCFile,
       case DRAM_CACHE:
         FLAGS_block_cache_type = "DRAM";
         break;
-#if defined(__linux__)
+#if defined(HAVE_LIB_VMEM)
       case NVM_CACHE:
         FLAGS_block_cache_type = "NVM";
         break;
@@ -548,14 +550,19 @@ TEST_P(TestCFileBothCacheTypes, TestReadWriteInt64) {
   }
 }
 
-TEST_P(TestCFileBothCacheTypes, TestFixedSizeReadWritePlainEncodingFloat) {
-  TestReadWriteFixedSizeTypes<FPDataGenerator<FLOAT, false> >(PLAIN_ENCODING);
-}
-TEST_P(TestCFileBothCacheTypes, TestFixedSizeReadWritePlainEncodingDouble) {
-  TestReadWriteFixedSizeTypes<FPDataGenerator<DOUBLE, false> >(PLAIN_ENCODING);
+TEST_P(TestCFileBothCacheTypes, TestReadWriteInt128) {
+  TestReadWriteFixedSizeTypes<Int128DataGenerator<false>>(PLAIN_ENCODING);
 }
 
-// Test for BitShuffle builder for UINT8, INT8, UINT16, INT16, UINT32, INT32, FLOAT, DOUBLE
+TEST_P(TestCFileBothCacheTypes, TestFixedSizeReadWritePlainEncodingFloat) {
+  TestReadWriteFixedSizeTypes<FPDataGenerator<FLOAT, false>>(PLAIN_ENCODING);
+}
+TEST_P(TestCFileBothCacheTypes, TestFixedSizeReadWritePlainEncodingDouble) {
+  TestReadWriteFixedSizeTypes<FPDataGenerator<DOUBLE, false>>(PLAIN_ENCODING);
+}
+
+// Test for BitShuffle builder for UINT8, INT8, UINT16, INT16, UINT32, INT32,
+// UINT64, INT64, INT128, FLOAT, DOUBLE
 template <typename T>
 class BitShuffleTest : public TestCFile {
   public:
@@ -569,6 +576,9 @@ typedef ::testing::Types<UInt8DataGenerator<false>,
                          Int16DataGenerator<false>,
                          UInt32DataGenerator<false>,
                          Int32DataGenerator<false>,
+                         UInt64DataGenerator<false>,
+                         Int64DataGenerator<false>,
+                         Int128DataGenerator<false>,
                          FPDataGenerator<FLOAT, false>,
                          FPDataGenerator<DOUBLE, false> > MyTypes;
 TYPED_TEST_CASE(BitShuffleTest, MyTypes);
@@ -1019,7 +1029,7 @@ TEST_P(TestCFileBothCacheTypes, TestCacheKeysAreStable) {
   }
 }
 
-#if defined(__linux__)
+#if defined(HAVE_LIB_VMEM)
 // Inject failures in nvm allocation and ensure that we can still read a file.
 TEST_P(TestCFileBothCacheTypes, TestNvmAllocationFailure) {
   if (GetParam() != NVM_CACHE) return;

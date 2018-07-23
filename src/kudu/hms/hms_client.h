@@ -19,15 +19,21 @@
 
 #include <cstdint>
 #include <string>
-#include <vector> // IWYU pragma: keep
+#include <vector>
 
 #include "kudu/gutil/port.h"
 #include "kudu/hms/ThriftHiveMetastore.h"
-#include "kudu/hms/hive_metastore_types.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
-namespace hive = Apache::Hadoop::Hive;
+namespace hive {
+class Database;
+class EnvironmentContext;
+class NotificationEvent;
+class Partition;
+class Table;
+}
 
 namespace kudu {
 
@@ -41,38 +47,80 @@ enum class Cascade {
   kFalse,
 };
 
-// A client for the Hive MetaStore.
+struct HmsClientOptions {
+
+  // Thrift socket send timeout
+  MonoDelta send_timeout = MonoDelta::FromSeconds(60);
+
+  // Thrift socket receive timeout.
+  MonoDelta recv_timeout = MonoDelta::FromSeconds(60);
+
+  // Thrift socket connect timeout.
+  MonoDelta conn_timeout = MonoDelta::FromSeconds(60);
+
+  // Whether to use SASL Kerberos authentication when connecting to the HMS.
+  bool enable_kerberos = false;
+};
+
+// A client for the Hive Metastore.
 //
 // All operations are synchronous, and may block.
 //
 // HmsClient is not thread safe.
 //
-// TODO(dan): this client is lacking adequate failure handling, including:
-//  - Documentation of specific Status codes returned in error scenarios
-//  - Connection timeouts
-//  - Handling and/or documentation of retry and reconnection behavior
+// HmsClient wraps a single TCP connection to an HMS, and does not attempt to
+// handle or retry on failure. It's expected that a higher-level component will
+// wrap HmsClient to provide retry, pooling, and HA deployment features if
+// necessary.
 //
-// TODO(dan): this client does not handle HA (multi) HMS deployments.
-//
-// TODO(dan): this client does not handle Kerberized HMS deployments.
+// Note: Thrift provides a handy TSocketPool class which could be useful in
+// allowing the HmsClient to transparently handle connecting to a pool of HA HMS
+// instances. However, because TSocketPool handles choosing the instance during
+// socket connect, it can't determine if the remote endpoint is actually an HMS,
+// or just a random listening TCP socket. Nor can it do application-level checks
+// like ensuring that the connected HMS is configured with the Kudu Metastore
+// plugin. So, it's better for a higher-level construct to handle connecting to
+// HA deployments by wrapping multiple HmsClient instances. HmsClient punts on
+// handling connection retries, because the higher-level construct which is
+// handling HA deployments will naturally want to retry across HMS instances as
+// opposed to retrying repeatedly on a single instance.
 class HmsClient {
  public:
 
+  static const char* const kExternalTableKey;
+  static const char* const kLegacyKuduStorageHandler;
+  static const char* const kLegacyKuduTableNameKey;
+  static const char* const kLegacyTablePrefix;
   static const char* const kKuduTableIdKey;
   static const char* const kKuduMasterAddrsKey;
+  static const char* const kKuduMasterEventKey;;
+  static const char* const kStorageHandlerKey;
   static const char* const kKuduStorageHandler;
+  static const char* const kHiveFilterFieldParams;
 
   static const char* const kTransactionalEventListeners;
+  static const char* const kDisallowIncompatibleColTypeChanges;
   static const char* const kDbNotificationListener;
   static const char* const kKuduMetastorePlugin;
 
-  explicit HmsClient(const HostPort& hms_address);
+  // See org.apache.hadoop.hive.metastore.TableType.
+  static const char* const kManagedTable;
+  static const char* const kExternalTable;
+
+  static const uint16_t kDefaultHmsPort;
+
+  // Create an HmsClient connection to the proided HMS Thrift RPC address.
+  //
+  // The individual timeouts may be set to enforce per-operation
+  // (read/write/connect) timeouts.
+  HmsClient(const HostPort& hms_address, const HmsClientOptions& options);
   ~HmsClient();
 
   // Starts the HMS client.
   //
   // This method will open a synchronous TCP connection to the HMS. If the HMS
-  // can not be reached, an error is returned.
+  // can not be reached within the connection timeout interval, an error is
+  // returned.
   //
   // Must be called before any subsequent operations using the client.
   Status Start() WARN_UNUSED_RESULT;
@@ -81,6 +129,9 @@ class HmsClient {
   //
   // This is optional; if not called the destructor will stop the client.
   Status Stop() WARN_UNUSED_RESULT;
+
+  // Returns 'true' if the client is connected to the remote server.
+  bool IsConnected() WARN_UNUSED_RESULT;
 
   // Creates a new database in the HMS.
   //
@@ -103,26 +154,43 @@ class HmsClient {
   Status GetDatabase(const std::string& pattern, hive::Database* database) WARN_UNUSED_RESULT;
 
   // Creates a table in the HMS.
-  Status CreateTable(const hive::Table& table) WARN_UNUSED_RESULT;
+  Status CreateTable(const hive::Table& table,
+                     const hive::EnvironmentContext& env_ctx = hive::EnvironmentContext())
+    WARN_UNUSED_RESULT;
 
   // Alter a table in the HMS.
   Status AlterTable(const std::string& database_name,
                     const std::string& table_name,
-                    const hive::Table& table) WARN_UNUSED_RESULT;
+                    const hive::Table& table,
+                    const hive::EnvironmentContext& env_ctx = hive::EnvironmentContext())
+    WARN_UNUSED_RESULT;
 
   // Drops a Kudu table in the HMS.
-  Status DropTableWithContext(const std::string& database_name,
-                              const std::string& table_name,
-                              const hive::EnvironmentContext& env_ctx) WARN_UNUSED_RESULT;
+  Status DropTable(const std::string& database_name,
+                   const std::string& table_name,
+                   const hive::EnvironmentContext& env_ctx = hive::EnvironmentContext())
+    WARN_UNUSED_RESULT;
 
   // Retrieves an HMS table metadata.
   Status GetTable(const std::string& database_name,
                   const std::string& table_name,
                   hive::Table* table) WARN_UNUSED_RESULT;
 
-  // Retrieves all tables in an HMS database.
-  Status GetAllTables(const std::string& database_name,
-                      std::vector<std::string>* tables) WARN_UNUSED_RESULT;
+  // Retrieves HMS table metadata for all tables in 'table_names'.
+  Status GetTables(const std::string& database_name,
+                   const std::vector<std::string>& table_names,
+                   std::vector<hive::Table>* tables) WARN_UNUSED_RESULT;
+
+  // Retrieves all table names in an HMS database.
+  Status GetTableNames(const std::string& database_name,
+                       std::vector<std::string>* table_names) WARN_UNUSED_RESULT;
+
+  // Retrieves all table names in an HMS database matching a filter. See the
+  // docs for 'get_table_names_by_filter' in hive_metastore.thrift for filter
+  // syntax examples.
+  Status GetTableNames(const std::string& database_name,
+                       const std::string& filter,
+                       std::vector<std::string>* table_names) WARN_UNUSED_RESULT;
 
   // Retrieves a the current HMS notification event ID.
   Status GetCurrentNotificationEventId(int64_t* event_id) WARN_UNUSED_RESULT;
@@ -131,6 +199,16 @@ class HmsClient {
   Status GetNotificationEvents(int64_t last_event_id,
                                int32_t max_events,
                                std::vector<hive::NotificationEvent>* events) WARN_UNUSED_RESULT;
+
+  // Adds partitions to an HMS table.
+  Status AddPartitions(const std::string& database_name,
+                       const std::string& table_name,
+                       std::vector<hive::Partition> partitions) WARN_UNUSED_RESULT;
+
+  // Retrieves the partitions of an HMS table.
+  Status GetPartitions(const std::string& database_name,
+                       const std::string& table_name,
+                       std::vector<hive::Partition>* partitions) WARN_UNUSED_RESULT;
 
   // Deserializes a JSON encoded table.
   //

@@ -35,7 +35,7 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -269,8 +269,13 @@ TEST_F(TabletCopyClientSessionITest, TestCopyFromCrashedSource) {
 
   // Attempt the copy again. This time it should succeed.
   ASSERT_OK(WaitUntilTabletRunning(ts0, tablet_id, kDefaultTimeout));
-  ASSERT_OK(StartTabletCopy(ts1, tablet_id, ts0->uuid(), src_addr,
-                            std::numeric_limits<int64_t>::max(), kDefaultTimeout));
+  // KUDU-2444: Even though the copy failed and the tablet replica is
+  // tombstoned, the tablet manager may not have transitioned the replica out
+  // of the 'copying' phase yet, so we retry here.
+  ASSERT_EVENTUALLY([&]{
+    ASSERT_OK(StartTabletCopy(ts1, tablet_id, ts0->uuid(), src_addr,
+                              std::numeric_limits<int64_t>::max(), kDefaultTimeout));
+  });
   ASSERT_OK(WaitUntilTabletRunning(ts1, tablet_id, kDefaultTimeout));
 }
 

@@ -171,8 +171,7 @@ elif [[ "$OSTYPE" == "darwin"* ]]; then
 
   # Build against the Macports or Homebrew OpenSSL versions, in order to match
   # the Kudu build.
-  OPENSSL_CFLAGS=$(pkg-config --cflags openssl)
-  if [ -z $OPENSSL_CFLAGS ]; then
+  if ! OPENSSL_CFLAGS=$(pkg-config --cflags openssl); then
     # If OpenSSL is built via Homebrew, pkg-config does not report on cflags.
     homebrew_openssl_dir=/usr/local/opt/openssl
     if [ -d $homebrew_openssl_dir ]; then
@@ -412,7 +411,7 @@ MODE_SUFFIX=".tsan"
 
 save_env
 
-# Build the dependencies with TSAN instrumentation.
+# Build the C (non-C++) dependencies with TSAN instrumentation.
 EXTRA_CFLAGS="-fsanitize=thread $EXTRA_CFLAGS"
 
 # Enable debug symbols so that stacktraces and linenumbers are available at runtime.
@@ -463,10 +462,6 @@ fi
 
 save_env
 
-# libc++ (and its dependents) need to find libc++abi at link and run time.
-EXTRA_LDFLAGS="-L$PREFIX/lib $EXTRA_LDFLAGS"
-EXTRA_LDFLAGS="-Wl,-rpath,$PREFIX/lib $EXTRA_LDFLAGS"
-
 # Build libc++ with TSAN enabled.
 if [ -n "$F_TSAN" -o -n "$F_LLVM" ]; then
   build_libcxx tsan
@@ -474,9 +469,9 @@ fi
 
 # Build the rest of the dependencies against the TSAN-instrumented libc++
 # instead of the system's C++ standard library.
-EXTRA_CXXFLAGS="-nostdinc++ $EXTRA_CXXFLAGS"
-EXTRA_CXXFLAGS="-stdlib=libc++ $EXTRA_CXXFLAGS"
 EXTRA_CXXFLAGS="-isystem $PREFIX/include/c++/v1 $EXTRA_CXXFLAGS"
+EXTRA_LDFLAGS="-L$PREFIX/lib $EXTRA_LDFLAGS"
+EXTRA_LDFLAGS="-Wl,-rpath,$PREFIX/lib $EXTRA_LDFLAGS"
 
 # Build the rest of the dependencies with TSAN instrumentation.
 EXTRA_CFLAGS="-fsanitize=thread $EXTRA_CFLAGS"
@@ -486,6 +481,19 @@ EXTRA_CXXFLAGS="-DTHREAD_SANITIZER $EXTRA_CXXFLAGS"
 if [ -n "$F_TSAN" -o -n "$F_LLVM" ]; then
   build_llvm tsan
 fi
+
+# LLVM is told to use libc++ explicitly and thus doesn't need these, but the
+# rest of the dependencies need them.
+#
+# Note: -nostdinc++ is necessary to prevent C++ headers from using #include_next
+# to chain the host's C++ headers. However, using it means we need to also use
+# -Qunused-arguments because clang raises an unused argument warning when it
+# detects -nostdinc++ on a link line, and there's no way to prevent that when
+# passing -nostdinc++ to cmake via -DCMAKE_CXX_FLAGS [1].
+#
+# 1. https://gitlab.kitware.com/cmake/cmake/issues/12652
+EXTRA_CXXFLAGS="-Qunused-arguments -nostdinc++ $EXTRA_CXXFLAGS"
+EXTRA_LDFLAGS="-stdlib=libc++ $EXTRA_LDFLAGS"
 
 # Enable debug symbols so that stacktraces and linenumbers are available at
 # runtime. LLVM is compiled without debug symbols because the LLVM debug symbols

@@ -81,7 +81,12 @@ inline void GetCurrentTime(mach_timespec_t* ts) {
 inline MicrosecondsInt64 GetCurrentTimeMicros() {
   mach_timespec_t ts;
   GetCurrentTime(&ts);
-  return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+  // 'tv_sec' is just 4 bytes on macOS, need to be careful not
+  // to convert to nanos until we've moved to a larger int.
+  MicrosecondsInt64 micros_from_secs = ts.tv_sec;
+  micros_from_secs *= 1000 * 1000;
+  micros_from_secs += ts.tv_nsec / 1000;
+  return micros_from_secs;
 }
 
 inline int64_t GetMonoTimeNanos() {
@@ -96,7 +101,7 @@ inline int64_t GetMonoTimeNanos() {
 }
 
 inline MicrosecondsInt64 GetMonoTimeMicros() {
-  return GetMonoTimeNanos() / 1e3;
+  return GetMonoTimeNanos() / 1000;
 }
 
 inline MicrosecondsInt64 GetThreadCpuTimeMicros() {
@@ -122,7 +127,7 @@ inline MicrosecondsInt64 GetThreadCpuTimeMicros() {
     return 0;
   }
 
-  return thread_info_data.user_time.seconds * 1e6 + thread_info_data.user_time.microseconds;
+  return thread_info_data.user_time.seconds * 1000000 + thread_info_data.user_time.microseconds;
 }
 
 #else
@@ -130,7 +135,13 @@ inline MicrosecondsInt64 GetThreadCpuTimeMicros() {
 inline MicrosecondsInt64 GetClockTimeMicros(clockid_t clock) {
   timespec ts;
   clock_gettime(clock, &ts);
-  return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+  // 'tv_sec' is usually 8 bytes, but the spec says it only
+  // needs to be 'a signed int'. Moved to a 64 bit var before
+  // converting to micros to be safe.
+  MicrosecondsInt64 micros_from_secs = ts.tv_sec;
+  micros_from_secs *= 1000 * 1000;
+  micros_from_secs += ts.tv_nsec / 1000;
+  return micros_from_secs;
 }
 
 #endif // defined(__APPLE__)

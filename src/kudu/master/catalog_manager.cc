@@ -53,6 +53,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,14 +84,16 @@
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/escaping.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/sysinfo.h"
 #include "kudu/gutil/utf/utf.h"
 #include "kudu/gutil/walltime.h"
+#include "kudu/hms/hms_catalog.h"
+#include "kudu/master/hms_notification_log_listener.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master_cert_authority.h"
@@ -107,6 +110,7 @@
 #include "kudu/security/token.pb.h"
 #include "kudu/security/token_signer.h"
 #include "kudu/security/token_signing_key.h"
+#include "kudu/security/token_verifier.h"
 #include "kudu/server/monitored_task.h"
 #include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet_replica.h"
@@ -219,6 +223,14 @@ DEFINE_bool(catalog_manager_fail_ts_rpcs, false,
 TAG_FLAG(catalog_manager_fail_ts_rpcs, hidden);
 TAG_FLAG(catalog_manager_fail_ts_rpcs, runtime);
 
+DEFINE_int32(catalog_manager_inject_latency_load_ca_info_ms, 0,
+             "Injects a random sleep between 0 and this many milliseconds "
+             "while reading CA info from the system table. "
+             "This is a test-only flag, do not use in production.");
+TAG_FLAG(catalog_manager_inject_latency_load_ca_info_ms, hidden);
+TAG_FLAG(catalog_manager_inject_latency_load_ca_info_ms, runtime);
+TAG_FLAG(catalog_manager_inject_latency_load_ca_info_ms, unsafe);
+
 DEFINE_int32(catalog_manager_inject_latency_prior_tsk_write_ms, 0,
              "Injects a random sleep between 0 and this many milliseconds "
              "prior to writing newly generated TSK into the system table. "
@@ -234,19 +246,21 @@ TAG_FLAG(catalog_manager_evict_excess_replicas, runtime);
 
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_bool(raft_attempt_to_replace_replica_without_majority);
+DECLARE_int64(tsk_rotation_seconds);
 
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
+using boost::optional;
 using kudu::cfile::TypeEncodingInfo;
 using kudu::consensus::ConsensusServiceProxy;
 using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::GetConsensusRole;
 using kudu::consensus::IsRaftConfigMember;
+using kudu::consensus::MajorityHealthPolicy;
 using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftConsensus;
 using kudu::consensus::RaftPeerPB;
 using kudu::consensus::StartTabletCopyRequestPB;
-using kudu::consensus::MajorityHealthPolicy;
 using kudu::consensus::kMinimumTerm;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
@@ -257,6 +271,7 @@ using kudu::security::PrivateKey;
 using kudu::security::TokenSigner;
 using kudu::security::TokenSigningPrivateKey;
 using kudu::security::TokenSigningPrivateKeyPB;
+using kudu::security::TokenSigningPublicKeyPB;
 using kudu::tablet::TABLET_DATA_DELETED;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using kudu::tablet::TabletDataState;
@@ -300,7 +315,18 @@ class TableLoader : public TableVisitor {
     bool is_deleted = l.mutable_data()->is_deleted();
     catalog_manager_->table_ids_map_[table->id()] = table;
     if (!is_deleted) {
-      catalog_manager_->table_names_map_[l.data().name()] = table;
+      auto* existing = InsertOrReturnExisting(&catalog_manager_->normalized_table_names_map_,
+                                              CatalogManager::NormalizeTableName(l.data().name()),
+                                              table);
+      if (existing) {
+        // Return an HMS-specific error message, since this error currently only
+        // occurs when the HMS is enabled.
+        return Status::IllegalState(
+            "when the Hive Metastore integration is enabled, Kudu table names must not differ "
+            "only by case; restart the master(s) with the Hive Metastore integration disabled and "
+            "rename one of the conflicting tables",
+            Substitute("$0 or $1 [id=$2]", (*existing)->ToString(), l.data().name(), table_id));
+      }
     }
     l.Commit();
 
@@ -433,7 +459,7 @@ class CatalogManagerBgTasks {
 
   ~CatalogManagerBgTasks() {}
 
-  Status Init();
+  Status Init() WARN_UNUSED_RESULT;
   void Shutdown();
 
   void Wake() {
@@ -446,7 +472,7 @@ class CatalogManagerBgTasks {
     MutexLock lock(lock_);
     if (closing_) return;
     if (!pending_updates_) {
-      cond_.TimedWait(MonoDelta::FromMilliseconds(msec));
+      cond_.WaitFor(MonoDelta::FromMilliseconds(msec));
     }
     pending_updates_ = false;
   }
@@ -454,7 +480,6 @@ class CatalogManagerBgTasks {
  private:
   void Run();
 
- private:
   Atomic32 closing_;
   bool pending_updates_;
   mutable Mutex lock_;
@@ -482,6 +507,7 @@ void CatalogManagerBgTasks::Shutdown() {
 }
 
 void CatalogManagerBgTasks::Run() {
+  MonoTime last_tspk_run;
   while (!NoBarrier_Load(&closing_)) {
     {
       CatalogManager::ScopedLeaderSharedLock l(catalog_manager_);
@@ -536,10 +562,14 @@ void CatalogManagerBgTasks::Run() {
             LOG(FATAL) << err_msg;
           }
         }
-      } else if (catalog_manager_->NeedToPrepareFollower() && l.owns_lock()) {
-        // This is the case of a non-leader catalog manager that has some work
-        // to do in a preparation to run in its current role.
-        Status s = catalog_manager_->PrepareFollower();
+      } else if (l.owns_lock()) {
+        // This is the case of a follower catalog manager running as a part
+        // of master process. To be able to authenticate connecting clients
+        // using their authn tokens, a follower master needs:
+        //  * CA-signed server certificate to authenticate itself to a
+        //    connecting client (otherwise the client wont try to use its token)
+        //  * public parts of active TSK keys to verify token signature
+        Status s = catalog_manager_->PrepareFollower(&last_tspk_run);
         if (!s.ok()) {
           LOG(WARNING) << s.ToString()
                        << ": failed to prepare follower catalog manager, will retry";
@@ -561,7 +591,6 @@ void CatalogManagerBgTasks::Run() {
 
 namespace {
 
-
 string RequestorString(RpcContext* rpc) {
   if (rpc) {
     return rpc->requestor_string();
@@ -570,11 +599,21 @@ string RequestorString(RpcContext* rpc) {
   }
 }
 
+// If 's' is not OK, fills in the RPC response with the error and provided code. Returns 's'.
+template<typename RespClass>
+Status SetupError(Status s, RespClass* resp, MasterErrorPB::Code code) {
+  if (PREDICT_FALSE(!s.ok())) {
+    StatusToPB(s, resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(code);
+  }
+  return s;
+}
+
 // If 's' indicates that the node is no longer the leader, setup
 // Service::UnavailableError as the error, set NOT_THE_LEADER as the
 // error code and return true.
 template<class RespClass>
-void CheckIfNoLongerLeaderAndSetupError(Status s, RespClass* resp) {
+void CheckIfNoLongerLeaderAndSetupError(const Status& s, RespClass* resp) {
   // TODO (KUDU-591): This is a bit of a hack, as right now
   // there's no way to propagate why a write to a consensus configuration has
   // failed. However, since we use Status::IllegalState()/IsAborted() to
@@ -582,24 +621,25 @@ void CheckIfNoLongerLeaderAndSetupError(Status s, RespClass* resp) {
   // that is no longer the leader, this suffices until we
   // distinguish this cause of write failure more explicitly.
   if (s.IsIllegalState() || s.IsAborted()) {
-    Status new_status = Status::ServiceUnavailable(
-        "operation requested can only be executed on a leader master, but this"
-        " master is no longer the leader", s.ToString());
-    SetupError(resp->mutable_error(), MasterErrorPB::NOT_THE_LEADER, new_status);
+    SetupError(Status::ServiceUnavailable(
+          "operation requested can only be executed on a leader master, but this"
+          " master is no longer the leader", s.ToString()),
+        resp, MasterErrorPB::NOT_THE_LEADER);
   }
 }
 
 template<class RespClass>
 Status CheckIfTableDeletedOrNotRunning(TableMetadataLock* lock, RespClass* resp) {
   if (lock->data().is_deleted()) {
-    Status s = Status::NotFound("The table was deleted", lock->data().pb.state_msg());
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
+    return SetupError(Status::NotFound(
+          Substitute("table $0 was deleted", lock->data().name()),
+          lock->data().pb.state_msg()),
+        resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
   if (!lock->data().is_running()) {
-    Status s = Status::ServiceUnavailable("The table is not running");
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
+    return SetupError(Status::ServiceUnavailable(
+          Substitute("table $0 is not running", lock->data().name())),
+        resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
   return Status::OK();
 }
@@ -629,11 +669,12 @@ Status ProcessColumnPBDefaults(ColumnSchemaPB* col) {
 
 } // anonymous namespace
 
-CatalogManager::CatalogManager(Master *master)
+CatalogManager::CatalogManager(Master* master)
   : master_(master),
     rng_(GetRandomSeed32()),
     state_(kConstructed),
     leader_ready_term_(-1),
+    hms_notification_log_event_id_(-1),
     leader_lock_(RWMutex::Priority::PREFER_WRITING) {
   CHECK_OK(ThreadPoolBuilder("leader-initialization")
            // Presently, this thread pool must contain only a single thread
@@ -665,6 +706,26 @@ Status CatalogManager::Init(bool is_first_run) {
   RETURN_NOT_OK_PREPEND(sys_catalog_->WaitUntilRunning(),
                         "Failed waiting for the catalog tablet to run");
 
+  if (hms::HmsCatalog::IsEnabled()) {
+    vector<HostPortPB> master_addrs_pb;
+    RETURN_NOT_OK(master_->GetMasterHostPorts(&master_addrs_pb));
+
+    string master_addresses = JoinMapped(
+        master_addrs_pb,
+        [] (const HostPortPB& hostport) {
+          return Substitute("$0:$1", hostport.host(), hostport.port());
+        },
+        ",");
+
+    hms_catalog_.reset(new hms::HmsCatalog(std::move(master_addresses)));
+    RETURN_NOT_OK_PREPEND(hms_catalog_->Start(),
+                          "failed to start Hive Metastore catalog");
+
+    hms_notification_log_listener_.reset(new HmsNotificationLogListenerTask(this));
+    RETURN_NOT_OK_PREPEND(hms_notification_log_listener_->Init(),
+        "failed to initialize Hive Metastore notification log listener task");
+  }
+
   std::lock_guard<LockType> l(lock_);
   background_tasks_.reset(new CatalogManagerBgTasks(this));
   RETURN_NOT_OK_PREPEND(background_tasks_->Init(),
@@ -685,7 +746,8 @@ Status CatalogManager::ElectedAsLeaderCb() {
 }
 
 Status CatalogManager::WaitUntilCaughtUpAsLeader(const MonoDelta& timeout) {
-  ConsensusStatePB cstate = sys_catalog_->tablet_replica()->consensus()->ConsensusState();
+  ConsensusStatePB cstate;
+  RETURN_NOT_OK(sys_catalog_->tablet_replica()->consensus()->ConsensusState(&cstate));
   const string& uuid = master_->fs_manager()->uuid();
   if (cstate.leader_uuid() != uuid) {
     return Status::IllegalState(
@@ -780,7 +842,7 @@ Status CatalogManager::InitCertAuthority() {
     unique_ptr<Cert> cert(new Cert);
 
     // Generate new private key and corresponding CA certificate.
-    RETURN_NOT_OK(master_->cert_authority()->Generate(key.get(), cert.get()));
+    RETURN_NOT_OK(MasterCertAuthority::Generate(key.get(), cert.get()));
     // If the leadership was lost, writing into the system table fails.
     RETURN_NOT_OK(StoreCertAuthorityInfo(*key, *cert));
     // Once the CA information is persisted, it's necessary to initialize
@@ -796,6 +858,7 @@ Status CatalogManager::InitCertAuthority() {
 // private key and certificate.
 Status CatalogManager::InitCertAuthorityWith(
     unique_ptr<PrivateKey> key, unique_ptr<Cert> cert) {
+
   leader_lock_.AssertAcquired();
 
   auto* ca = master_->cert_authority();
@@ -805,7 +868,7 @@ Status CatalogManager::InitCertAuthorityWith(
   RETURN_NOT_OK_PREPEND(tls->AddTrustedCertificate(ca->ca_cert()),
                         "could not trust master CA cert");
   // If we haven't signed our own server cert yet, do so.
-  boost::optional<security::CertSignRequest> csr = tls->GetCsrIfNecessary();
+  optional<security::CertSignRequest> csr = tls->GetCsrIfNecessary();
   if (csr) {
     Cert cert;
     RETURN_NOT_OK_PREPEND(ca->SignServerCSR(*csr, &cert),
@@ -819,6 +882,8 @@ Status CatalogManager::InitCertAuthorityWith(
 Status CatalogManager::LoadCertAuthorityInfo(unique_ptr<PrivateKey>* key,
                                              unique_ptr<Cert>* cert) {
   leader_lock_.AssertAcquired();
+
+  MAYBE_INJECT_RANDOM_LATENCY(FLAGS_catalog_manager_inject_latency_load_ca_info_ms);
 
   SysCertAuthorityEntryPB info;
   RETURN_NOT_OK(sys_catalog_->GetCertAuthorityEntry(&info));
@@ -867,7 +932,7 @@ void CatalogManager::PrepareForLeadershipTask() {
     shared_lock<LockType> l(lock_);
   }
   const RaftConsensus* consensus = sys_catalog_->tablet_replica()->consensus();
-  const int64_t term_before_wait = consensus->ConsensusState().current_term();
+  const int64_t term_before_wait = consensus->CurrentTerm();
   {
     std::lock_guard<simple_spinlock> l(state_lock_);
     if (leader_ready_term_ == term_before_wait) {
@@ -892,7 +957,7 @@ void CatalogManager::PrepareForLeadershipTask() {
     return;
   }
 
-  const int64_t term = consensus->ConsensusState().current_term();
+  const int64_t term = consensus->CurrentTerm();
   if (term_before_wait != term) {
     // If we got elected leader again while waiting to catch up then we will
     // get another callback to visit the tables and tablets, so bail.
@@ -930,7 +995,7 @@ void CatalogManager::PrepareForLeadershipTask() {
         }
       }
 
-      const int64_t term = consensus.ConsensusState().current_term();
+      const int64_t term = consensus.CurrentTerm();
       if (term != start_term) {
         // If the term has changed we assume the new leader catalog is about
         // to do the necessary work in its leadership preparation task.
@@ -976,22 +1041,29 @@ void CatalogManager::PrepareForLeadershipTask() {
         return;
       }
     }
+
+    if (hms_catalog_) {
+      static const char* const kNotificationLogEventIdDescription =
+          "Loading latest processed Hive Metastore notification log event ID";
+      LOG(INFO) << kNotificationLogEventIdDescription << "...";
+      LOG_SLOW_EXECUTION(WARNING, 1000, LogPrefix() + kNotificationLogEventIdDescription) {
+        if (!check(std::bind(&CatalogManager::InitLatestNotificationLogEventId, this),
+                   *consensus, term, kNotificationLogEventIdDescription).ok()) {
+          return;
+        }
+      }
+    }
   }
 
   std::lock_guard<simple_spinlock> l(state_lock_);
   leader_ready_term_ = term;
 }
 
-bool CatalogManager::NeedToPrepareFollower() {
-  return !master_->tls_context().has_signed_cert();
-}
-
-Status CatalogManager::PrepareFollower() {
+Status CatalogManager::PrepareFollowerCaInfo() {
   static const char* const kDescription =
       "acquiring CA information for follower catalog manager";
 
-  leader_lock_.AssertAcquiredForReading();
-
+  // Load the CA certificate and CA private key.
   unique_ptr<PrivateKey> key;
   unique_ptr<Cert> cert;
   Status s = LoadCertAuthorityInfo(&key, &cert).AndThen([&] {
@@ -1003,6 +1075,51 @@ Status CatalogManager::PrepareFollower() {
     LOG_WITH_PREFIX(WARNING) << kDescription << ": " << s.ToString();
   }
   return s;
+}
+
+Status CatalogManager::PrepareFollowerTokenVerifier() {
+  static const char* const kDescription =
+      "importing token verification keys for follower catalog manager";
+
+  // Load public parts of the existing TSKs.
+  vector<TokenSigningPublicKeyPB> keys;
+  const Status s = LoadTspkEntries(&keys).AndThen([&] {
+    return master_->messenger()->shared_token_verifier()->ImportKeys(keys);
+  });
+  if (!s.ok()) {
+    LOG_WITH_PREFIX(WARNING) << kDescription << ": " << s.ToString();
+    return s;
+  }
+
+  if (keys.empty()) {
+    // In case if no keys are found in the system table it's necessary to retry.
+    // Returning non-OK will lead the upper-level logic to call this method
+    // again as soon as possible.
+    return Status::NotFound("no TSK found in the system table");
+  }
+
+  LOG_WITH_PREFIX(INFO) << kDescription
+                        << ": success; most recent TSK sequence number "
+                        << keys.back().key_seq_num();
+  return Status::OK();
+}
+
+Status CatalogManager::PrepareFollower(MonoTime* last_tspk_run) {
+  leader_lock_.AssertAcquiredForReading();
+  // Load the CA certificate and CA private key.
+  if (!master_->tls_context().has_signed_cert()) {
+    RETURN_NOT_OK(PrepareFollowerCaInfo());
+  }
+  // Import keys for authn token verification. A new TSK appear every
+  // tsk_rotation_seconds, so using 1/2 of that interval to avoid edge cases.
+  const auto tsk_rotation_interval =
+      MonoDelta::FromSeconds(FLAGS_tsk_rotation_seconds / 2.0);
+  const auto now = MonoTime::Now();
+  if (!last_tspk_run->Initialized() || *last_tspk_run + tsk_rotation_interval < now) {
+    RETURN_NOT_OK(PrepareFollowerTokenVerifier());
+    *last_tspk_run = now;
+  }
+  return Status::OK();
 }
 
 Status CatalogManager::VisitTablesAndTabletsUnlocked() {
@@ -1020,7 +1137,7 @@ Status CatalogManager::VisitTablesAndTabletsUnlocked() {
   AbortAndWaitForAllTasks(tables);
 
   // Clear the existing state.
-  table_names_map_.clear();
+  normalized_table_names_map_.clear();
   table_ids_map_.clear();
   tablet_map_.clear();
 
@@ -1085,6 +1202,11 @@ void CatalogManager::Shutdown() {
     background_tasks_->Shutdown();
   }
 
+  if (hms_catalog_) {
+    hms_notification_log_listener_->Shutdown();
+    hms_catalog_->Stop();
+  }
+
   // Mark all outstanding table tasks as aborted and wait for them to fail.
   //
   // There may be an outstanding table visitor thread modifying the table map,
@@ -1128,13 +1250,6 @@ void CatalogManager::Shutdown() {
   }
 }
 
-static void SetupError(MasterErrorPB* error,
-                       MasterErrorPB::Code code,
-                       const Status& s) {
-  StatusToPB(s, error->mutable_status());
-  error->set_code(code);
-}
-
 Status CatalogManager::CheckOnline() const {
   if (PREDICT_FALSE(!IsInitialized())) {
     return Status::ServiceUnavailable("CatalogManager is not running");
@@ -1176,7 +1291,7 @@ Status ValidateIdentifier(const string& id) {
 }
 
 // Validate the client-provided schema and name.
-Status ValidateClientSchema(const boost::optional<string>& name,
+Status ValidateClientSchema(const optional<string>& name,
                             const Schema& schema) {
   if (name != boost::none) {
     RETURN_NOT_OK_PREPEND(ValidateIdentifier(name.get()), "invalid table name");
@@ -1221,14 +1336,14 @@ Status ValidateClientSchema(const boost::optional<string>& name,
 Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
                                    CreateTableResponsePB* resp,
                                    rpc::RpcContext* rpc) {
-  auto SetError = [&](MasterErrorPB::Code code, const Status& s) {
-    SetupError(resp->mutable_error(), code, s);
-    return s;
-  };
-
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
-  Status s;
+
+  // If the HMS integration is enabled, wait for the notification log listener
+  // to catch up. This reduces the likelihood of attempting to create a table
+  // with a name that conflicts with a table that has just been deleted or
+  // renamed in the HMS.
+  RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
 
   // Copy the request, so we can fill in some defaults.
   CreateTableRequestPB req = *orig_req;
@@ -1242,21 +1357,19 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // on the protobuf here.
   for (int i = 0; i < req.schema().columns_size(); i++) {
     auto* col = req.mutable_schema()->mutable_columns(i);
-    Status s = ProcessColumnPBDefaults(col);
-    if (!s.ok()) {
-      return SetError(MasterErrorPB::INVALID_SCHEMA, s);
-    }
+    RETURN_NOT_OK(SetupError(ProcessColumnPBDefaults(col), resp, MasterErrorPB::INVALID_SCHEMA));
   }
 
   // a. Validate the user request.
   Schema client_schema;
   RETURN_NOT_OK(SchemaFromPB(req.schema(), &client_schema));
-  s = ValidateClientSchema(req.name(), client_schema);
-  if (s.ok() && client_schema.has_column_ids()) {
-    s = Status::InvalidArgument("User requests should not have Column IDs");
-  }
-  if (!s.ok()) {
-    return SetError(MasterErrorPB::INVALID_SCHEMA, s);
+  string normalized_table_name = NormalizeTableName(req.name());
+
+  RETURN_NOT_OK(SetupError(ValidateClientSchema(normalized_table_name, client_schema),
+                           resp, MasterErrorPB::INVALID_SCHEMA));
+  if (client_schema.has_column_ids()) {
+    return SetupError(Status::InvalidArgument("user requests should not have Column IDs"),
+                      resp, MasterErrorPB::INVALID_SCHEMA);
   }
   Schema schema = client_schema.CopyWithColumnIds();
 
@@ -1264,10 +1377,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // the default partition schema (no hash bucket components and a range
   // partitioned on the primary key columns) will be used.
   PartitionSchema partition_schema;
-  s = PartitionSchema::FromPB(req.partition_schema(), schema, &partition_schema);
-  if (!s.ok()) {
-    return SetError(MasterErrorPB::INVALID_SCHEMA, s);
-  }
+  RETURN_NOT_OK(SetupError(
+        PartitionSchema::FromPB(req.partition_schema(), schema, &partition_schema),
+        resp, MasterErrorPB::INVALID_SCHEMA));
 
   // Decode split rows.
   vector<KuduPartialRow> split_rows;
@@ -1291,9 +1403,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
         if (i >= ops.size() ||
             (ops[i].type != RowOperationsPB::RANGE_UPPER_BOUND &&
              ops[i].type != RowOperationsPB::INCLUSIVE_RANGE_UPPER_BOUND)) {
-          return SetError(MasterErrorPB::UNKNOWN_ERROR,
-                          Status::InvalidArgument(
-                              "Missing upper range bound in create table request"));
+          return SetupError(
+              Status::InvalidArgument("missing upper range bound in create table request"),
+              resp, MasterErrorPB::UNKNOWN_ERROR);
         }
 
         if (op.type == RowOperationsPB::EXCLUSIVE_RANGE_LOWER_BOUND) {
@@ -1322,28 +1434,26 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     req.set_num_replicas(FLAGS_default_num_replicas);
   }
 
+  const auto num_replicas = req.num_replicas();
   // Reject create table with even replication factors, unless master flag
   // allow_unsafe_replication_factor is on.
-  if (req.num_replicas() % 2 == 0 && !FLAGS_allow_unsafe_replication_factor) {
-    s = Status::InvalidArgument(Substitute("illegal replication factor $0 (replication "
-                                           "factor must be odd)", req.num_replicas()));
-    return SetError(MasterErrorPB::EVEN_REPLICATION_FACTOR, s);
+  if (num_replicas % 2 == 0 && !FLAGS_allow_unsafe_replication_factor) {
+    return SetupError(Status::InvalidArgument(
+        Substitute("illegal replication factor $0 (replication factor must be odd)", num_replicas)),
+      resp, MasterErrorPB::EVEN_REPLICATION_FACTOR);
   }
 
-  if (req.num_replicas() > FLAGS_max_num_replicas) {
-    s = Status::InvalidArgument(Substitute("illegal replication factor $0 (max replication "
-                                           "factor is $1)",
-                                           req.num_replicas(),
-                                           FLAGS_max_num_replicas));
-    return SetError(MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH, s);
-
+  if (num_replicas > FLAGS_max_num_replicas) {
+    return SetupError(Status::InvalidArgument(
+          Substitute("illegal replication factor $0 (max replication factor is $1)",
+            num_replicas, FLAGS_max_num_replicas)),
+        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
   }
-  if (req.num_replicas() <= 0) {
-    s = Status::InvalidArgument(Substitute("illegal replication factor $0 (replication factor "
-                                           "must be positive)",
-                                           req.num_replicas(),
-                                           FLAGS_max_num_replicas));
-    return SetError(MasterErrorPB::ILLEGAL_REPLICATION_FACTOR, s);
+  if (num_replicas <= 0) {
+    return SetupError(Status::InvalidArgument(
+          Substitute("illegal replication factor $0 (replication factor must be positive)",
+            num_replicas, FLAGS_max_num_replicas)),
+        resp, MasterErrorPB::ILLEGAL_REPLICATION_FACTOR);
   }
 
   // Verify that the total number of tablets is reasonable, relative to the number
@@ -1352,22 +1462,41 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   master_->ts_manager()->GetAllLiveDescriptors(&ts_descs);
   int num_live_tservers = ts_descs.size();
   int max_tablets = FLAGS_max_create_tablets_per_ts * num_live_tservers;
-  if (req.num_replicas() > 1 && max_tablets > 0 && partitions.size() > max_tablets) {
-    s = Status::InvalidArgument(Substitute("The requested number of tablets is over the "
-                                           "maximum permitted at creation time ($0). Additional "
-                                           "tablets may be added by adding range partitions to the "
-                                           "table post-creation.", max_tablets));
-    return SetError(MasterErrorPB::TOO_MANY_TABLETS, s);
+  if (num_replicas > 1 && max_tablets > 0 && partitions.size() > max_tablets) {
+    return SetupError(Status::InvalidArgument(Substitute(
+            "the requested number of tablets is over the maximum permitted at creation time ($0), "
+            "additional tablets may be added by adding range partitions to the table post-creation",
+            max_tablets)),
+        resp, MasterErrorPB::TOO_MANY_TABLETS);
   }
 
   // Verify that the number of replicas isn't larger than the number of live tablet
   // servers.
-  if (FLAGS_catalog_manager_check_ts_count_for_create_table &&
-      req.num_replicas() > num_live_tservers) {
-    s = Status::InvalidArgument(Substitute(
-        "Not enough live tablet servers to create a table with the requested replication "
-        "factor $0. $1 tablet servers are alive.", req.num_replicas(), num_live_tservers));
-    return SetError(MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH, s);
+  if (FLAGS_catalog_manager_check_ts_count_for_create_table && num_replicas > num_live_tservers) {
+    // Note: this error message is matched against in master-stress-test.
+    return SetupError(Status::InvalidArgument(Substitute(
+            "not enough live tablet servers to create a table with the requested replication "
+            "factor $0; $1 tablet servers are alive", req.num_replicas(), num_live_tservers)),
+        resp, MasterErrorPB::REPLICATION_FACTOR_TOO_HIGH);
+  }
+
+  // Warn if the number of live tablet servers is not enough to re-replicate
+  // a failed replica of the tablet.
+  const auto num_ts_needed_for_rereplication =
+      num_replicas + (FLAGS_raft_prepare_replacement_before_eviction ? 1 : 0);
+  if (num_replicas > 1 && num_ts_needed_for_rereplication > num_live_tservers) {
+    const bool is_off_by_one = FLAGS_raft_prepare_replacement_before_eviction &&
+        num_ts_needed_for_rereplication == num_live_tservers + 1;
+    const string msg = Substitute(
+        "The number of live tablet servers is not enough to re-replicate a "
+        "tablet replica of the newly created table $0 in case of a replica "
+        "failure: $1 tablet servers are needed, $2 are alive. "
+        "Consider bringing up additional tablet server(s)$3",
+        normalized_table_name, num_ts_needed_for_rereplication, num_live_tservers,
+        is_off_by_one ? " or running both the masters and all tablet servers"
+                        " with --raft_prepare_replacement_before_eviction=false"
+                        " flag (not recommended)." : ".");
+    LOG(WARNING) << msg;
   }
 
   scoped_refptr<TableInfo> table;
@@ -1376,30 +1505,30 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     TRACE("Acquired catalog manager lock");
 
     // b. Verify that the table does not exist.
-    table = FindPtrOrNull(table_names_map_, req.name());
+    table = FindPtrOrNull(normalized_table_names_map_, normalized_table_name);
     if (table != nullptr) {
-      s = Status::AlreadyPresent(Substitute("Table $0 already exists with id $1",
-                                 req.name(), table->id()));
-      return SetError(MasterErrorPB::TABLE_ALREADY_PRESENT, s);
+      return SetupError(Status::AlreadyPresent(Substitute(
+              "table $0 already exists with id $1", normalized_table_name, table->id())),
+          resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
 
     // c. Reserve the table name if possible.
-    if (!InsertIfNotPresent(&reserved_table_names_, req.name())) {
+    if (!InsertIfNotPresent(&reserved_normalized_table_names_, normalized_table_name)) {
       // ServiceUnavailable will cause the client to retry the create table
       // request. We don't want to outright fail the request with
       // 'AlreadyPresent', because a table name reservation can be rolled back
       // in the case of an error. Instead, we force the client to retry at a
       // later time.
-      s = Status::ServiceUnavailable(Substitute(
-          "New table name $0 is already reserved", req.name()));
-      return SetError(MasterErrorPB::TABLE_ALREADY_PRESENT, s);
+      return SetupError(Status::ServiceUnavailable(Substitute(
+              "new table name $0 is already reserved", normalized_table_name)),
+          resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
   }
 
   // Ensure that we drop the name reservation upon return.
   SCOPED_CLEANUP({
     std::lock_guard<LockType> l(lock_);
-    CHECK_EQ(1, reserved_table_names_.erase(req.name()));
+    CHECK_EQ(1, reserved_normalized_table_names_.erase(normalized_table_name));
   });
 
   // d. Create the in-memory representation of the new table and its tablets.
@@ -1429,11 +1558,34 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   }
   table->mutable_metadata()->mutable_dirty()->pb.set_state(SysTablesEntryPB::RUNNING);
 
-  // e. Write table and tablets to sys-catalog.
+  // e. Create the table in the HMS.
+  //
+  // It is critical that this step happen before writing the table to the sys catalog,
+  // since this step validates that the table name is available in the HMS catalog.
+  if (hms_catalog_) {
+    Status s = hms_catalog_->CreateTable(table->id(), normalized_table_name, schema);
+    if (!s.ok()) {
+      s = s.CloneAndPrepend(Substitute("an error occurred while creating table $0 in the HMS",
+                                       normalized_table_name));
+      LOG(WARNING) << s.ToString();
+      return SetupError(std::move(s), resp, MasterErrorPB::HIVE_METASTORE_ERROR);
+    }
+  }
+  // Delete the new HMS entry if we exit early.
+  auto abort_hms = MakeScopedCleanup([&] {
+      // TODO(dan): figure out how to test this.
+      if (hms_catalog_) {
+        TRACE("Rolling back HMS table creation");
+        WARN_NOT_OK(hms_catalog_->DropTable(table->id(), normalized_table_name),
+                    "an error occurred while attempting to delete orphaned HMS table entry");
+      }
+  });
+
+  // f. Write table and tablets to sys-catalog.
   SysCatalogTable::Actions actions;
   actions.table_to_add = table;
   actions.tablets_to_add = tablets;
-  s = sys_catalog_->Write(actions);
+  Status s = sys_catalog_->Write(actions);
   if (!s.ok()) {
     s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
     LOG(WARNING) << s.ToString();
@@ -1442,7 +1594,8 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   }
   TRACE("Wrote table and tablets to system table");
 
-  // f. Commit the in-memory state.
+  // g. Commit the in-memory state.
+  abort_hms.cancel();
   table->mutable_metadata()->CommitMutation();
 
   for (const auto& tablet : tablets) {
@@ -1450,7 +1603,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   }
   abort_mutations.cancel();
 
-  // g. Add the tablets to the table.
+  // h. Add the tablets to the table.
   //
   // We can't reuse the above WRITE tablet locks for this because
   // AddRemoveTablets() will read from the clean state, which is empty for
@@ -1463,12 +1616,12 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     tablet->metadata().ReadUnlock();
   }
 
-  // h. Make the new table and tablets visible in the catalog.
+  // i. Make the new table and tablets visible in the catalog.
   {
     std::lock_guard<LockType> l(lock_);
 
     table_ids_map_[table->id()] = table;
-    table_names_map_[req.name()] = table;
+    normalized_table_names_map_[normalized_table_name] = table;
     for (const auto& tablet : tablets) {
       InsertOrDie(&tablet_map_, tablet->id(), tablet);
     }
@@ -1487,15 +1640,9 @@ Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
   RETURN_NOT_OK(CheckOnline());
 
   // 1. Lookup the table and verify if it exists
-  TRACE("Looking up and locking table");
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req->table(), LockMode::READ, &table, &l));
-  if (table == nullptr) {
-    Status s = Status::NotFound("The table does not exist", SecureShortDebugString(req->table()));
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
-  }
+  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the create is in-progress
@@ -1513,7 +1660,7 @@ scoped_refptr<TableInfo> CatalogManager::CreateTableInfo(const CreateTableReques
   table->mutable_metadata()->StartMutation();
   SysTablesEntryPB *metadata = &table->mutable_metadata()->mutable_dirty()->pb;
   metadata->set_state(SysTablesEntryPB::PREPARING);
-  metadata->set_name(req.name());
+  metadata->set_name(NormalizeTableName(req.name()));
   metadata->set_version(0);
   metadata->set_next_column_id(ColumnId(schema.max_col_id() + 1));
   metadata->set_num_replicas(req.num_replicas());
@@ -1535,10 +1682,21 @@ scoped_refptr<TabletInfo> CatalogManager::CreateTabletInfo(const scoped_refptr<T
   return tablet;
 }
 
-Status CatalogManager::FindAndLockTable(const TableIdentifierPB& table_identifier,
+template<typename ReqClass, typename RespClass>
+Status CatalogManager::FindAndLockTable(const ReqClass& request,
+                                        RespClass* response,
                                         LockMode lock_mode,
                                         scoped_refptr<TableInfo>* table_info,
                                         TableMetadataLock* table_lock) {
+  TRACE("Looking up and locking table");
+  const TableIdentifierPB& table_identifier = request.table();
+
+  auto tnf_error = [&] {
+    return SetupError(Status::NotFound(
+          "the table does not exist", SecureShortDebugString(table_identifier)),
+        response, MasterErrorPB::TABLE_NOT_FOUND);
+  };
+
   scoped_refptr<TableInfo> table;
   {
     shared_lock<LockType> l(lock_);
@@ -1548,28 +1706,32 @@ Status CatalogManager::FindAndLockTable(const TableIdentifierPB& table_identifie
       // If the request contains both a table ID and table name, ensure that
       // both match the same table.
       if (table_identifier.has_table_name() &&
-          table.get() != FindPtrOrNull(table_names_map_, table_identifier.table_name()).get()) {
-        return Status::OK();
+          table.get() != FindPtrOrNull(normalized_table_names_map_,
+                                       NormalizeTableName(table_identifier.table_name())).get()) {
+        return tnf_error();
       }
     } else if (table_identifier.has_table_name()) {
-      table = FindPtrOrNull(table_names_map_, table_identifier.table_name());
+      table = FindPtrOrNull(normalized_table_names_map_,
+                            NormalizeTableName(table_identifier.table_name()));
     } else {
-      return Status::InvalidArgument("Missing Table ID or Table Name");
+      return SetupError(Status::InvalidArgument("missing table ID or table name"),
+                        response, MasterErrorPB::UNKNOWN_ERROR);
     }
   }
 
   // If the table doesn't exist, don't attempt to lock it.
   if (!table) {
-    return Status::OK();
+    return tnf_error();
   }
 
   // Acquire the table lock.
   TableMetadataLock lock(table.get(), lock_mode);
 
-  if (table_identifier.has_table_name() && table_identifier.table_name() != lock.data().name()) {
+  if (table_identifier.has_table_name() &&
+      NormalizeTableName(table_identifier.table_name()) != NormalizeTableName(lock.data().name())) {
     // We've encountered the table while it's in the process of being renamed;
     // pretend it doesn't yet exist.
-    return Status::OK();
+    return tnf_error();
   }
 
   *table_info = std::move(table);
@@ -1577,29 +1739,86 @@ Status CatalogManager::FindAndLockTable(const TableIdentifierPB& table_identifie
   return Status::OK();
 }
 
-Status CatalogManager::DeleteTable(const DeleteTableRequestPB* req,
-                                   DeleteTableResponsePB* resp,
-                                   rpc::RpcContext* rpc) {
+Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
+                                      DeleteTableResponsePB* resp,
+                                      rpc::RpcContext* rpc) {
+  LOG(INFO) << Substitute("Servicing DeleteTable request from $0:\n$1",
+                          RequestorString(rpc), SecureShortDebugString(req));
+
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
-  LOG(INFO) << Substitute("Servicing DeleteTable request from $0:\n$1",
-                          RequestorString(rpc), SecureShortDebugString(*req));
+  // If the HMS integration is enabled, then don't directly remove the table
+  // from the Kudu catalog. Instead, delete the table from the HMS and wait for
+  // the notification log listener to apply the corresponding event to the
+  // catalog. By 'serializing' the drop through the HMS, race conditions are
+  // avoided.
+  if (hms_catalog_) {
+    // Wait for the notification log listener to catch up. This reduces the
+    // likelihood of attempting to delete a table which has just been deleted or
+    // renamed in the HMS.
+    RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+
+    // Look up and lock the table.
+    scoped_refptr<TableInfo> table;
+    TableMetadataLock l;
+    RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::READ, &table, &l));
+    if (l.data().is_deleted()) {
+      return SetupError(Status::NotFound("the table was deleted", l.data().pb.state_msg()),
+          resp, MasterErrorPB::TABLE_NOT_FOUND);
+    }
+
+    // Drop the table from the HMS.
+    RETURN_NOT_OK(SetupError(
+          hms_catalog_->DropTable(table->id(), l.data().name()),
+          resp, MasterErrorPB::HIVE_METASTORE_ERROR));
+
+    // Unlock the table, and wait for the notification log listener to handle
+    // the delete table event.
+    l.Unlock();
+    return WaitForNotificationLogListenerCatchUp(resp, rpc);
+  }
+
+  // If the HMS integration isn't enabled, then delete the table directly from
+  // the Kudu catalog.
+  return DeleteTable(req, resp, boost::none);
+}
+
+Status CatalogManager::DeleteTableHms(const string& table_name,
+                                      const string& table_id,
+                                      int64_t notification_log_event_id) {
+  LOG(INFO) << "Deleting table " << table_name
+            << " [id=" << table_id
+            << "] in response to Hive Metastore notification log event "
+            << notification_log_event_id;
+
+  DeleteTableRequestPB req;
+  DeleteTableResponsePB resp;
+  req.mutable_table()->set_table_name(table_name);
+  req.mutable_table()->set_table_id(table_id);
+
+  RETURN_NOT_OK(DeleteTable(req, &resp, notification_log_event_id));
+
+  // Update the cached HMS notification log event ID, if it changed.
+  DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
+  hms_notification_log_event_id_ = notification_log_event_id;
+
+  return Status::OK();
+}
+
+Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
+                                   DeleteTableResponsePB* resp,
+                                   optional<int64_t> hms_notification_log_event_id) {
+  leader_lock_.AssertAcquiredForReading();
+  RETURN_NOT_OK(CheckOnline());
 
   // 1. Look up the table, lock it, and mark it as removed.
-  TRACE("Looking up and locking table");
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req->table(), LockMode::WRITE, &table, &l));
-  if (table == nullptr) {
-    Status s = Status::NotFound("The table does not exist", SecureShortDebugString(req->table()));
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
-  }
+  RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::WRITE, &table, &l));
   if (l.data().is_deleted()) {
-    Status s = Status::NotFound("The table was deleted", l.data().pb.state_msg());
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
+    return SetupError(Status::NotFound("the table was deleted", l.data().pb.state_msg()),
+        resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
 
   TRACE("Modifying in-memory table state")
@@ -1623,6 +1842,7 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB* req,
     // 3. Update sys-catalog with the removed table and tablet state.
     TRACE("Removing table and tablets from system table");
     SysCatalogTable::Actions actions;
+    actions.hms_notification_log_event_id = hms_notification_log_event_id;
     actions.table_to_update = table;
     actions.tablets_to_update.assign(tablets.begin(), tablets.end());
     Status s = sys_catalog_->Write(actions);
@@ -1633,14 +1853,14 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB* req,
       return s;
     }
 
-    // The operation has been written to sys-catalog; now it must succeed.
-
     // 4. Remove the table from the by-name map.
     {
       TRACE("Removing table from by-name map");
       std::lock_guard<LockType> l_map(lock_);
-      if (table_names_map_.erase(l.data().name()) != 1) {
-        PANIC_RPC(rpc, "Could not remove table from map, name=" + l.data().name());
+      if (normalized_table_names_map_.erase(NormalizeTableName(l.data().name())) != 1) {
+        LOG(FATAL) << "Could not remove table " << table->ToString()
+                   << " from map in response to DeleteTable request: "
+                   << SecureShortDebugString(req);
       }
     }
 
@@ -1916,19 +2136,102 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
   return Status::OK();
 }
 
-Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
-                                  AlterTableResponsePB* resp,
-                                  rpc::RpcContext* rpc) {
+Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
+                                     AlterTableResponsePB* resp,
+                                     rpc::RpcContext* rpc) {
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
+  // If the HMS integration is enabled, wait for the notification log listener
+  // to catch up. This reduces the likelihood of attempting to apply an
+  // alteration to a table which has just been renamed or deleted through the HMS.
+  RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+
   LOG(INFO) << Substitute("Servicing AlterTable request from $0:\n$1",
-                          RequestorString(rpc), SecureShortDebugString(*req));
+                          RequestorString(rpc), SecureShortDebugString(req));
+
+  // If the HMS integration is enabled, the alteration includes a table
+  // rename and the table should be altered in the HMS, then don't directly
+  // rename the table in the Kudu catalog. Instead, rename the table
+  // in the HMS and wait for the notification log listener to apply
+  // that event to the catalog. By 'serializing' the rename through the
+  // HMS, race conditions are avoided.
+  if (hms_catalog_ && req.has_new_table_name() && req.alter_external_catalogs()) {
+    // Look up the table and lock it.
+    scoped_refptr<TableInfo> table;
+    TableMetadataLock l;
+    RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::READ, &table, &l));
+    RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
+    string normalized_new_table_name = NormalizeTableName(req.new_table_name());
+
+    // The HMS allows renaming a table to the same name (ALTER TABLE t RENAME TO t),
+    // however Kudu does not, so we must enforce this constraint ourselves before
+    // altering the table in the HMS. The comparison is on the non-normalized
+    // table names, since we want to allow changing the case of a table name.
+    if (l.data().name() == normalized_new_table_name) {
+      return SetupError(
+          Status::AlreadyPresent(Substitute("table $0 already exists with id $1",
+              normalized_new_table_name, table->id())),
+          resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
+    }
+
+    Schema schema;
+    RETURN_NOT_OK(SchemaFromPB(l.data().pb.schema(), &schema));
+
+    // Rename the table in the HMS.
+    RETURN_NOT_OK(SetupError(hms_catalog_->AlterTable(
+            table->id(), l.data().name(), normalized_new_table_name,
+            schema),
+        resp, MasterErrorPB::HIVE_METASTORE_ERROR));
+
+    // Unlock the table, and wait for the notification log listener to handle
+    // the alter table event.
+    l.Unlock();
+    RETURN_NOT_OK(WaitForNotificationLogListenerCatchUp(resp, rpc));
+
+    // Finally, apply the remaining schema and partitioning alterations to the
+    // local catalog. Since Kudu holds the canonical version of table schemas
+    // and partitions the HMS is not updated first.
+    AlterTableRequestPB r(req);
+    r.mutable_table()->clear_table_name();
+    r.mutable_table()->set_table_id(table->id());
+    r.clear_new_table_name();
+
+    return AlterTable(r, resp, boost::none);
+  }
+
+  return AlterTable(req, resp, boost::none);
+}
+
+Status CatalogManager::RenameTableHms(const string& table_id,
+                                      const string& table_name,
+                                      const string& new_table_name,
+                                      int64_t notification_log_event_id) {
+  AlterTableRequestPB req;
+  AlterTableResponsePB resp;
+  req.mutable_table()->set_table_id(table_id);
+  req.mutable_table()->set_table_name(table_name);
+  req.set_new_table_name(new_table_name);
+
+  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id));
+
+  // Update the cached HMS notification log event ID.
+  DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
+  hms_notification_log_event_id_ = notification_log_event_id;
+
+  return Status::OK();
+}
+
+Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
+                                  AlterTableResponsePB* resp,
+                                  optional<int64_t> hms_notification_log_event_id) {
+  leader_lock_.AssertAcquiredForReading();
+  RETURN_NOT_OK(CheckOnline());
 
   // 1. Group the steps into schema altering steps and partition altering steps.
   vector<AlterTableRequestPB::Step> alter_schema_steps;
   vector<AlterTableRequestPB::Step> alter_partitioning_steps;
-  for (const auto& step : req->alter_schema_steps()) {
+  for (const auto& step : req.alter_schema_steps()) {
     switch (step.type()) {
       case AlterTableRequestPB::ADD_COLUMN:
       case AlterTableRequestPB::DROP_COLUMN:
@@ -1949,19 +2252,13 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
   }
 
   // 2. Lookup the table, verify if it exists, and lock it for modification.
-  TRACE("Looking up and locking table");
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req->table(), LockMode::WRITE, &table, &l));
-  if (table == nullptr) {
-    Status s = Status::NotFound("The table does not exist", SecureShortDebugString(req->table()));
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
-  }
+  RETURN_NOT_OK(FindAndLockTable(req, resp, LockMode::WRITE, &table, &l));
   if (l.data().is_deleted()) {
-    Status s = Status::NotFound("The table was deleted", l.data().pb.state_msg());
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
+    return SetupError(
+        Status::NotFound("the table was deleted", l.data().pb.state_msg()),
+        resp, MasterErrorPB::TABLE_NOT_FOUND);
   }
 
   string table_name = l.data().name();
@@ -1970,67 +2267,66 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
   // 3. Calculate and validate new schema for the on-disk state, not persisted yet.
   Schema new_schema;
   ColumnId next_col_id = ColumnId(l.data().pb.next_column_id());
-  if (!alter_schema_steps.empty()) {
-    TRACE("Apply alter schema");
-    Status s = ApplyAlterSchemaSteps(l.data().pb, alter_schema_steps, &new_schema, &next_col_id);
-    if (!s.ok()) {
-      SetupError(resp->mutable_error(), MasterErrorPB::INVALID_SCHEMA, s);
-      return s;
-    }
-    DCHECK_NE(next_col_id, 0);
-    DCHECK_EQ(new_schema.find_column_by_id(next_col_id),
-              static_cast<int>(Schema::kColumnNotFound));
 
-    // Just validate the schema, not the name (validated below).
-    s = ValidateClientSchema(boost::none, new_schema);
-    if (!s.ok()) {
-      SetupError(resp->mutable_error(), MasterErrorPB::INVALID_SCHEMA, s);
-      return s;
-    }
-  }
+  // Apply the alter steps. Note that there may be no steps, in which case this
+  // is essentialy a no-op. It's still important to execute because
+  // ApplyAlterSchemaSteps populates 'new_schema', which is used below.
+  TRACE("Apply alter schema");
+  RETURN_NOT_OK(SetupError(
+        ApplyAlterSchemaSteps(l.data().pb, alter_schema_steps, &new_schema, &next_col_id),
+        resp, MasterErrorPB::INVALID_SCHEMA));
+
+  DCHECK_NE(next_col_id, 0);
+  DCHECK_EQ(new_schema.find_column_by_id(next_col_id),
+            static_cast<int>(Schema::kColumnNotFound));
+
+  // Just validate the schema, not the name (validated below).
+  RETURN_NOT_OK(SetupError(
+        ValidateClientSchema(boost::none, new_schema),
+        resp, MasterErrorPB::INVALID_SCHEMA));
 
   // 4. Validate and try to acquire the new table name.
-  if (req->has_new_table_name()) {
-    Status s = ValidateIdentifier(req->new_table_name());
-    if (!s.ok()) {
-      SetupError(resp->mutable_error(), MasterErrorPB::INVALID_SCHEMA,
-                 s.CloneAndPrepend("invalid table name"));
-      return s;
-    }
+  string normalized_new_table_name = NormalizeTableName(req.new_table_name());
+  if (req.has_new_table_name()) {
+    RETURN_NOT_OK(SetupError(
+          ValidateIdentifier(normalized_new_table_name).CloneAndPrepend("invalid table name"),
+          resp, MasterErrorPB::INVALID_SCHEMA));
 
+    // Validate the new table name.
     std::lock_guard<LockType> catalog_lock(lock_);
     TRACE("Acquired catalog manager lock");
 
     // Verify that the table does not exist.
-    scoped_refptr<TableInfo> other_table = FindPtrOrNull(table_names_map_, req->new_table_name());
+    scoped_refptr<TableInfo> other_table = FindPtrOrNull(normalized_table_names_map_,
+                                                         normalized_new_table_name);
+
     if (other_table != nullptr) {
-      Status s = Status::AlreadyPresent(Substitute("Table $0 already exists with id $1",
-                                                   req->new_table_name(), table->id()));
-      SetupError(resp->mutable_error(), MasterErrorPB::TABLE_ALREADY_PRESENT, s);
-      return s;
+      return SetupError(
+          Status::AlreadyPresent(Substitute("table $0 already exists with id $1",
+              normalized_new_table_name, table->id())),
+          resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
 
     // Reserve the new table name if possible.
-    if (!InsertIfNotPresent(&reserved_table_names_, req->new_table_name())) {
+    if (!InsertIfNotPresent(&reserved_normalized_table_names_, normalized_new_table_name)) {
       // ServiceUnavailable will cause the client to retry the create table
       // request. We don't want to outright fail the request with
       // 'AlreadyPresent', because a table name reservation can be rolled back
       // in the case of an error. Instead, we force the client to retry at a
       // later time.
-      Status s = Status::ServiceUnavailable(Substitute(
-          "Table name $0 is already reserved", req->new_table_name()));
-      SetupError(resp->mutable_error(), MasterErrorPB::TABLE_ALREADY_PRESENT, s);
-      return s;
+      return SetupError(Status::ServiceUnavailable(Substitute(
+              "table name $0 is already reserved", normalized_new_table_name)),
+          resp, MasterErrorPB::TABLE_ALREADY_PRESENT);
     }
 
-    l.mutable_data()->pb.set_name(req->new_table_name());
+    l.mutable_data()->pb.set_name(normalized_new_table_name);
   }
 
   // Ensure that we drop our reservation upon return.
   auto cleanup = MakeScopedCleanup([&] () {
-    if (req->has_new_table_name()) {
+    if (req.has_new_table_name()) {
       std::lock_guard<LockType> l(lock_);
-      CHECK_EQ(1, reserved_table_names_.erase(req->new_table_name()));
+      CHECK_EQ(1, reserved_normalized_table_names_.erase(normalized_new_table_name));
     }
   });
 
@@ -2040,19 +2336,18 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
   if (!alter_partitioning_steps.empty()) {
     TRACE("Apply alter partitioning");
     Schema client_schema;
-    RETURN_NOT_OK(SchemaFromPB(req->schema(), &client_schema));
-    Status s = ApplyAlterPartitioningSteps(l, table, client_schema, alter_partitioning_steps,
-                                           &tablets_to_add, &tablets_to_drop);
-    if (!s.ok()) {
-      SetupError(resp->mutable_error(), MasterErrorPB::UNKNOWN_ERROR, s);
-      return s;
-    }
+    RETURN_NOT_OK(SetupError(SchemaFromPB(req.schema(), &client_schema),
+          resp, MasterErrorPB::UNKNOWN_ERROR));
+    RETURN_NOT_OK(SetupError(
+          ApplyAlterPartitioningSteps(l, table, client_schema, alter_partitioning_steps,
+            &tablets_to_add, &tablets_to_drop),
+          resp, MasterErrorPB::UNKNOWN_ERROR));
   }
 
   // Set to true if columns are altered, added or dropped.
   bool has_schema_changes = !alter_schema_steps.empty();
   // Set to true if there are schema changes, or the table is renamed.
-  bool has_metadata_changes = has_schema_changes || req->has_new_table_name();
+  bool has_metadata_changes = has_schema_changes || req.has_new_table_name();
   // Set to true if there are partitioning changes.
   bool has_partitioning_changes = !alter_partitioning_steps.empty();
   // Set to true if metadata changes need to be applied to existing tablets.
@@ -2089,6 +2384,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
   TRACE("Updating metadata on disk");
   string deletion_msg = "Partition dropped at " + LocalTimeAsString();
   SysCatalogTable::Actions actions;
+  actions.hms_notification_log_event_id = hms_notification_log_event_id;
   if (!tablets_to_add.empty() || has_metadata_changes) {
     // If anything modified the table's persistent metadata, then sync it to the sys catalog.
     actions.table_to_update = table;
@@ -2117,6 +2413,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
   // 8. Commit the in-memory state.
   {
     TRACE("Committing alterations to in-memory state");
+
     // Commit new tablet in-memory state. This doesn't require taking the global
     // lock since the new tablets are not yet visible, because they haven't been
     // added to the table or tablet index.
@@ -2125,12 +2422,13 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
     // Take the global catalog manager lock in order to modify the global table
     // and tablets indices.
     std::lock_guard<LockType> lock(lock_);
-    if (req->has_new_table_name()) {
-      if (table_names_map_.erase(table_name) != 1) {
-        PANIC_RPC(rpc, Substitute(
-            "Could not remove table (name $0) from map", table_name));
+    if (req.has_new_table_name()) {
+      if (normalized_table_names_map_.erase(table_name) != 1) {
+        LOG(FATAL) << "Could not remove table " << table->ToString()
+                   << " from map in response to AlterTable request: "
+                   << SecureShortDebugString(req);
       }
-      InsertOrDie(&table_names_map_, req->new_table_name(), table);
+      InsertOrDie(&normalized_table_names_map_, normalized_new_table_name, table);
     }
 
     // Insert new tablets into the global tablet map. After this, the tablets
@@ -2166,6 +2464,21 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB* req,
   // the tablet again.
   tablets_to_drop_lock.Commit();
 
+  // If there are schema changes, then update the entry in the Hive Metastore.
+  // This is done on a best-effort basis, since Kudu is the source of truth for
+  // table schema information, and the table has already been altered in the
+  // Kudu catalog via the successful sys-table write above.
+  if (hms_catalog_ && has_schema_changes) {
+    // Sanity check: if there are schema changes then this is necessarily not a
+    // table rename, since we split out the rename portion into its own
+    // 'transaction' which is serialized through the HMS.
+    DCHECK(!req.has_new_table_name());
+    WARN_NOT_OK(hms_catalog_->AlterTable(table->id(), table_name, table_name, new_schema),
+                Substitute(
+                  "failed to alter HiveMetastore schema for table $0, "
+                  "HMS schema information will be stale", table->ToString()));
+  }
+
   if (!tablets_to_add.empty() || has_metadata_changes) {
     l.Commit();
   } else {
@@ -2189,15 +2502,9 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
   RETURN_NOT_OK(CheckOnline());
 
   // 1. Lookup the table and verify if it exists
-  TRACE("Looking up and locking table");
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req->table(), LockMode::READ, &table, &l));
-  if (table == nullptr) {
-    Status s = Status::NotFound("The table does not exist", SecureShortDebugString(req->table()));
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
-  }
+  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the alter is in-progress
@@ -2214,15 +2521,9 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
   RETURN_NOT_OK(CheckOnline());
 
   // Lookup the table and verify if it exists
-  TRACE("Looking up and locking table");
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req->table(), LockMode::READ, &table, &l));
-  if (table == nullptr) {
-    Status s = Status::NotFound("The table does not exist", SecureShortDebugString(req->table()));
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
-  }
+  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   if (l.data().pb.has_fully_applied_schema()) {
@@ -2249,7 +2550,7 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
 
   shared_lock<LockType> l(lock_);
 
-  for (const TableInfoMap::value_type& entry : table_names_map_) {
+  for (const TableInfoMap::value_type& entry : normalized_table_names_map_) {
     TableMetadataLock ltm(entry.second.get(), LockMode::READ);
     if (!ltm.data().is_running()) continue; // implies !is_deleted() too
 
@@ -2260,7 +2561,7 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
       }
     }
 
-    ListTablesResponsePB::TableInfo *table = resp->add_tables();
+    ListTablesResponsePB::TableInfo* table = resp->add_tables();
     table->set_id(entry.second->id());
     table->set_name(ltm.data().name());
   }
@@ -2293,7 +2594,7 @@ Status CatalogManager::TableNameExists(const string& table_name, bool* exists) {
   RETURN_NOT_OK(CheckOnline());
 
   shared_lock<LockType> l(lock_);
-  *exists = ContainsKey(table_names_map_, table_name);
+  *exists = ContainsKey(normalized_table_names_map_, NormalizeTableName(table_name));
   return Status::OK();
 }
 
@@ -2408,8 +2709,8 @@ class PickSpecificUUID : public TSPicker {
 // and sends the RPC to that server.
 class PickLeaderReplica : public TSPicker {
  public:
-  explicit PickLeaderReplica(const scoped_refptr<TabletInfo>& tablet) :
-    tablet_(tablet) {
+  explicit PickLeaderReplica(scoped_refptr<TabletInfo> tablet) :
+      tablet_(std::move(tablet)) {
   }
 
   Status PickReplica(string* ts_uuid) override {
@@ -2443,10 +2744,10 @@ class RetryingTSRpcTask : public MonitoredTask {
  public:
   RetryingTSRpcTask(Master *master,
                     gscoped_ptr<TSPicker> replica_picker,
-                    const scoped_refptr<TableInfo>& table)
+                    scoped_refptr<TableInfo> table)
     : master_(master),
       replica_picker_(std::move(replica_picker)),
-      table_(table),
+      table_(std::move(table)),
       start_ts_(MonoTime::Now()),
       deadline_(start_ts_ + MonoDelta::FromMilliseconds(FLAGS_unresponsive_ts_rpc_timeout_ms)),
       attempt_(0),
@@ -2560,9 +2861,12 @@ Status RetryingTSRpcTask::Run() {
   rpc_.Reset();
   rpc_.set_deadline(deadline);
 
+  // Increment the counter of the attempts to run the task.
+  ++attempt_;
+
   Status s = ResetTSProxy();
   if (s.ok()) {
-    if (SendRequest(++attempt_)) {
+    if (SendRequest(attempt_)) {
       return Status::OK();
     }
   } else {
@@ -2768,7 +3072,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
       Master* master, const string& permanent_uuid,
       const scoped_refptr<TableInfo>& table, string tablet_id,
       TabletDataState delete_type,
-      boost::optional<int64_t> cas_config_opid_index_less_or_equal,
+      optional<int64_t> cas_config_opid_index_less_or_equal,
       string reason)
       : RetrySpecificTSRpcTask(master, permanent_uuid, table),
         tablet_id_(std::move(tablet_id)),
@@ -2846,7 +3150,7 @@ class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
 
   const string tablet_id_;
   const TabletDataState delete_type_;
-  const boost::optional<int64_t> cas_config_opid_index_less_or_equal_;
+  const optional<int64_t> cas_config_opid_index_less_or_equal_;
   const string reason_;
   tserver::DeleteTabletResponsePB resp_;
 };
@@ -2947,11 +3251,11 @@ shared_ptr<TSDescriptor> SelectReplica(const TSDescriptorVector& ts_descs,
 class AsyncAlterTable : public RetryingTSRpcTask {
  public:
   AsyncAlterTable(Master *master,
-                  const scoped_refptr<TabletInfo>& tablet)
+                  scoped_refptr<TabletInfo> tablet)
     : RetryingTSRpcTask(master,
                         gscoped_ptr<TSPicker>(new PickLeaderReplica(tablet)),
                         tablet->table()),
-      tablet_(tablet) {
+      tablet_(std::move(tablet)) {
   }
 
   string type_name() const override { return "Alter Table"; }
@@ -3675,6 +3979,45 @@ Status CatalogManager::ProcessTabletReport(
   return Status::OK();
 }
 
+int64_t CatalogManager::GetLatestNotificationLogEventId() {
+  DCHECK(hms_catalog_);
+  leader_lock_.AssertAcquiredForReading();
+  return hms_notification_log_event_id_;
+}
+
+Status CatalogManager::InitLatestNotificationLogEventId() {
+  DCHECK(hms_catalog_);
+  leader_lock_.AssertAcquiredForWriting();
+  int64_t hms_notification_log_event_id;
+  RETURN_NOT_OK(sys_catalog_->GetLatestNotificationLogEventId(&hms_notification_log_event_id));
+  hms_notification_log_event_id_ = hms_notification_log_event_id;
+  return Status::OK();
+}
+
+Status CatalogManager::StoreLatestNotificationLogEventId(int64_t event_id) {
+  DCHECK(hms_catalog_);
+  DCHECK_GT(event_id, hms_notification_log_event_id_);
+  leader_lock_.AssertAcquiredForReading();
+  SysCatalogTable::Actions actions;
+  actions.hms_notification_log_event_id = event_id;
+  RETURN_NOT_OK_PREPEND(
+      sys_catalog()->Write(actions),
+      "Failed to update processed Hive Metastore notification log ID in the sys catalog table");
+  hms_notification_log_event_id_ = event_id;
+  return Status::OK();
+}
+
+std::shared_ptr<RaftConsensus> CatalogManager::master_consensus() const {
+  // CatalogManager::InitSysCatalogAsync takes lock_ in exclusive mode in order
+  // to initialize sys_catalog_, so it's sufficient to take lock_ in shared mode
+  // here to protect access to sys_catalog_.
+  shared_lock<LockType> l(lock_);
+  if (!sys_catalog_) {
+    return nullptr;
+  }
+  return sys_catalog_->tablet_replica()->shared_consensus();
+}
+
 void CatalogManager::SendAlterTableRequest(const scoped_refptr<TableInfo>& table) {
   vector<scoped_refptr<TabletInfo>> tablets;
   table->GetAllTablets(&tablets);
@@ -3792,6 +4135,21 @@ Status CatalogManager::LoadTskEntries(set<string>* expired_entry_ids) {
     expired_entry_ids->swap(ref);
   }
   return master_->token_signer()->ImportKeys(loader.entries());
+}
+
+Status CatalogManager::LoadTspkEntries(vector<TokenSigningPublicKeyPB>* keys) {
+  TskEntryLoader loader;
+  RETURN_NOT_OK(sys_catalog_->VisitTskEntries(&loader));
+  for (const auto& private_key : loader.entries()) {
+    // Extract public parts of the loaded keys for the verifier.
+    TokenSigningPrivateKey tsk(private_key);
+    TokenSigningPublicKeyPB key;
+    tsk.ExportPublicKeyPB(&key);
+    auto key_seq_num = key.key_seq_num();
+    keys->emplace_back(std::move(key));
+    VLOG(2) << "read public part of TSK " << key_seq_num;
+  }
+  return Status::OK();
 }
 
 Status CatalogManager::DeleteTskEntries(const set<string>& entry_ids) {
@@ -4187,6 +4545,90 @@ Status CatalogManager::GetTabletLocations(const string& tablet_id,
   return BuildLocationsForTablet(tablet_info, filter, locs_pb);
 }
 
+Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletResponsePB* resp) {
+  leader_lock_.AssertAcquiredForReading();
+  RETURN_NOT_OK(CheckOnline());
+
+  // Lookup the tablet-to-be-replaced and get its table.
+  scoped_refptr<TabletInfo> old_tablet;
+  {
+    shared_lock<LockType> l(lock_);
+    if (!FindCopy(tablet_map_, tablet_id, &old_tablet)) {
+      return Status::NotFound(Substitute("Unknown tablet $0", tablet_id));
+    }
+  }
+  scoped_refptr<TableInfo> table = old_tablet->table();
+
+  // Lock the tablet-to-be-replaced (the "old" tablet).
+  // We don't need to lock the table because we are not modifying its TableInfo.
+  TabletMetadataLock l_old_tablet(old_tablet.get(), LockMode::WRITE);
+
+  // It's possible that between when we looked up the old tablet and when we
+  // acquired its lock that the old tablet was deleted.
+  if (old_tablet->metadata().state().is_deleted()) {
+    return Status::NotFound(Substitute("Tablet $0 already deleted", tablet_id));
+  }
+
+  // Create the TabletInfo for the replacement tablet.
+  const SysTabletsEntryPB& replaced_pb = l_old_tablet.data().pb;
+  scoped_refptr<TabletInfo> new_tablet(new TabletInfo(table, GenerateId()));
+  TabletMetadataLock l_new_tablet(new_tablet.get(), LockMode::WRITE);
+  SysTabletsEntryPB* new_metadata = &new_tablet->mutable_metadata()->mutable_dirty()->pb;
+  new_metadata->set_state(SysTabletsEntryPB::PREPARING);
+  new_metadata->mutable_partition()->CopyFrom(replaced_pb.partition());
+  new_metadata->set_table_id(table->id());
+
+  const string replace_msg = Substitute("replaced by tablet $0", new_tablet->id());
+  old_tablet->mutable_metadata()->mutable_dirty()->set_state(SysTabletsEntryPB::DELETED,
+                                                             replace_msg);
+
+  // Persist the changes to the syscatalog table.
+  SysCatalogTable::Actions actions;
+  actions.tablets_to_add.push_back(new_tablet);
+  actions.tablets_to_update.push_back(old_tablet);
+  Status s = sys_catalog_->Write(actions);
+  if (!s.ok()) {
+    s = s.CloneAndPrepend("an error occurred while writing to the sys-catalog");
+    LOG(WARNING) << s.ToString();
+    CheckIfNoLongerLeaderAndSetupError(s, resp);
+    return s;
+  }
+
+  // Now commit the in-memory state and modify the global tablet map.
+  // The order of operations here is based on AlterTable.
+
+  // Commit the in-memory state of the new tablet. This doesn't require the global
+  // lock because the new tablet is not visible yet.
+  l_new_tablet.Commit();
+
+  // Add the new tablet to the global tablet map.
+  {
+    std::lock_guard<LockType> l(lock_);
+    InsertOrDie(&tablet_map_, new_tablet->id(), new_tablet);
+  }
+
+  // Next, add the new tablet and remove the old tablet from the table.
+  {
+    TabletMetadataLock l_new_tablet(new_tablet.get(), LockMode::READ);
+    table->AddRemoveTablets({new_tablet}, {old_tablet});
+  }
+
+  // Commit state changes for the old tablet.
+  l_old_tablet.Commit();
+
+  // Finish up by kicking off the delete of the old tablet.
+  {
+    TabletMetadataLock l_old_tablet(old_tablet.get(), LockMode::READ);
+    SendDeleteTabletRequest(old_tablet, l_old_tablet, replace_msg);
+    background_tasks_->Wake();
+  }
+
+  LOG(INFO) << "ReplaceTablet: tablet " << old_tablet->id()
+            << " deleted and replaced by tablet " << new_tablet->id();
+  resp->set_replacement_tablet_id(new_tablet->id());
+  return Status::OK();
+}
+
 Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
                                          GetTableLocationsResponsePB* resp) {
   // If start-key is > end-key report an error instead of swap the two
@@ -4199,19 +4641,13 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
     return Status::InvalidArgument("max_returned_locations must be greater than 0");
   }
 
-  // Lookup the table and verify if it exists
-  TRACE("Looking up and locking table");
   leader_lock_.AssertAcquiredForReading();
   RETURN_NOT_OK(CheckOnline());
 
+  // Lookup the table and verify if it exists
   scoped_refptr<TableInfo> table;
   TableMetadataLock l;
-  RETURN_NOT_OK(FindAndLockTable(req->table(), LockMode::READ, &table, &l));
-  if (table == nullptr) {
-    Status s = Status::NotFound("The table does not exist", SecureShortDebugString(req->table()));
-    SetupError(resp->mutable_error(), MasterErrorPB::TABLE_NOT_FOUND, s);
-    return s;
-  }
+  RETURN_NOT_OK(FindAndLockTable(*req, resp, LockMode::READ, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   vector<scoped_refptr<TabletInfo>> tablets_in_range;
@@ -4256,7 +4692,7 @@ void CatalogManager::DumpState(std::ostream* out) const {
   {
     shared_lock<LockType> l(lock_);
     ids_copy = table_ids_map_;
-    names_copy = table_names_map_;
+    names_copy = normalized_table_names_map_;
     tablets_copy = tablet_map_;
     // TODO(aserbin): add information about root CA certs, if any
   }
@@ -4326,6 +4762,53 @@ void CatalogManager::AbortAndWaitForAllTasks(
     t->WaitTasksCompletion();
   }
 }
+
+template<typename RespClass>
+Status CatalogManager::WaitForNotificationLogListenerCatchUp(RespClass* resp,
+                                                             rpc::RpcContext* rpc) {
+  if (hms_catalog_) {
+    Status s = hms_notification_log_listener_->WaitForCatchUp(rpc->GetClientDeadline());
+    // ServiceUnavailable indicates the master has lost leadership.
+    MasterErrorPB::Code code = s.IsServiceUnavailable() ?
+      MasterErrorPB::NOT_THE_LEADER :
+      MasterErrorPB::HIVE_METASTORE_ERROR;
+    return SetupError(s, resp, code);
+  }
+  return Status::OK();
+}
+
+string CatalogManager::NormalizeTableName(const string& table_name) {
+  // Force a deep copy on platforms with reference counted strings.
+  string normalized_table_name(table_name.data(), table_name.size());
+  if (hms::HmsCatalog::IsEnabled()) {
+    // If HmsCatalog::NormalizeTableName returns an error, the table name is not
+    // modified. In this case the table is guaranteed to be a legacy table which
+    // has survived since before the cluster was configured to integrate with
+    // the HMS. It's safe to use the unmodified table name as the normalized
+    // name in this case, since there cannot be a name conflict with a table in
+    // the HMS. When the table gets 'upgraded' to be included in the HMS it will
+    // need to be renamed with a Hive compatible name.
+    //
+    // Note: not all legacy tables will fail normalization; if a table happens
+    // to be named with a Hive compatible name ("Legacy.Table"), it will be
+    // normalized according to the Hive rules ("legacy.table"). We check in
+    // TableLoader::VisitTables that such legacy tables do not have conflicting
+    // names when normalized.
+    ignore_result(hms::HmsCatalog::NormalizeTableName(&normalized_table_name));
+  }
+  return normalized_table_name;
+}
+
+const char* CatalogManager::StateToString(State state) {
+  switch (state) {
+    case CatalogManager::kConstructed: return "Constructed";
+    case CatalogManager::kStarting: return "Starting";
+    case CatalogManager::kRunning: return "Running";
+    case CatalogManager::kClosing: return "Closing";
+  }
+  __builtin_unreachable();
+}
+
 ////////////////////////////////////////////////////////////
 // CatalogManager::ScopedLeaderSharedLock
 ////////////////////////////////////////////////////////////
@@ -4343,14 +4826,21 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
   if (PREDICT_FALSE(catalog_->state_ != kRunning)) {
     catalog_status_ = Status::ServiceUnavailable(
         Substitute("Catalog manager is not initialized. State: $0",
-                   catalog_->state_));
+                   StateToString(catalog_->state_)));
     return;
   }
+
+  ConsensusStatePB cstate;
+  Status s = catalog_->sys_catalog_->tablet_replica()->consensus()->ConsensusState(&cstate);
+  if (PREDICT_FALSE(!s.ok())) {
+    DCHECK(s.IsIllegalState()) << s.ToString();
+    catalog_status_ = s.CloneAndPrepend("ConsensusState is not available");
+    return;
+  }
+
   catalog_status_ = Status::OK();
 
   // Check if the catalog manager is the leader.
-  const ConsensusStatePB cstate = catalog_->sys_catalog_->tablet_replica()->
-      consensus()->ConsensusState();
   initial_term_ = cstate.current_term();
   const string& uuid = catalog_->master_->fs_manager()->uuid();
   if (PREDICT_FALSE(cstate.leader_uuid() != uuid)) {
@@ -4370,9 +4860,8 @@ CatalogManager::ScopedLeaderSharedLock::ScopedLeaderSharedLock(
 
 bool CatalogManager::ScopedLeaderSharedLock::has_term_changed() const {
   DCHECK(leader_status().ok());
-  const ConsensusStatePB cstate = catalog_->sys_catalog_->tablet_replica()->
-      consensus()->ConsensusState();
-  return cstate.current_term() != initial_term_;
+  const auto current_term = catalog_->sys_catalog_->tablet_replica()->consensus()->CurrentTerm();
+  return current_term != initial_term_;
 }
 
 template<typename RespClass>
@@ -4406,11 +4895,11 @@ bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrResp
 #define INITTED_OR_RESPOND(RespClass) \
   template bool \
   CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedOrRespond( \
-      RespClass* resp, RpcContext* rpc)
+      RespClass* resp, RpcContext* rpc) /* NOLINT */
 #define INITTED_AND_LEADER_OR_RESPOND(RespClass) \
   template bool \
   CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrRespond( \
-      RespClass* resp, RpcContext* rpc)
+      RespClass* resp, RpcContext* rpc) /* NOLINT */
 
 INITTED_OR_RESPOND(ConnectToMasterResponsePB);
 INITTED_OR_RESPOND(GetMasterRegistrationResponsePB);
@@ -4424,6 +4913,7 @@ INITTED_AND_LEADER_OR_RESPOND(ListTablesResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTableLocationsResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTableSchemaResponsePB);
 INITTED_AND_LEADER_OR_RESPOND(GetTabletLocationsResponsePB);
+INITTED_AND_LEADER_OR_RESPOND(ReplaceTabletResponsePB);
 
 #undef INITTED_OR_RESPOND
 #undef INITTED_AND_LEADER_OR_RESPOND
@@ -4432,9 +4922,9 @@ INITTED_AND_LEADER_OR_RESPOND(GetTabletLocationsResponsePB);
 // TabletInfo
 ////////////////////////////////////////////////////////////
 
-TabletInfo::TabletInfo(const scoped_refptr<TableInfo>& table, string tablet_id)
+TabletInfo::TabletInfo(scoped_refptr<TableInfo> table, string tablet_id)
     : tablet_id_(std::move(tablet_id)),
-      table_(table),
+      table_(std::move(table)),
       last_create_tablet_time_(MonoTime::Now()),
       reported_schema_version_(NOT_YET_REPORTED) {}
 

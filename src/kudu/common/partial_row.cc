@@ -28,9 +28,12 @@
 #include "kudu/common/row.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/decimal_util.h"
+#include "kudu/util/int128.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/memory/overwrite.h"
 #include "kudu/util/status.h"
@@ -39,7 +42,6 @@ using std::string;
 using strings::Substitute;
 
 namespace kudu {
-
 namespace {
 inline Status FindColumn(const Schema& schema, const Slice& col_name, int* idx) {
   StringPiece sp(reinterpret_cast<const char*>(col_name.data()), col_name.size());
@@ -186,15 +188,31 @@ Status KuduPartialRow::Set(int32_t column_idx, const uint8_t* val) {
       break;
     };
     case STRING: {
+      // TODO(todd) Is reinterpret_cast unsafe here?
       RETURN_NOT_OK(SetStringCopy(column_idx, *reinterpret_cast<const Slice*>(val)));
       break;
     };
     case BINARY: {
+      // TODO(todd) Is reinterpret_cast unsafe here?
       RETURN_NOT_OK(SetBinaryCopy(column_idx, *reinterpret_cast<const Slice*>(val)));
       break;
     };
     case UNIXTIME_MICROS: {
       RETURN_NOT_OK(SetUnixTimeMicros(column_idx, *reinterpret_cast<const int64_t*>(val)));
+      break;
+    };
+    case DECIMAL32: {
+      RETURN_NOT_OK(Set<TypeTraits<DECIMAL32> >(column_idx,
+                                                *reinterpret_cast<const int32_t*>(val)));
+      break;
+    };
+    case DECIMAL64: {
+      RETURN_NOT_OK(Set<TypeTraits<DECIMAL64> >(column_idx,
+                                                *reinterpret_cast<const int64_t*>(val)));
+      break;
+    };
+    case DECIMAL128: {
+      RETURN_NOT_OK(Set<TypeTraits<DECIMAL128>>(column_idx, UnalignedLoad<int128_t>(val)));
       break;
     };
     default: {
@@ -254,6 +272,11 @@ Status KuduPartialRow::SetFloat(const Slice& col_name, float val) {
 Status KuduPartialRow::SetDouble(const Slice& col_name, double val) {
   return Set<TypeTraits<DOUBLE> >(col_name, val);
 }
+Status KuduPartialRow::SetUnscaledDecimal(const Slice& col_name, int128_t val) {
+  int col_idx;
+  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  return SetUnscaledDecimal(col_idx, val);
+}
 Status KuduPartialRow::SetBool(int col_idx, bool val) {
   return Set<TypeTraits<BOOL> >(col_idx, val);
 }
@@ -277,6 +300,30 @@ Status KuduPartialRow::SetFloat(int col_idx, float val) {
 }
 Status KuduPartialRow::SetDouble(int col_idx, double val) {
   return Set<TypeTraits<DOUBLE> >(col_idx, val);
+}
+Status KuduPartialRow::SetUnscaledDecimal(int col_idx, int128_t val) {
+  const ColumnSchema& col = schema_->column(col_idx);
+  const DataType col_type = col.type_info()->type();
+
+  int128_t max_val = MaxUnscaledDecimal(col.type_attributes().precision);
+  int128_t min_val = -max_val;
+  if (val < min_val || val > max_val) {
+    return Status::InvalidArgument(
+        Substitute("value $0 out of range for decimal column '$1'",
+                   DecimalToString(val, col.type_attributes().scale), col.name()));
+  }
+  switch (col_type) {
+    case DECIMAL32:
+      return Set<TypeTraits<DECIMAL32> >(col_idx, static_cast<int32_t>(val));
+    case DECIMAL64:
+      return Set<TypeTraits<DECIMAL64> >(col_idx, static_cast<int64_t>(val));
+    case DECIMAL128:
+      return Set<TypeTraits<DECIMAL128> >(col_idx, static_cast<int128_t>(val));
+    default:
+      return Status::InvalidArgument(
+          Substitute("invalid type $0 provided for column '$1' (expected DECIMAL)",
+                     col.type_info()->name(), col.name()));
+  }
 }
 
 Status KuduPartialRow::SetBinary(const Slice& col_name, const Slice& val) {
@@ -416,6 +463,11 @@ Status KuduPartialRow::Set<TypeTraits<INT64> >(int col_idx,
                                                bool owned);
 
 template
+Status KuduPartialRow::Set<TypeTraits<INT128> >(int col_idx,
+                                               const TypeTraits<INT128>::cpp_type& val,
+                                               bool owned);
+
+template
 Status KuduPartialRow::Set<TypeTraits<UNIXTIME_MICROS> >(
     int col_idx,
     const TypeTraits<UNIXTIME_MICROS>::cpp_type& val,
@@ -465,6 +517,11 @@ template
 Status KuduPartialRow::Set<TypeTraits<INT64> >(const Slice& col_name,
                                                const TypeTraits<INT64>::cpp_type& val,
                                                bool owned);
+
+template
+Status KuduPartialRow::Set<TypeTraits<INT128> >(const Slice& col_name,
+                                                const TypeTraits<INT128>::cpp_type& val,
+                                                bool owned);
 
 template
 Status KuduPartialRow::Set<TypeTraits<UNIXTIME_MICROS> >(
@@ -555,6 +612,11 @@ Status KuduPartialRow::GetFloat(const Slice& col_name, float* val) const {
 Status KuduPartialRow::GetDouble(const Slice& col_name, double* val) const {
   return Get<TypeTraits<DOUBLE> >(col_name, val);
 }
+Status KuduPartialRow::GetUnscaledDecimal(const Slice &col_name, int128_t *val) {
+  int col_idx;
+  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  return GetUnscaledDecimal(col_idx, val);
+}
 Status KuduPartialRow::GetString(const Slice& col_name, Slice* val) const {
   return Get<TypeTraits<STRING> >(col_name, val);
 }
@@ -585,6 +647,31 @@ Status KuduPartialRow::GetFloat(int col_idx, float* val) const {
 }
 Status KuduPartialRow::GetDouble(int col_idx, double* val) const {
   return Get<TypeTraits<DOUBLE> >(col_idx, val);
+}
+Status KuduPartialRow::GetUnscaledDecimal(int col_idx, int128_t *val) {
+  const ColumnSchema& col = schema_->column(col_idx);
+  const DataType col_type = col.type_info()->type();
+  switch (col_type) {
+    case DECIMAL32:
+      int32_t i32_val;
+      RETURN_NOT_OK(Get<TypeTraits<DECIMAL32> >(col_idx, &i32_val));
+      *val = i32_val;
+      return Status::OK();
+    case DECIMAL64:
+      int64_t i64_val;
+      RETURN_NOT_OK(Get<TypeTraits<DECIMAL64> >(col_idx, &i64_val));
+      *val = i64_val;
+      return Status::OK();
+    case DECIMAL128:
+      int128_t i128_val;
+      RETURN_NOT_OK(Get<TypeTraits<DECIMAL128> >(col_idx, &i128_val));
+      *val = i128_val;
+      return Status::OK();
+    default:
+      return Status::InvalidArgument(
+          Substitute("invalid type $0 provided for column '$1' (expected DECIMAL)",
+                     col.type_info()->name(), col.name()));
+  }
 }
 Status KuduPartialRow::GetString(int col_idx, Slice* val) const {
   return Get<TypeTraits<STRING> >(col_idx, val);

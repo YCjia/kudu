@@ -17,17 +17,46 @@
 
 #include "kudu/kserver/kserver.h"
 
-#include <limits>
+#include <algorithm>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <ostream>
 #include <string>
-#include <utility>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/integral_types.h"
+#include "kudu/gutil/strings/numbers.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
 #include "kudu/util/threadpool.h"
 
+DEFINE_int32(server_thread_pool_max_thread_count, -1,
+             "Maximum number of threads to allow in each server-wide thread "
+             "pool. If -1, Kudu will automatically calculate this value. It "
+             "is an error to use a value of 0.");
+TAG_FLAG(server_thread_pool_max_thread_count, advanced);
+TAG_FLAG(server_thread_pool_max_thread_count, evolving);
+
+static bool ValidateThreadPoolThreadLimit(const char* /*flagname*/, int32_t value) {
+  if (value == 0 || value < -1) {
+    LOG(ERROR) << "Invalid thread pool thread limit: cannot be " << value;
+    return false;
+  }
+  return true;
+}
+DEFINE_validator(server_thread_pool_max_thread_count, &ValidateThreadPoolThreadLimit);
+
 using std::string;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -56,6 +85,46 @@ METRIC_DEFINE_histogram(server, op_apply_run_time, "Operation Apply Run Time",
                         "that operations consist of very large batches.",
                         10000000, 2);
 
+namespace {
+
+int GetThreadPoolThreadLimit(Env* env) {
+  // Maximize this process' running thread limit first, if possible.
+  static std::once_flag once;
+  std::call_once(once, [&]() {
+    env->IncreaseResourceLimit(Env::ResourceLimitType::RUNNING_THREADS_PER_EUID);
+  });
+
+  uint64_t rlimit = env->GetResourceLimit(Env::ResourceLimitType::RUNNING_THREADS_PER_EUID);
+  // See server_thread_pool_max_thread_count.
+  if (FLAGS_server_thread_pool_max_thread_count == -1) {
+    // Use both pid_max and threads-max as possible upper bounds.
+    faststring buf;
+    uint64_t buf_val;
+    for (const auto& proc_file : { "/proc/sys/kernel/pid_max",
+                                   "/proc/sys/kernel/threads-max" }) {
+      if (ReadFileToString(env, proc_file, &buf).ok() &&
+          safe_strtou64(buf.ToString(), &buf_val)) {
+        rlimit = std::min(rlimit, buf_val);
+      }
+    }
+
+    // Callers of this function expect a signed 32-bit integer, so we need to
+    // further cap the limit just in case it's too large.
+    rlimit = std::min(rlimit, static_cast<uint64_t>(kint32max));
+
+    // Take only 10% of the calculated limit; we don't want to hog the system.
+    return static_cast<int32_t>(rlimit) / 10;
+  }
+  LOG_IF(FATAL, FLAGS_server_thread_pool_max_thread_count > rlimit) <<
+      Substitute(
+          "Configured server-wide thread pool running thread limit "
+          "(server_thread_pool_max_thread_count) $0 exceeds euid running "
+          "thread limit (ulimit) $1",
+          FLAGS_server_thread_pool_max_thread_count, rlimit);
+  return FLAGS_server_thread_pool_max_thread_count;
+}
+
+} // anonymous namespace
 
 KuduServer::KuduServer(string name,
                        const ServerBaseOptions& options,
@@ -75,20 +144,15 @@ Status KuduServer::Init() {
                 .set_metrics(std::move(metrics))
                 .Build(&tablet_apply_pool_));
 
-  // These pools are shared by all replicas hosted by this server.
-  //
-  // Submitted tasks use blocking IO (raft_pool_) or acquire long-held locks
-  // (tablet_prepare_pool_) so we configure no upper bound on the maximum
-  // number of threads in each pool (otherwise the default value of "number of
-  // CPUs" may cause blocking tasks to starve other "fast" tasks). However, the
-  // effective upper bound is the number of replicas as each will submit its
-  // own tasks via a dedicated token.
+  // These pools are shared by all replicas hosted by this server, and thus
+  // are capped at a portion of the overall per-euid thread resource limit.
+  int server_wide_pool_limit = GetThreadPoolThreadLimit(fs_manager_->env());
   RETURN_NOT_OK(ThreadPoolBuilder("prepare")
-                .set_max_threads(std::numeric_limits<int>::max())
+                .set_max_threads(server_wide_pool_limit)
                 .Build(&tablet_prepare_pool_));
   RETURN_NOT_OK(ThreadPoolBuilder("raft")
                 .set_trace_metric_prefix("raft")
-                .set_max_threads(std::numeric_limits<int>::max())
+                .set_max_threads(server_wide_pool_limit)
                 .Build(&raft_pool_));
 
   return Status::OK();

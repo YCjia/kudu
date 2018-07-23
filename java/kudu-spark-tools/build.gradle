@@ -22,15 +22,14 @@ dependencies {
   compile project(path: ":kudu-client", configuration: "shadow")
   compile project(path: ":kudu-client-tools", configuration: "shadow")
   compile project(path: ":kudu-spark", configuration: "shadow")
-  compile libs.slf4jApi
-
-  // This artifact is in compile scope for convenience, as it is typically
-  // not included in the Spark submit classpath by Spark platform providers.
-  compile libs.sparkAvro
+  // TODO(KUDU-2500): Spark uses reflection which requires the annotations at runtime.
+  compile libs.yetusAnnotations
 
   provided libs.scalaLibrary
+  provided libs.sparkAvro
   provided libs.sparkCore
   provided libs.sparkSql
+  provided libs.slf4jApi
 
   testCompile project(path: ":kudu-client", configuration: "shadowTest")
   testCompile project(path: ":kudu-spark", configuration: "test")

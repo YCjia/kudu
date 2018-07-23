@@ -18,6 +18,7 @@
 #include "kudu/server/server_base.h"
 
 #include <cstdint>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -39,18 +40,19 @@
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/fs_report.h"
-#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/walltime.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/result_tracker.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/rpc/service_if.h"
+#include "kudu/rpc/service_pool.h"
 #include "kudu/security/init.h"
 #include "kudu/security/security_flags.h"
 #include "kudu/server/default_path_handlers.h"
+#include "kudu/server/diagnostics_log.h"
 #include "kudu/server/generic_service.h"
 #include "kudu/server/glog_metrics.h"
 #include "kudu/server/rpc_server.h"
@@ -74,7 +76,6 @@
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/rolling_log.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/spinlock_profiling.h"
 #include "kudu/util/thread.h"
@@ -210,6 +211,7 @@ using kudu::security::RpcEncryption;
 using std::ostringstream;
 using std::shared_ptr;
 using std::string;
+using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 
@@ -428,10 +430,17 @@ Status ServerBase::Init() {
   Status s = fs_manager_->Open(&report);
   if (s.IsNotFound()) {
     LOG(INFO) << "Could not load existing FS layout: " << s.ToString();
-    LOG(INFO) << "Creating new FS layout";
+    LOG(INFO) << "Attempting to create new FS layout instead";
     is_first_run_ = true;
-    RETURN_NOT_OK_PREPEND(fs_manager_->CreateInitialFileSystemLayout(),
-                          "Could not create new FS layout");
+    s = fs_manager_->CreateInitialFileSystemLayout();
+    if (s.IsAlreadyPresent()) {
+      // The operator is likely trying to start up with an extra entry in their
+      // `fs_data_dirs` configuration.
+      LOG(INFO) << "To start Kudu with a different FS layout, the `kudu fs "
+                   "update_dirs` tool must be run first";
+      return s.CloneAndPrepend("FS layout already exists; not overwriting existing layout");
+    }
+    RETURN_NOT_OK_PREPEND(s, "Could not create new FS layout");
     s = fs_manager_->Open(&report);
   }
   RETURN_NOT_OK_PREPEND(s, "Failed to load FS layout");
@@ -458,7 +467,13 @@ Status ServerBase::Init() {
          .set_keytab_file(FLAGS_keytab_file)
          .enable_inbound_tls();
 
+  if (options_.rpc_opts.rpc_reuseport) {
+    builder.set_reuseport();
+  }
+
   RETURN_NOT_OK(builder.Build(&messenger_));
+  rpc_server_->set_too_busy_hook(std::bind(
+      &ServerBase::ServiceQueueOverflowed, this, std::placeholders::_1));
 
   RETURN_NOT_OK(rpc_server_->Init(messenger_));
   RETURN_NOT_OK(rpc_server_->Bind());
@@ -601,53 +616,17 @@ Status ServerBase::StartMetricsLogging() {
   if (options_.metrics_log_interval_ms <= 0) {
     return Status::OK();
   }
-
-  return Thread::Create("server", "metrics-logger", &ServerBase::MetricsLoggingThread,
-                        this, &metrics_logging_thread_);
-}
-
-void ServerBase::MetricsLoggingThread() {
-  RollingLog log(Env::Default(), FLAGS_log_dir, "metrics");
-
-  // How long to wait before trying again if we experience a failure
-  // logging metrics.
-  const MonoDelta kWaitBetweenFailures = MonoDelta::FromSeconds(60);
-
-
-  MonoTime next_log = MonoTime::Now();
-  while (!stop_background_threads_latch_.WaitUntil(next_log)) {
-    next_log = MonoTime::Now() +
-        MonoDelta::FromMilliseconds(options_.metrics_log_interval_ms);
-
-    std::ostringstream buf;
-    buf << "metrics " << GetCurrentTimeMicros() << " ";
-
-    // Collect the metrics JSON string.
-    vector<string> metrics;
-    metrics.emplace_back("*");
-    MetricJsonOptions opts;
-    opts.include_raw_histograms = true;
-
-    JsonWriter writer(&buf, JsonWriter::COMPACT);
-    Status s = metric_registry_->WriteAsJson(&writer, metrics, opts);
-    if (!s.ok()) {
-      WARN_NOT_OK(s, "Unable to collect metrics to log");
-      next_log += kWaitBetweenFailures;
-      continue;
-    }
-
-    buf << "\n";
-
-    s = log.Append(buf.str());
-    if (!s.ok()) {
-      WARN_NOT_OK(s, "Unable to write metrics to log");
-      next_log += kWaitBetweenFailures;
-      continue;
-    }
+  if (FLAGS_log_dir.empty()) {
+    LOG(INFO) << "Not starting metrics log since no log directory was specified.";
+    return Status::OK();
   }
-
-  WARN_NOT_OK(log.Close(), "Unable to close metric log");
+  unique_ptr<DiagnosticsLog> l(new DiagnosticsLog(FLAGS_log_dir, metric_registry_.get()));
+  l->SetMetricsLogInterval(MonoDelta::FromMilliseconds(options_.metrics_log_interval_ms));
+  RETURN_NOT_OK(l->Start());
+  diag_log_ = std::move(l);
+  return Status::OK();
 }
+
 
 Status ServerBase::StartExcessLogFileDeleterThread() {
   // Try synchronously deleting excess log files once at startup to make sure it
@@ -684,7 +663,6 @@ Status ServerBase::Start() {
 
   RETURN_NOT_OK(RegisterService(make_gscoped_ptr<rpc::ServiceIf>(
                                   new GenericServiceImpl(this))));
-
   RETURN_NOT_OK(rpc_server_->Start());
 
   if (web_server_) {
@@ -720,8 +698,8 @@ void ServerBase::Shutdown() {
 
   // Next, shut down remaining server components.
   stop_background_threads_latch_.CountDown();
-  if (metrics_logging_thread_) {
-    metrics_logging_thread_->Join();
+  if (diag_log_) {
+    diag_log_->Stop();
   }
   if (excess_log_deleter_thread_) {
     excess_log_deleter_thread_->Join();
@@ -730,6 +708,23 @@ void ServerBase::Shutdown() {
 
 void ServerBase::UnregisterAllServices() {
   messenger_->UnregisterAllServices();
+}
+
+void ServerBase::ServiceQueueOverflowed(rpc::ServicePool* service) {
+  if (!diag_log_) return;
+
+  // Logging all of the stacks is relatively heavy-weight, so if we are in a persistent
+  // state of overload, it's probably not a good idea to start compounding the issue with
+  // a lot of stack-logging activity. So, we limit the frequency of stack-dumping.
+  static logging::LogThrottler throttler;
+  const int kStackDumpFrequencySecs = 5;
+  int suppressed = 0;
+  if (PREDICT_TRUE(!throttler.ShouldLog(kStackDumpFrequencySecs, "", &suppressed))) {
+    return;
+  }
+
+  diag_log_->DumpStacksNow(Substitute("service queue overflowed for $0",
+                                      service->service_name()));
 }
 
 } // namespace server

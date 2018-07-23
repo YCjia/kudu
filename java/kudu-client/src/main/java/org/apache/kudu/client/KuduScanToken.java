@@ -21,7 +21,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
-import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -97,7 +96,7 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
    * @return the serialized scan token
    * @throws IOException
    */
-  @VisibleForTesting
+  @InterfaceAudience.LimitedPrivate("Test")
   static byte[] serialize(ScanTokenPB message) throws IOException {
     byte[] buf = new byte[message.getSerializedSize()];
     CodedOutputStream cos = CodedOutputStream.newInstance(buf);
@@ -168,7 +167,7 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
     for (Common.ColumnSchemaPB column : message.getProjectedColumnsList()) {
       int columnIdx = table.getSchema().getColumnIndex(column.getName());
       ColumnSchema schema = table.getSchema().getColumnByIndex(columnIdx);
-      if (column.getType() != schema.getType().getDataType()) {
+      if (column.getType() != schema.getType().getDataType(schema.getTypeAttributes())) {
         throw new IllegalStateException(String.format(
             "invalid type %s for column '%s' in scan token, expected: %s",
             column.getType().name(), column.getName(), schema.getType().name()));
@@ -219,6 +218,10 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
           builder.readMode(AsyncKuduScanner.ReadMode.READ_LATEST);
           break;
         }
+        case READ_YOUR_WRITES: {
+          builder.readMode(AsyncKuduScanner.ReadMode.READ_YOUR_WRITES);
+          break;
+        }
         default: throw new IllegalArgumentException("unknown read mode");
       }
     }
@@ -252,6 +255,10 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
 
     if (message.hasBatchSizeBytes()) {
       builder.batchSizeBytes(message.getBatchSizeBytes());
+    }
+
+    if (message.hasScanRequestTimeoutMs()) {
+      builder.scanRequestTimeout(message.getScanRequestTimeoutMs());
     }
 
     return builder.build();
@@ -364,6 +371,7 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       proto.setCacheBlocks(cacheBlocks);
       proto.setFaultTolerant(isFaultTolerant);
       proto.setBatchSizeBytes(batchSizeBytes);
+      proto.setScanRequestTimeoutMs(scanRequestTimeout);
 
       try {
         PartitionPruner pruner = PartitionPruner.create(this);

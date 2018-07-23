@@ -17,6 +17,8 @@
 
 package org.apache.kudu;
 
+import java.util.Objects;
+
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.yetus.audience.InterfaceStability;
 
@@ -39,12 +41,16 @@ public class ColumnSchema {
   private final int desiredBlockSize;
   private final Encoding encoding;
   private final CompressionAlgorithm compressionAlgorithm;
+  private final ColumnTypeAttributes typeAttributes;
+  private final int typeSize;
 
   /**
    * Specifies the encoding of data for a column on disk.
    * Not all encodings are available for all data types.
    * Refer to the Kudu documentation for more information on each encoding.
    */
+  @InterfaceAudience.Public
+  @InterfaceStability.Evolving
   public enum Encoding {
     UNKNOWN(EncodingType.UNKNOWN_ENCODING),
     AUTO_ENCODING(EncodingType.AUTO_ENCODING),
@@ -70,6 +76,8 @@ public class ColumnSchema {
   /**
    * Specifies the compression algorithm of data for a column on disk.
    */
+  @InterfaceAudience.Public
+  @InterfaceStability.Evolving
   public enum CompressionAlgorithm {
     UNKNOWN(CompressionType.UNKNOWN_COMPRESSION),
     DEFAULT_COMPRESSION(CompressionType.DEFAULT_COMPRESSION),
@@ -92,7 +100,7 @@ public class ColumnSchema {
 
   private ColumnSchema(String name, Type type, boolean key, boolean nullable,
                        Object defaultValue, int desiredBlockSize, Encoding encoding,
-                       CompressionAlgorithm compressionAlgorithm) {
+                       CompressionAlgorithm compressionAlgorithm, ColumnTypeAttributes typeAttributes) {
     this.name = name;
     this.type = type;
     this.key = key;
@@ -101,6 +109,8 @@ public class ColumnSchema {
     this.desiredBlockSize = desiredBlockSize;
     this.encoding = encoding;
     this.compressionAlgorithm = compressionAlgorithm;
+    this.typeAttributes = typeAttributes;
+    this.typeSize = type.getSize(typeAttributes);
   }
 
   /**
@@ -168,41 +178,48 @@ public class ColumnSchema {
     return compressionAlgorithm;
   }
 
+  /**
+   * Return the column type attributes for the column, or null if it is not known.
+   */
+  public ColumnTypeAttributes getTypeAttributes() {
+    return typeAttributes;
+  }
+
+  /**
+   * The size of this type in bytes on the wire.
+   * @return A size
+   */
+  public int getTypeSize() {
+    return typeSize;
+  }
+
   @Override
   public boolean equals(Object o) {
-    if (this == o) {
-      return true;
-    }
-    if (o == null || getClass() != o.getClass()) {
-      return false;
-    }
-
+    if (this == o) return true;
+    if (o == null || getClass() != o.getClass()) return false;
     ColumnSchema that = (ColumnSchema) o;
-
-    if (key != that.key) {
-      return false;
-    }
-    if (!name.equals(that.name)) {
-      return false;
-    }
-    if (!type.equals(that.type)) {
-      return false;
-    }
-
-    return true;
+    return Objects.equals(name, that.name) &&
+        Objects.equals(type, that.type) &&
+        Objects.equals(key, that.key) &&
+        Objects.equals(typeAttributes, that.typeAttributes);
   }
 
   @Override
   public int hashCode() {
-    int result = name.hashCode();
-    result = 31 * result + type.hashCode();
-    result = 31 * result + (key ? 1 : 0);
-    return result;
+    return Objects.hash(name, type, key, typeAttributes);
   }
 
   @Override
   public String toString() {
-    return "Column name: " + name + ", type: " + type.getName();
+    StringBuilder sb = new StringBuilder();
+    sb.append("Column name: ");
+    sb.append(name);
+    sb.append(", type: ");
+    sb.append(type.getName());
+    if (typeAttributes != null) {
+      sb.append(typeAttributes.toStringForType(type));
+    }
+    return sb.toString();
   }
 
   /**
@@ -219,6 +236,7 @@ public class ColumnSchema {
     private int blockSize = 0;
     private Encoding encoding = null;
     private CompressionAlgorithm compressionAlgorithm = null;
+    private ColumnTypeAttributes typeAttributes = null;
 
     /**
      * Constructor for the required parameters.
@@ -310,13 +328,25 @@ public class ColumnSchema {
     }
 
     /**
+     * Set the column type attributes for this column.
+     */
+    public ColumnSchemaBuilder typeAttributes(ColumnTypeAttributes typeAttributes) {
+      if (type != Type.DECIMAL && typeAttributes != null) {
+        throw new IllegalArgumentException(
+            "ColumnTypeAttributes are not used on " + type + " columns");
+      }
+      this.typeAttributes = typeAttributes;
+      return this;
+    }
+
+    /**
      * Builds a {@link ColumnSchema} using the passed parameters.
      * @return a new {@link ColumnSchema}
      */
     public ColumnSchema build() {
       return new ColumnSchema(name, type,
                               key, nullable, defaultValue,
-                              blockSize, encoding, compressionAlgorithm);
+                              blockSize, encoding, compressionAlgorithm, typeAttributes);
     }
   }
 }

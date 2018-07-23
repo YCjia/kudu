@@ -16,6 +16,8 @@
 // under the License.
 package org.apache.kudu.client;
 
+import static org.apache.kudu.util.ClientTestUtil.countRowsInScan;
+import static org.apache.kudu.util.ClientTestUtil.getBasicCreateTableOptions;
 import static org.junit.Assert.assertEquals;
 
 import org.junit.After;
@@ -30,11 +32,6 @@ public class TestMasterFailover extends BaseKuduTest {
     CREATE_TABLE,
     OPEN_TABLE,
     SCAN_TABLE
-  }
-
-  @After
-  public void restartDeadServers() throws Exception {
-    miniCluster.restartDeadMasters();
   }
 
   @Test(timeout = 30000)

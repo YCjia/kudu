@@ -42,6 +42,9 @@ import org.apache.kudu.util.Pair;
 /**
  * Base class for the RPCs that related to WriteRequestPB. It contains almost all the logic
  * and knows how to serialize its child classes.
+ *
+ * TODO(todd): this should not extend KuduRpc. Rather, we should make single-operation writes
+ * just use a Batch instance with a single operation in it.
  */
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
@@ -74,7 +77,7 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
     }
 
     /** The byte used to encode this in a RowOperationsPB */
-    private byte encodedByte;
+    private final byte encodedByte;
   }
 
   static final String METHOD = "Write";
@@ -130,8 +133,8 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
   Message createRequestPB() {
     final Tserver.WriteRequestPB.Builder builder =
         createAndFillWriteRequestPB(ImmutableList.of(this));
-    this.rowOperationSizeBytes = builder.getRowOperations().getRows().size() +
-        builder.getRowOperations().getIndirectData().size();
+    this.rowOperationSizeBytes = (long)builder.getRowOperations().getRows().size() +
+        (long)builder.getRowOperations().getIndirectData().size();
     builder.setTabletId(UnsafeByteOperations.unsafeWrap(getTablet().getTabletIdAsBytes()));
     builder.setExternalConsistencyMode(this.externalConsistencyMode.pbVersion());
     if (this.propagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
@@ -303,10 +306,10 @@ public abstract class Operation extends KuduRpc<OperationResponse> {
             indirectWrittenBytes += bbSize;
           } else {
             // This is for cols other than strings
-            rows.put(rowData, currentRowOffset, col.getType().getSize());
+            rows.put(rowData, currentRowOffset, col.getTypeSize());
           }
         }
-        currentRowOffset += col.getType().getSize();
+        currentRowOffset += col.getTypeSize();
         colIdx++;
       }
     }

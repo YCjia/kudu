@@ -54,7 +54,6 @@
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/gutil/move.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -205,17 +204,17 @@ TabletComponents::TabletComponents(shared_ptr<MemRowSet> mrs,
 // Tablet
 ////////////////////////////////////////////////////////////
 
-Tablet::Tablet(const scoped_refptr<TabletMetadata>& metadata,
-               const scoped_refptr<clock::Clock>& clock,
-               const shared_ptr<MemTracker>& parent_mem_tracker,
+Tablet::Tablet(scoped_refptr<TabletMetadata> metadata,
+               scoped_refptr<clock::Clock> clock,
+               shared_ptr<MemTracker> parent_mem_tracker,
                MetricRegistry* metric_registry,
-               const scoped_refptr<LogAnchorRegistry>& log_anchor_registry)
+               scoped_refptr<LogAnchorRegistry> log_anchor_registry)
   : key_schema_(metadata->schema().CreateKeyProjection()),
-    metadata_(metadata),
-    log_anchor_registry_(log_anchor_registry),
-    mem_trackers_(tablet_id(), parent_mem_tracker),
+    metadata_(std::move(metadata)),
+    log_anchor_registry_(std::move(log_anchor_registry)),
+    mem_trackers_(tablet_id(), std::move(parent_mem_tracker)),
     next_mrs_id_(0),
-    clock_(clock),
+    clock_(std::move(clock)),
     rowsets_flush_sem_(1),
     state_(kInitialized) {
       CHECK(schema()->has_column_ids());
@@ -1662,7 +1661,7 @@ Status Tablet::Compact(CompactFlags flags) {
   RETURN_NOT_OK_PREPEND(PickRowSetsToCompact(&input, flags),
                         "Failed to pick rowsets to compact");
   LOG_WITH_PREFIX(INFO) << "Compaction: stage 1 complete, picked "
-                        << input.num_rowsets() << " rowsets to compact";
+                        << input.num_rowsets() << " rowsets to compact or flush";
   if (compaction_hooks_) {
     RETURN_NOT_OK_PREPEND(compaction_hooks_->PostSelectIterators(),
                           "PostSelectIterators hook failed");
@@ -1674,6 +1673,13 @@ Status Tablet::Compact(CompactFlags flags) {
 }
 
 void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
+
+  if (mvcc_.GetCleanTimestamp() == Timestamp::kInitialTimestamp) {
+    KLOG_EVERY_N_SECS(WARNING, 30) << LogPrefix() <<  "Can't schedule compaction. Clean time has "
+                                   << "not been advanced past its initial value.";
+    stats->set_runnable(false);
+    return;
+  }
 
   // TODO: use workload statistics here to find out how "hot" the tablet has
   // been in the last 5 minutes, and somehow scale the compaction quality
@@ -1718,21 +1724,28 @@ Status Tablet::DebugDump(vector<string> *lines) {
 }
 
 Status Tablet::CaptureConsistentIterators(
-  const Schema *projection,
-  const MvccSnapshot &snap,
-  const ScanSpec *spec,
-  OrderMode order,
-  vector<shared_ptr<RowwiseIterator> > *iters) const {
+    const Schema* projection,
+    const MvccSnapshot& snap,
+    const ScanSpec* spec,
+    OrderMode order,
+    vector<shared_ptr<RowwiseIterator>>* iters) const {
+
   shared_lock<rw_spinlock> l(component_lock_);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
 
   // Construct all the iterators locally first, so that if we fail
   // in the middle, we don't modify the output arguments.
-  vector<shared_ptr<RowwiseIterator> > ret;
+  vector<shared_ptr<RowwiseIterator>> ret;
+
+  RowIteratorOptions opts;
+  opts.projection = projection;
+  opts.snap_to_include = snap;
+  opts.order = order;
 
   // Grab the memrowset iterator.
   gscoped_ptr<RowwiseIterator> ms_iter;
-  RETURN_NOT_OK(components_->memrowset->NewRowIterator(projection, snap, order, &ms_iter));
-  ret.push_back(shared_ptr<RowwiseIterator>(ms_iter.release()));
+  RETURN_NOT_OK(components_->memrowset->NewRowIterator(opts, &ms_iter));
+  ret.emplace_back(ms_iter.release());
 
   // Cull row-sets in the case of key-range queries.
   if (spec != nullptr && spec->lower_bound_key() && spec->exclusive_upper_bound_key()) {
@@ -1747,10 +1760,10 @@ Status Tablet::CaptureConsistentIterators(
         &interval_sets);
     for (const RowSet *rs : interval_sets) {
       gscoped_ptr<RowwiseIterator> row_it;
-      RETURN_NOT_OK_PREPEND(rs->NewRowIterator(projection, snap, order, &row_it),
+      RETURN_NOT_OK_PREPEND(rs->NewRowIterator(opts, &row_it),
                             Substitute("Could not create iterator for rowset $0",
                                        rs->ToString()));
-      ret.push_back(shared_ptr<RowwiseIterator>(row_it.release()));
+      ret.emplace_back(row_it.release());
     }
     ret.swap(*iters);
     return Status::OK();
@@ -1760,10 +1773,10 @@ Status Tablet::CaptureConsistentIterators(
   // fall back to grabbing all rowset iterators
   for (const shared_ptr<RowSet> &rs : components_->rowsets->all_rowsets()) {
     gscoped_ptr<RowwiseIterator> row_it;
-    RETURN_NOT_OK_PREPEND(rs->NewRowIterator(projection, snap, order, &row_it),
+    RETURN_NOT_OK_PREPEND(rs->NewRowIterator(opts, &row_it),
                           Substitute("Could not create iterator for rowset $0",
                                      rs->ToString()));
-    ret.push_back(shared_ptr<RowwiseIterator>(row_it.release()));
+    ret.emplace_back(row_it.release());
   }
 
   // Swap results into the parameters.

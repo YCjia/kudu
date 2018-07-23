@@ -28,6 +28,7 @@
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h" // IWYU pragma: keep
 #include "kudu/util/faststring.h"
+#include "kudu/util/int128.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
@@ -63,18 +64,18 @@ class EncodedKeyTest : public KuduTest {
     return Schema({ ColumnSchema("key", UINT32) }, 1);
   }
 
-  EncodedKey* BuildEncodedKey(EncodedKeyBuilder& key_builder, int val) {
-    key_builder.Reset();
-    key_builder.AddColumnKey(&val);
-    return key_builder.BuildEncodedKey();
+  EncodedKey* BuildEncodedKey(EncodedKeyBuilder* key_builder, int val) {
+    key_builder->Reset();
+    key_builder->AddColumnKey(&val);
+    return key_builder->BuildEncodedKey();
   }
 
   // Test whether target lies within the numerical key ranges given by
   // start and end. If -1, an empty slice is used instead.
   bool InRange(int start, int end, int target) {
-    gscoped_ptr<EncodedKey> start_key(BuildEncodedKey(key_builder_, start));
-    gscoped_ptr<EncodedKey> end_key(BuildEncodedKey(key_builder_, end));
-    gscoped_ptr<EncodedKey> target_key(BuildEncodedKey(key_builder_, target));
+    gscoped_ptr<EncodedKey> start_key(BuildEncodedKey(&key_builder_, start));
+    gscoped_ptr<EncodedKey> end_key(BuildEncodedKey(&key_builder_, end));
+    gscoped_ptr<EncodedKey> target_key(BuildEncodedKey(&key_builder_, target));
     return target_key->InRange(start != -1 ? start_key->encoded_key() : Slice(),
                                end != -1 ? end_key->encoded_key() : Slice());
   }
@@ -170,6 +171,18 @@ TEST_F(EncodedKeyTest, TestDecodeSimpleKeys) {
     int64_t val = -1234567891011121314;
     EXPECT_DECODED_KEY_EQ(INT64, "(int64 key=-1234567891011121314)",
                           "\x6e\xdd\xef\x0b\x4d\x2d\xcf\x5e", &val);
+  }
+
+  {
+    int128_t val = INT128_MAX;
+    EXPECT_DECODED_KEY_EQ(INT128, "(int128 key=170141183460469231731687303715884105727)",
+                          "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", &val);
+  }
+
+  {
+    int128_t val = -1234567891011121314;
+    EXPECT_DECODED_KEY_EQ(INT128, "(int128 key=-1234567891011121314)",
+                          "\x7f\xff\xff\xff\xff\xff\xff\xff\xee\xdd\xef\x0b\x4d\x2d\xcf\x5e", &val);
   }
 
   {
