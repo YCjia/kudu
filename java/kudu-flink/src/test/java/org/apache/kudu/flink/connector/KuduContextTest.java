@@ -19,11 +19,19 @@ package org.apache.kudu.flink.connector;
 import java.util.Map;
 import org.apache.commons.collections.map.HashedMap;
 import org.apache.kudu.Type;
+<<<<<<< HEAD
 import org.apache.kudu.client.BaseKuduTest;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class KuduContextTest extends BaseKuduTest {
+=======
+import org.apache.kudu.flink.KuduClusterTest;
+import org.junit.Assert;
+import org.junit.Test;
+
+public class KuduContextTest extends KuduClusterTest {
+>>>>>>> origin/KUDU-2273
 
     @Test
     public void testTableCreationAndDeletion() throws Exception {
@@ -38,6 +46,7 @@ public class KuduContextTest extends BaseKuduTest {
         new KuduContext(obtainTable("testing", false));
     }
 
+<<<<<<< HEAD
     @Test
     public void testTableWrite() throws Exception {
         KuduContext client = new KuduContext(obtainTable("testing", true));
@@ -46,6 +55,8 @@ public class KuduContextTest extends BaseKuduTest {
         }
     }
 
+=======
+>>>>>>> origin/KUDU-2273
     private KuduRow createRow(Integer key) {
         Map<String, Object> map = new HashedMap();
         map.put("key", key);
@@ -55,7 +66,11 @@ public class KuduContextTest extends BaseKuduTest {
 
     private static KuduTableInfo obtainTable(String tableName, boolean createIfNotExists) {
         return KuduTableInfo.Builder
+<<<<<<< HEAD
                 .create(masterAddresses, tableName)
+=======
+                .create(hostsCluster, tableName)
+>>>>>>> origin/KUDU-2273
                 .mode(KuduTableInfo.Mode.UPSERT)
                 .createIfNotExist(createIfNotExists)
                 .addColumn(KuduColumnInfo.Builder.create("key", Type.INT32).key(true).rangeKey(true).build())

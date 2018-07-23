@@ -38,6 +38,7 @@
 
 #include "kudu/fs/block_manager.h"
 #include "kudu/fs/block_manager_util.h"
+#include "kudu/fs/fs.pb.h"
 #include "kudu/gutil/bind.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/integral_types.h"
@@ -61,16 +62,17 @@
 #include "kudu/util/test_util_prod.h"
 #include "kudu/util/threadpool.h"
 
-DEFINE_int32(fs_target_data_dirs_per_tablet, 0,
-              "Indicates the target number of data dirs to spread each "
-              "tablet's data across. If greater than the number of data dirs "
-              "available, data will be striped across those available. The "
-              "default value 0 indicates striping should occur across all "
-              "healthy data directories.");
+DEFINE_int32(fs_target_data_dirs_per_tablet, 3,
+             "Indicates the target number of data dirs to spread each "
+             "tablet's data across. If greater than the number of data dirs "
+             "available, data will be striped across those available. A "
+             "value of 0 indicates striping should occur across all healthy "
+             "data dirs. Using fewer data dirs per tablet means a single "
+             "drive failure will be less likely to affect a given tablet.");
 DEFINE_validator(fs_target_data_dirs_per_tablet,
     [](const char* /*n*/, int32_t v) { return v >= 0; });
 TAG_FLAG(fs_target_data_dirs_per_tablet, advanced);
-TAG_FLAG(fs_target_data_dirs_per_tablet, experimental);
+TAG_FLAG(fs_target_data_dirs_per_tablet, evolving);
 
 DEFINE_int64(fs_data_dirs_reserved_bytes, -1,
              "Number of bytes to reserve on each data directory filesystem for "
@@ -187,12 +189,20 @@ void DeleteTmpFilesRecursively(Env* env, const string& path) {
 
 } // anonymous namespace
 
+////////////////////////////////////////////////////////////
+// DataDirMetrics
+////////////////////////////////////////////////////////////
+
 #define GINIT(x) x(METRIC_##x.Instantiate(entity, 0))
 DataDirMetrics::DataDirMetrics(const scoped_refptr<MetricEntity>& entity)
   : GINIT(data_dirs_failed),
     GINIT(data_dirs_full) {
 }
 #undef GINIT
+
+////////////////////////////////////////////////////////////
+// DataDir
+////////////////////////////////////////////////////////////
 
 DataDir::DataDir(Env* env,
                  DataDirMetrics* metrics,
@@ -280,10 +290,61 @@ Status DataDir::RefreshIsFull(RefreshMode mode) {
   return Status::OK();
 }
 
+////////////////////////////////////////////////////////////
+// DataDirGroup
+////////////////////////////////////////////////////////////
+
+DataDirGroup::DataDirGroup() {}
+
+DataDirGroup::DataDirGroup(vector<int> uuid_indices)
+    : uuid_indices_(std::move(uuid_indices)) {}
+
+Status DataDirGroup::LoadFromPB(const UuidIndexByUuidMap& uuid_idx_by_uuid,
+                                const DataDirGroupPB& pb) {
+  vector<int> uuid_indices;
+  for (const auto& uuid : pb.uuids()) {
+    int uuid_idx;
+    if (!FindCopy(uuid_idx_by_uuid, uuid, &uuid_idx)) {
+      return Status::NotFound(Substitute(
+          "could not find data dir with uuid $0", uuid));
+    }
+    uuid_indices.emplace_back(uuid_idx);
+  }
+
+  uuid_indices_ = std::move(uuid_indices);
+  return Status::OK();
+}
+
+Status DataDirGroup::CopyToPB(const UuidByUuidIndexMap& uuid_by_uuid_idx,
+                              DataDirGroupPB* pb) const {
+  DCHECK(pb);
+  DataDirGroupPB group;
+  for (auto uuid_idx : uuid_indices_) {
+    string uuid;
+    if (!FindCopy(uuid_by_uuid_idx, uuid_idx, &uuid)) {
+      return Status::NotFound(Substitute(
+          "could not find data dir with uuid index $0", uuid_idx));
+    }
+    group.mutable_uuids()->Add(std::move(uuid));
+  }
+
+  *pb = std::move(group);
+  return Status::OK();
+}
+
+////////////////////////////////////////////////////////////
+// DataDirManagerOptions
+////////////////////////////////////////////////////////////
+
 DataDirManagerOptions::DataDirManagerOptions()
-  : block_manager_type(FLAGS_block_manager),
-    read_only(false),
-    update_on_disk(false) {}
+    : block_manager_type(FLAGS_block_manager),
+      read_only(false),
+      consistency_check(ConsistencyCheckBehavior::ENFORCE_CONSISTENCY) {
+}
+
+////////////////////////////////////////////////////////////
+// DataDirManager
+////////////////////////////////////////////////////////////
 
 vector<string> DataDirManager::GetRootNames(const CanonicalizedRootsList& root_list) {
   vector<string> roots;
@@ -300,7 +361,8 @@ DataDirManager::DataDirManager(Env* env,
       canonicalized_data_fs_roots_(std::move(canonicalized_data_roots)),
       rng_(GetRandomSeed32()) {
   DCHECK_GT(canonicalized_data_fs_roots_.size(), 0);
-  DCHECK(!opts_.update_on_disk || !opts_.read_only);
+  DCHECK(opts_.consistency_check != ConsistencyCheckBehavior::UPDATE_ON_DISK ||
+         !opts_.read_only);
 
   if (opts_.metric_entity) {
     metrics_.reset(new DataDirMetrics(opts_.metric_entity));
@@ -531,9 +593,10 @@ Status DataDirManager::LoadInstances(
     } else {
       // This may return OK and mark 'instance' as failed.
       Status s = instance->LoadFromDisk();
-      if (s.IsNotFound() && opts_.update_on_disk) {
-        // A missing instance is only tolerated if we've been asked to add new
-        // data directories.
+      if (s.IsNotFound() &&
+          opts_.consistency_check != ConsistencyCheckBehavior::ENFORCE_CONSISTENCY) {
+        // A missing instance is not tolerated if we've been asked to enforce
+        // consistency checks.
         missing_roots_tmp.emplace_back(root.path);
         continue;
       }
@@ -585,17 +648,11 @@ Status DataDirManager::Open() {
   vector<unique_ptr<PathInstanceMetadataFile>> loaded_instances;
   RETURN_NOT_OK(LoadInstances(&missing_roots, &loaded_instances));
 
-  // Check the integrity of all loaded instances.
-  RETURN_NOT_OK_PREPEND(
-      PathInstanceMetadataFile::CheckIntegrity(loaded_instances),
-      Substitute("could not verify integrity of files: $0",
-                 JoinStrings(GetDataDirs(), ",")));
-
-  // Create any missing data directories, if desired.
-  if (!missing_roots.empty()) {
+  // Add new or remove existing data directories, if desired.
+  if (opts_.consistency_check == ConsistencyCheckBehavior::UPDATE_ON_DISK) {
     if (opts_.block_manager_type == "file") {
       return Status::InvalidArgument(
-          "file block manager may not add new data directories");
+          "file block manager may not add or remove data directories");
     }
 
     // Prepare to create new directories and update existing instances. We
@@ -626,11 +683,20 @@ Status DataDirManager::Open() {
 
     // Now that we've created the missing directories, try loading the
     // directories again.
+    //
     // Note: 'loaded_instances' must be cleared to unlock the instance files.
     loaded_instances.clear();
     missing_roots.clear();
     RETURN_NOT_OK(LoadInstances(&missing_roots, &loaded_instances));
     DCHECK(missing_roots.empty());
+  }
+
+  // Check the integrity of all loaded instances.
+  if (opts_.consistency_check != ConsistencyCheckBehavior::IGNORE_INCONSISTENCY) {
+    RETURN_NOT_OK_PREPEND(
+        PathInstanceMetadataFile::CheckIntegrity(loaded_instances),
+        Substitute("could not verify integrity of files: $0",
+                   JoinStrings(GetDataDirs(), ",")));
   }
 
   // All instances are present and accounted for. Time to create the in-memory
@@ -718,7 +784,11 @@ Status DataDirManager::Open() {
         break;
       }
     }
-    DCHECK_NE(idx, -1); // Guaranteed by CheckIntegrity().
+    if (idx == -1) {
+      return Status::IOError(Substitute(
+          "corrupt path set for data directory $0: uuid $1 not found in path set",
+          dd->dir(), path_set.uuid()));
+    }
     if (idx > kMaxDataDirs) {
       return Status::NotSupported(
           Substitute("block manager supports a maximum of $0 paths", kMaxDataDirs));
@@ -734,7 +804,22 @@ Status DataDirManager::Open() {
   for (int uuid_idx = 0; uuid_idx < path_set.all_uuids_size(); uuid_idx++) {
     if (!ContainsKey(uuid_by_idx, uuid_idx)) {
       const string& unassigned_uuid = path_set.all_uuids(uuid_idx);
-      DCHECK_LT(failed_dir_idx, unassigned_dirs.size());
+      if (failed_dir_idx == unassigned_dirs.size()) {
+        // This uuid's data directory is missing outright, which can only
+        // happen when opts_.consistency_check is IGNORE_INCONSISTENCY (i.e. if
+        // this DataDirManager is trialing a new data dir configuration that
+        // removes an existing data dir). In such a case, we don't bother
+        // tracking the missing directory at all.
+        //
+        // If opts_.consistency_check is UPDATE_ON_DISK, the on-disk instances
+        // were updated and reloaded above, ensuring that the list of data
+        // directories now excludes the missing directory.
+        //
+        // If opts_.consistency_check is ENFORCE_CONSISTENCY, the
+        // CheckIntegrity call above requires that on-disk instances and the
+        // list of data directories match, so there cannot be a missing data directory.
+        continue;
+      }
       insert_to_maps(uuid_idx, unassigned_uuid, unassigned_dirs[failed_dir_idx]);
 
       // Record the directory as failed.
@@ -782,13 +867,16 @@ Status DataDirManager::Open() {
 Status DataDirManager::LoadDataDirGroupFromPB(const std::string& tablet_id,
                                               const DataDirGroupPB& pb) {
   std::lock_guard<percpu_rwlock> lock(dir_group_lock_);
-  DataDirGroup group_from_pb = DataDirGroup::FromPB(pb, idx_by_uuid_);
+  DataDirGroup group_from_pb;
+  RETURN_NOT_OK_PREPEND(group_from_pb.LoadFromPB(idx_by_uuid_, pb), Substitute(
+      "could not load data dir group for tablet $0", tablet_id));
   DataDirGroup* other = InsertOrReturnExisting(&group_by_tablet_map_,
                                                tablet_id,
                                                group_from_pb);
   if (other != nullptr) {
-    return Status::AlreadyPresent("Tried to load directory group for tablet but one is already "
-                                  "registered", tablet_id);
+    return Status::AlreadyPresent(Substitute(
+        "tried to load directory group for tablet $0 but one is already registered",
+        tablet_id));
   }
   for (int uuid_idx : group_from_pb.uuid_indices()) {
     InsertOrDie(&FindOrDie(tablets_by_uuid_idx_map_, uuid_idx), tablet_id);
@@ -919,15 +1007,16 @@ void DataDirManager::DeleteDataDirGroup(const std::string& tablet_id) {
   group_by_tablet_map_.erase(tablet_id);
 }
 
-bool DataDirManager::GetDataDirGroupPB(const std::string& tablet_id,
-                                       DataDirGroupPB* pb) const {
+Status DataDirManager::GetDataDirGroupPB(const string& tablet_id,
+                                         DataDirGroupPB* pb) const {
   shared_lock<rw_spinlock> lock(dir_group_lock_.get_lock());
   const DataDirGroup* group = FindOrNull(group_by_tablet_map_, tablet_id);
-  if (group != nullptr) {
-    group->CopyToPB(uuid_by_idx_, pb);
-    return true;
+  if (group == nullptr) {
+    return Status::NotFound(Substitute(
+        "could not find data dir group for tablet $0", tablet_id));
   }
-  return false;
+  RETURN_NOT_OK(group->CopyToPB(uuid_by_idx_, pb));
+  return Status::OK();
 }
 
 void DataDirManager::GetDirsForGroupUnlocked(int target_size,

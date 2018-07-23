@@ -26,14 +26,11 @@
 #include <utility>
 #include <vector>
 
-#include <glog/logging.h>
 #include <gtest/gtest_prod.h>
 
-#include "kudu/fs/fs.pb.h"
 #include "kudu/gutil/callback.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
@@ -41,6 +38,8 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class DataDirGroupPB;
 class Env;
 class ThreadPool;
 
@@ -77,33 +76,29 @@ namespace internal {
 // The same directory may appear in multiple DataDirGroups.
 class DataDirGroup {
  public:
-  explicit DataDirGroup(std::vector<int> uuid_indices)
-      : uuid_indices_(std::move(uuid_indices)) {}
+  DataDirGroup();
 
-  static DataDirGroup FromPB(const DataDirGroupPB& pb,
-                             const UuidIndexByUuidMap& uuid_idx_by_uuid) {
-    std::vector<int> uuid_indices;
-    for (const std::string& uuid : pb.uuids()) {
-      uuid_indices.push_back(FindOrDie(uuid_idx_by_uuid, uuid));
-    }
-    return DataDirGroup(std::move(uuid_indices));
-  }
+  explicit DataDirGroup(std::vector<int> uuid_indices);
 
-  void CopyToPB(const UuidByUuidIndexMap& uuid_by_uuid_idx,
-                DataDirGroupPB* pb) const {
-    DCHECK(pb);
-    DataDirGroupPB group;
-    for (int uuid_idx : uuid_indices_) {
-      group.add_uuids(FindOrDie(uuid_by_uuid_idx, uuid_idx));
-    }
-    pb->Swap(&group);
-  }
+  // Reloads the DataDirGroup with UUID indices for the UUIDs in 'pb' by
+  // looking them up in 'uuid_idx_by_uuid'.
+  //
+  // Returns an error if a uuid cannot be found.
+  Status LoadFromPB(const UuidIndexByUuidMap& uuid_idx_by_uuid,
+                    const DataDirGroupPB& pb);
+
+  // Writes this group's UUIDs to 'pb', looking them up via index in
+  // 'uuid_by_uuid_idx'.
+  //
+  // Returns an error if an index cannot be found.
+  Status CopyToPB(const UuidByUuidIndexMap& uuid_by_uuid_idx,
+                  DataDirGroupPB* pb) const;
 
   const std::vector<int>& uuid_indices() const { return uuid_indices_; }
 
  private:
   // UUID indices corresponding to the data directories within the group.
-  const std::vector<int> uuid_indices_;
+  std::vector<int> uuid_indices_;
 };
 
 }  // namespace internal
@@ -118,6 +113,21 @@ enum class DataDirFsType {
 
   // None of the above.
   OTHER
+};
+
+// Defines the behavior of the consistency checks performed when the directory
+// manager is opened.
+enum class ConsistencyCheckBehavior {
+  // If the data directories don't match the on-disk path sets, fail.
+  ENFORCE_CONSISTENCY,
+
+  // If the data directories don't match the on-disk path sets, update the
+  // on-disk data to match. The directory manager must not be read-only.
+  UPDATE_ON_DISK,
+
+  // If the data directories don't match the on-disk path sets, continue
+  // without updating the on-disk data.
+  IGNORE_INCONSISTENCY
 };
 
 struct DataDirMetrics {
@@ -218,14 +228,11 @@ struct DataDirManagerOptions {
   // Defaults to false.
   bool read_only;
 
-  // Whether or not the provided directories should be considered the new
-  // canonical set. If true, on-disk data structures will be updated
-  // accordingly when the DataDirManager is opened.
+  // The behavior to use when comparing the provided data directories to the
+  // on-disk path sets.
   //
-  // Defaults to false. If true, 'read_only' must be false.
-  //
-  // Currently only supports adding new data directories.
-  bool update_on_disk;
+  // Defaults to ENFORCE_CONSISTENCY.
+  ConsistencyCheckBehavior consistency_check;
 };
 
 // Encapsulates knowledge of data directory management on behalf of block
@@ -290,9 +297,16 @@ class DataDirManager {
   // Deserializes a DataDirGroupPB and associates the resulting DataDirGroup
   // with a tablet_id.
   //
-  // Results in an error if the tablet already exists.
+  // Returns an error if the tablet already exists or if a data dir in the
+  // group is missing.
   Status LoadDataDirGroupFromPB(const std::string& tablet_id,
                                 const DataDirGroupPB& pb);
+
+  // Serializes the DataDirGroupPB associated with the given tablet_id.
+  //
+  // Returns an error if the tablet was not already registered or if a data dir
+  // is missing.
+  Status GetDataDirGroupPB(const std::string& tablet_id, DataDirGroupPB* pb) const;
 
   // Creates a new data dir group for the specified tablet. Adds data
   // directories to this new group until the limit specified by
@@ -312,10 +326,6 @@ class DataDirManager {
   // Deletes the group for the specified tablet. Maps from tablet_id to group
   // and data dir to tablet set are cleared of all references to the tablet.
   void DeleteDataDirGroup(const std::string& tablet_id);
-
-  // Serializes the DataDirGroupPB associated with the given tablet_id. Returns
-  // false if none exist.
-  bool GetDataDirGroupPB(const std::string& tablet_id, DataDirGroupPB* pb) const;
 
   // Returns a random directory from the specfied option's data dir group. If
   // there is no room in the group, returns an error.
@@ -365,8 +375,7 @@ class DataDirManager {
   // Representation Conversion
   // ==========================================================================
 
-  // Finds a data directory by uuid index, returning nullptr if it can't be
-  // found.
+  // Finds a data directory by uuid index, returning null if it can't be found.
   //
   // More information on uuid indexes and their relation to data directories
   // can be found next to PathSetPB in fs.proto.
@@ -409,11 +418,15 @@ class DataDirManager {
   // metadata directory (i.e. the first one) fails to load.
   Status Open();
 
-  // Loads the instance files for each directory, populating 'missing_roots'
-  // with the data roots that are missing instance files, and
-  // 'loaded_instances' with successfully loaded instances.
+  // Loads the instance files for each data directory.
   //
-  // Returns an error if the metadata directory fails to load.
+  // If consistency checking is disabled, missing instance files are tolerated
+  // and will be written to 'missing_roots' on success.
+  //
+  // On success, 'loaded_instances' contains all successfully loaded instance files.
+  //
+  // Returns an error if an instance file fails to load or if all instance
+  // files are unhealthy.
   Status LoadInstances(std::vector<std::string>* missing_roots,
       std::vector<std::unique_ptr<PathInstanceMetadataFile>>* loaded_instances);
 
